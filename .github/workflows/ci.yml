@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check-aggregate:
+    # Follows the guide at <https://github.com/re-actors/alls-green>.
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      # If you're modifying this workflow file and you're adding/removing a job
+      # which should be required to pass before merging a PR, don't forget to
+      # update this list!
+      - check
+      - features
+      - test
+    steps:
+      - name: Compute whether the needed jobs succeeded or failed
+        uses: re-actors/alls-green@release/v1
+        with:
+          allowed-skips: deploy-github-pages
+          jobs: ${{ toJSON(needs) }}
+
+  check:
+    name: check
+    runs-on: buildjet-4vcpu-ubuntu-2204
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install Rust
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - run: cargo check --all-targets --all-features
+      - run: cargo clippy --all-targets --all-features
+
+  # Check that every combination of features is working properly.
+  features:
+    name: features
+    runs-on: buildjet-8vcpu-ubuntu-2204
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install Rust
+        run: rustup show
+      - name: cargo install cargo-hack
+        uses: taiki-e/install-action@cargo-hack
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo hack
+        run: cargo hack check --workspace --feature-powerset --all-targets
+  test:
+    name: test
+    runs-on: buildjet-4vcpu-ubuntu-2204
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v3
+      - uses: taiki-e/install-action@nextest
+      - name: Install Rust
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo nextest run --workspace --all-features
+      # `cargo-nextest` does not support doctests (yet?), so we have to run them
+      # separately.
+      # TODO: https://github.com/nextest-rs/nextest/issues/16
+      - run: cargo test --workspace --doc --all-features
