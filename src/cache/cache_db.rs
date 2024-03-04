@@ -445,7 +445,7 @@ mod tests {
             let mut parent = to_parent.write().unwrap();
             parent.insert(1, 0);
         }
-        let mut cache_container = CacheContainer::new(db, to_parent.clone().into());
+        let mut cache_container = CacheContainer::new(db, to_parent.into());
         cache_container.add_snapshot(older_change_set).unwrap();
 
         let parent_iter = cache_container.iter::<TestSchema>(1).unwrap();
@@ -551,7 +551,7 @@ mod tests {
             cache_container.add_snapshot(cache_db_2.into()).unwrap();
         }
 
-        let cache_db_3 = CacheDb::new(3, cache_container.clone().into());
+        let cache_db_3 = CacheDb::new(3, cache_container.into());
         put_value(&cache_db_3, 1, 2);
         put_value(&cache_db_3, 8, 6);
         cache_db_3

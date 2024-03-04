@@ -822,7 +822,7 @@ mod tests {
                 "forward low range iterator is incorrect"
             );
             let backward_iterator = snapshot_manager
-                .rev_iter_range::<S>(4, lower_bound.clone()..)
+                .rev_iter_range::<S>(4, lower_bound..)
                 .unwrap();
             let actual_fields = collect_actual_values(backward_iterator);
             expected_fields.reverse();
@@ -843,7 +843,7 @@ mod tests {
                 "forward high range iterator is incorrect"
             );
             let backward_iterator = snapshot_manager
-                .rev_iter_range::<S>(4, ..upper_bound.clone())
+                .rev_iter_range::<S>(4, ..upper_bound)
                 .unwrap();
             let actual_fields = collect_actual_values(backward_iterator);
             expected_fields.reverse();
@@ -944,7 +944,7 @@ mod tests {
         let iterator_backward = cache_container
             .rev_iter_range::<S>(10, range.clone())
             .unwrap();
-        validate_iterator(iterator_backward, range.clone(), ScanDirection::Backward);
+        validate_iterator(iterator_backward, range, ScanDirection::Backward);
     }
 
     fn validate_iterator<I, R>(iterator: I, range: R, direction: ScanDirection)
