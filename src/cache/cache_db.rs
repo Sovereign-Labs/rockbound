@@ -133,7 +133,7 @@ impl CacheDb {
         seek_key: &impl SeekKeyEncoder<S>,
     ) -> anyhow::Result<Option<(S::Key, S::Value)>> {
         let seek_key = seek_key.encode_seek_key()?;
-        let range = ..=seek_key.clone();
+        let range = ..=seek_key;
         let change_set = self
             .local_cache
             .lock()
@@ -144,7 +144,7 @@ impl CacheDb {
             .db
             .read()
             .expect("Parent snapshots lock must not be poisoned");
-        let parent_iter = parent.rev_iter_range::<S>(change_set.id(), range.clone())?;
+        let parent_iter = parent.rev_iter_range::<S>(change_set.id(), range)?;
 
         let mut combined_iter: CacheDbIter<'_, _, _> = CacheDbIter {
             local_cache_iter: local_cache_iter.peekable(),
@@ -233,7 +233,7 @@ impl CacheDb {
             .db
             .read()
             .expect("Parent snapshots lock must not be poisoned");
-        let parent_iter = parent.iter_range::<S>(change_set.id(), range.clone())?;
+        let parent_iter = parent.iter_range::<S>(change_set.id(), range)?;
 
         let combined_iter: CacheDbIter<'_, _, _> = CacheDbIter {
             local_cache_iter: local_cache_iter.peekable(),
