@@ -363,10 +363,7 @@ fn test_db_snapshot_get_last_value() {
         let mut to_parent = to_parent.write().unwrap();
         to_parent.insert(1, 0);
     }
-    let manager = Arc::new(RwLock::new(CacheContainer::new(
-        db.db,
-        to_parent.clone().into(),
-    )));
+    let manager = Arc::new(RwLock::new(CacheContainer::new(db.db, to_parent.into())));
 
     let snapshot_1 = CacheDb::new(0, ReadOnlyLock::new(manager.clone()));
 
@@ -396,7 +393,7 @@ fn test_db_snapshot_get_last_value() {
         manager.add_snapshot(snapshot_1.into()).unwrap();
     }
 
-    let snapshot_2 = CacheDb::new(1, ReadOnlyLock::new(manager.clone()));
+    let snapshot_2 = CacheDb::new(1, ReadOnlyLock::new(manager));
 
     {
         let (latest_key, latest_value) = snapshot_2
@@ -454,10 +451,7 @@ fn test_db_cache_container_get_prev_value() {
         to_parent.insert(1, 0);
         to_parent.insert(2, 1);
     }
-    let cache_container = Arc::new(RwLock::new(CacheContainer::new(
-        db,
-        to_parent.clone().into(),
-    )));
+    let cache_container = Arc::new(RwLock::new(CacheContainer::new(db, to_parent.into())));
 
     // Snapshots 1 and 2 are to black box usages of parents iterator
     let snapshot_1 = CacheDb::new(0, ReadOnlyLock::new(cache_container.clone()));
@@ -537,7 +531,7 @@ fn test_db_cache_container_get_prev_value() {
         let mut manager = cache_container.write().unwrap();
         manager.add_snapshot(snapshot_2.into()).unwrap();
     }
-    let snapshot_3 = CacheDb::new(2, ReadOnlyLock::new(cache_container.clone()));
+    let snapshot_3 = CacheDb::new(2, ReadOnlyLock::new(cache_container));
     assert_eq!(
         (key_2.clone(), TestField(20)),
         snapshot_3
@@ -546,7 +540,7 @@ fn test_db_cache_container_get_prev_value() {
             .unwrap()
     );
     assert_eq!(
-        (key_2.clone(), TestField(20)),
+        (key_2, TestField(20)),
         snapshot_3.get_prev::<S>(&key_1).unwrap().unwrap()
     );
     assert_eq!(

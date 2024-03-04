@@ -74,7 +74,7 @@ fn snapshot_lifecycle() {
     }
 
     // Snapshot 3: gets empty result, event value is in some previous snapshots
-    let snapshot_3 = CacheDb::new(2, ReadOnlyLock::new(manager.clone()));
+    let snapshot_3 = CacheDb::new(2, ReadOnlyLock::new(manager));
     {
         let mut to_parent = to_parent.write().unwrap();
         to_parent.insert(2, 1);

@@ -382,10 +382,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let db = create_test_db(tempdir.path());
         let to_parent = Arc::new(RwLock::new(HashMap::new()));
-        let snapshot_manager = Arc::new(RwLock::new(CacheContainer::new(
-            db,
-            to_parent.clone().into(),
-        )));
+        let snapshot_manager = Arc::new(RwLock::new(CacheContainer::new(db, to_parent.into())));
 
         let snapshot_id = 1;
         let db_snapshot = CacheDb::new(snapshot_id, snapshot_manager.clone().into());
@@ -405,10 +402,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let db = create_test_db(tempdir.path());
         let to_parent = Arc::new(RwLock::new(HashMap::new()));
-        let snapshot_manager = Arc::new(RwLock::new(CacheContainer::new(
-            db,
-            to_parent.clone().into(),
-        )));
+        let snapshot_manager = Arc::new(RwLock::new(CacheContainer::new(db, to_parent.into())));
 
         let snapshot_id = 1;
         // Both share the same ID
@@ -429,7 +423,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let db = create_test_db(tempdir.path());
         let to_parent = Arc::new(RwLock::new(HashMap::new()));
-        let mut cache_container = CacheContainer::new(db, to_parent.clone().into());
+        let mut cache_container = CacheContainer::new(db, to_parent.into());
 
         cache_container.commit_snapshot(&1).unwrap();
     }
@@ -441,7 +435,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let db = create_test_db(tempdir.path());
         let to_parent = Arc::new(RwLock::new(HashMap::new()));
-        let mut cache_container = CacheContainer::new(db, to_parent.clone().into());
+        let mut cache_container = CacheContainer::new(db, to_parent.into());
 
         cache_container.discard_snapshot(&1);
     }
@@ -451,10 +445,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let db = create_test_db(tempdir.path());
         let to_parent = Arc::new(RwLock::new(HashMap::new()));
-        let snapshot_manager = Arc::new(RwLock::new(CacheContainer::new(
-            db,
-            to_parent.clone().into(),
-        )));
+        let snapshot_manager = Arc::new(RwLock::new(CacheContainer::new(db, to_parent.into())));
 
         let snapshot_id = 1;
         let db_snapshot = CacheDb::new(snapshot_id, snapshot_manager.clone().into());
@@ -473,7 +464,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let db = create_test_db(tempdir.path());
         let to_parent = Arc::new(RwLock::new(HashMap::new()));
-        let snapshot_manager = CacheContainer::new(db, to_parent.clone().into());
+        let snapshot_manager = CacheContainer::new(db, to_parent.into());
         assert_eq!(None, snapshot_manager.get::<S>(1, &TestField(1)).unwrap());
     }
 
@@ -492,10 +483,7 @@ mod tests {
         db_data.put::<S>(&three, &three).unwrap();
         db.write_schemas(db_data).unwrap();
 
-        let snapshot_manager = Arc::new(RwLock::new(CacheContainer::new(
-            db,
-            to_parent.clone().into(),
-        )));
+        let snapshot_manager = Arc::new(RwLock::new(CacheContainer::new(db, to_parent.into())));
 
         let db_snapshot = CacheDb::new(1, snapshot_manager.clone().into());
         db_snapshot.put::<S>(&two, &two).unwrap();
@@ -543,10 +531,7 @@ mod tests {
         db_data.put::<S>(&f1, &f1).unwrap();
         db.write_schemas(db_data).unwrap();
 
-        let snapshot_manager = Arc::new(RwLock::new(CacheContainer::new(
-            db,
-            to_parent.clone().into(),
-        )));
+        let snapshot_manager = Arc::new(RwLock::new(CacheContainer::new(db, to_parent.into())));
 
         // Operations:
         // | snapshot_id | key | operation |
@@ -698,10 +683,7 @@ mod tests {
         // |   0 |     1 |
         // |  11 |     9 |
 
-        let snapshot_manager = Arc::new(RwLock::new(CacheContainer::new(
-            db,
-            to_parent.clone().into(),
-        )));
+        let snapshot_manager = Arc::new(RwLock::new(CacheContainer::new(db, to_parent.into())));
 
         // Operations:
         // | snapshot_id | key |  operation |
@@ -908,10 +890,7 @@ mod tests {
             }
         }
 
-        let cache_container = Arc::new(RwLock::new(CacheContainer::new(
-            db,
-            to_parent.clone().into(),
-        )));
+        let cache_container = Arc::new(RwLock::new(CacheContainer::new(db, to_parent.into())));
 
         // Creating snapshots
         let n_chunks = 10; // Number of chunks you want
