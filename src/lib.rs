@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Adapted from aptos-core/schemadb
 
-#![forbid(unsafe_code)]
-#![deny(missing_docs)]
-
 //! This library implements a schematized DB on top of [RocksDB](https://rocksdb.org/). It makes
 //! sure all data passed in and out are structured according to predefined schemas and prevents
 //! access to raw keys and values. This library also enforces a set of specific DB options,
@@ -13,23 +10,28 @@
 //! families.  To use this library to store a kind of key-value pairs, the user needs to use the
 //! [`define_schema!`] macro to define the schema name, the types of key and value, and name of the
 //! column family.
+#![deny(missing_docs)]
+#![forbid(unsafe_code)]
+
+pub mod cache;
 
 mod iterator;
 mod metrics;
 pub mod schema;
 mod schema_batch;
-pub mod snapshot;
+
 #[cfg(feature = "test-utils")]
 pub mod test;
 
 use std::path::Path;
+use std::sync::{Arc, LockResult, RwLock, RwLockReadGuard};
 
 use anyhow::format_err;
 use iterator::ScanDirection;
-pub use iterator::{RawDbReverseIterator, SchemaIterator, SeekKeyEncoder};
+pub use iterator::{SchemaIterator, SeekKeyEncoder};
 use metrics::{
-    ROCKBOUND_BATCH_COMMIT_BYTES, ROCKBOUND_BATCH_COMMIT_LATENCY_SECONDS, ROCKBOUND_DELETES,
-    ROCKBOUND_GET_BYTES, ROCKBOUND_GET_LATENCY_SECONDS, ROCKBOUND_PUT_BYTES,
+    SCHEMADB_BATCH_COMMIT_BYTES, SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS, SCHEMADB_DELETES,
+    SCHEMADB_GET_BYTES, SCHEMADB_GET_LATENCY_SECONDS, SCHEMADB_PUT_BYTES,
 };
 pub use rocksdb;
 use rocksdb::ReadOptions;
@@ -37,9 +39,10 @@ pub use rocksdb::DEFAULT_COLUMN_FAMILY_NAME;
 use thiserror::Error;
 use tracing::info;
 
+use crate::iterator::RawDbIter;
 pub use crate::schema::Schema;
 use crate::schema::{ColumnFamilyName, KeyCodec, ValueCodec};
-pub use crate::schema_batch::{SchemaBatch, SchemaBatchIterator};
+pub use crate::schema_batch::SchemaBatch;
 
 /// This DB is a schematized RocksDB wrapper where all data passed in and out are typed according to
 /// [`Schema`]s.
@@ -112,7 +115,7 @@ impl DB {
     }
 
     fn log_construct(name: &'static str, inner: rocksdb::DB) -> DB {
-        info!(rocksdb_name = name, "Opened RocksDB.");
+        info!(rocksdb_name = name, "Opened RocksDB");
         DB { name, inner }
     }
 
@@ -121,7 +124,7 @@ impl DB {
         &self,
         schema_key: &impl KeyCodec<S>,
     ) -> anyhow::Result<Option<S::Value>> {
-        let _timer = ROCKBOUND_GET_LATENCY_SECONDS
+        let _timer = SCHEMADB_GET_LATENCY_SECONDS
             .with_label_values(&[S::COLUMN_FAMILY_NAME])
             .start_timer();
 
@@ -129,7 +132,7 @@ impl DB {
         let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
 
         let result = self.inner.get_pinned_cf(cf_handle, k)?;
-        ROCKBOUND_GET_BYTES
+        SCHEMADB_GET_BYTES
             .with_label_values(&[S::COLUMN_FAMILY_NAME])
             .observe(result.as_ref().map_or(0.0, |v| v.len() as f64));
 
@@ -195,13 +198,26 @@ impl DB {
         self.iter_with_direction::<S>(Default::default(), ScanDirection::Forward)
     }
 
-    /// Returns a [`RawDbReverseIterator`] which allows to iterate over raw values, backwards
-    pub fn raw_iter<S: Schema>(&self) -> anyhow::Result<RawDbReverseIterator> {
+    ///  Returns a [`RawDbIter`] which allows to iterate over raw values in specified [`ScanDirection`].
+    pub(crate) fn raw_iter<S: Schema>(
+        &self,
+        direction: ScanDirection,
+    ) -> anyhow::Result<RawDbIter> {
         let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
-        Ok(RawDbReverseIterator::new(
-            self.inner
-                .raw_iterator_cf_opt(cf_handle, Default::default()),
-        ))
+        Ok(RawDbIter::new(&self.inner, cf_handle, .., direction))
+    }
+
+    /// Get a [`RawDbIter`] in given range and direction.
+    pub(crate) fn raw_iter_range<S: Schema>(
+        &self,
+        range: impl std::ops::RangeBounds<SchemaKey>,
+        direction: ScanDirection,
+    ) -> anyhow::Result<RawDbIter> {
+        if is_range_bounds_inverse(&range) {
+            anyhow::bail!("lower_bound > upper_bound");
+        }
+        let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
+        Ok(RawDbIter::new(&self.inner, cf_handle, range, direction))
     }
 
     /// Returns a forward [`SchemaIterator`] on a certain schema with the provided read options.
@@ -214,7 +230,7 @@ impl DB {
 
     /// Writes a group of records wrapped in a [`SchemaBatch`].
     pub fn write_schemas(&self, batch: SchemaBatch) -> anyhow::Result<()> {
-        let _timer = ROCKBOUND_BATCH_COMMIT_LATENCY_SECONDS
+        let _timer = SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS
             .with_label_values(&[self.name])
             .start_timer();
         let mut db_batch = rocksdb::WriteBatch::default();
@@ -236,17 +252,17 @@ impl DB {
             for (key, operation) in rows {
                 match operation {
                     Operation::Put { value } => {
-                        ROCKBOUND_PUT_BYTES
+                        SCHEMADB_PUT_BYTES
                             .with_label_values(&[cf_name])
                             .observe((key.len() + value.len()) as f64);
                     }
                     Operation::Delete => {
-                        ROCKBOUND_DELETES.with_label_values(&[cf_name]).inc();
+                        SCHEMADB_DELETES.with_label_values(&[cf_name]).inc();
                     }
                 }
             }
         }
-        ROCKBOUND_BATCH_COMMIT_BYTES
+        SCHEMADB_BATCH_COMMIT_BYTES
             .with_label_values(&[self.name])
             .observe(serialized_size as f64);
 
@@ -294,9 +310,9 @@ pub type SchemaKey = Vec<u8>;
 /// Readability alias for a value in the DB.
 pub type SchemaValue = Vec<u8>;
 
+/// Represents operation written to the database.
 #[cfg_attr(feature = "arbitrary", derive(proptest_derive::Arbitrary))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-/// Represents operation written to the database
 pub enum Operation {
     /// Writing a value to the DB.
     Put {
@@ -305,6 +321,30 @@ pub enum Operation {
     },
     /// Deleting a value
     Delete,
+}
+
+impl Operation {
+    /// Returns [`S::Value`] if the operation is [`Operation::Put`] and `None` if [`Operation::Delete`].
+    fn decode_value<S: Schema>(&self) -> anyhow::Result<Option<S::Value>> {
+        match self {
+            Operation::Put { value } => {
+                let value = S::Value::decode_value(value)?;
+                Ok(Some(value))
+            }
+            Operation::Delete => Ok(None),
+        }
+    }
+}
+
+fn is_range_bounds_inverse(range: &impl std::ops::RangeBounds<SchemaKey>) -> bool {
+    match (range.start_bound(), range.end_bound()) {
+        (std::ops::Bound::Included(start), std::ops::Bound::Included(end)) => start > end,
+        (std::ops::Bound::Included(start), std::ops::Bound::Excluded(end)) => start > end,
+        (std::ops::Bound::Excluded(start), std::ops::Bound::Included(end)) => start > end,
+        (std::ops::Bound::Excluded(start), std::ops::Bound::Excluded(end)) => start > end,
+        (std::ops::Bound::Unbounded, _) => false,
+        (_, std::ops::Bound::Unbounded) => false,
+    }
 }
 
 /// An error that occurred during (de)serialization of a [`Schema`]'s keys or
@@ -334,6 +374,33 @@ fn default_write_options() -> rocksdb::WriteOptions {
     opts
 }
 
+/// Wrapper around `RwLock` that only allows read access.
+/// This type implies that wrapped type suppose to be used only for reading.
+/// It is useful to indicate that user of this type can only do reading.
+/// This also implies that that inner `Arc<RwLock<T>>` is a clone and some other part can do writing.
+#[derive(Debug, Clone)]
+pub struct ReadOnlyLock<T> {
+    lock: Arc<RwLock<T>>,
+}
+
+impl<T> ReadOnlyLock<T> {
+    /// Create new [`ReadOnlyLock`] from [`Arc<RwLock<T>>`].
+    pub fn new(lock: Arc<RwLock<T>>) -> Self {
+        Self { lock }
+    }
+
+    /// Acquires a read lock on the underlying [`RwLock`].
+    pub fn read(&self) -> LockResult<RwLockReadGuard<'_, T>> {
+        self.lock.read()
+    }
+}
+
+impl<T> From<Arc<RwLock<T>>> for ReadOnlyLock<T> {
+    fn from(value: Arc<RwLock<T>>) -> Self {
+        Self::new(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,5 +420,15 @@ mod tests {
         let db_debug = format!("{:?}", db);
         assert!(db_debug.contains("test_db_debug"));
         assert!(db_debug.contains(tmpdir.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn test_range_inverse() {
+        assert!(is_range_bounds_inverse(&(vec![4]..vec![3])));
+        assert!(is_range_bounds_inverse(&(vec![4]..=vec![3])));
+        // Not inverse, but empty
+        assert!(!is_range_bounds_inverse(&(vec![3]..vec![3])));
+        // Not inverse
+        assert!(!is_range_bounds_inverse(&(vec![3]..=vec![3])));
     }
 }

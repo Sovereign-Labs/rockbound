@@ -7,10 +7,10 @@ use prometheus::{
     IntCounterVec,
 };
 
-pub static ROCKBOUND_ITER_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+pub static SCHEMADB_ITER_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
     register_histogram_vec!(
         // metric name
-        "rockbound_iter_latency_seconds",
+        "schemadb_iter_latency_seconds",
         // metric description
         "Schemadb iter latency in seconds",
         // metric labels (dimensions)
@@ -20,10 +20,10 @@ pub static ROCKBOUND_ITER_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
     .unwrap()
 });
 
-pub static ROCKBOUND_ITER_BYTES: Lazy<HistogramVec> = Lazy::new(|| {
+pub static SCHEMADB_ITER_BYTES: Lazy<HistogramVec> = Lazy::new(|| {
     register_histogram_vec!(
         // metric name
-        "rockbound_iter_bytes",
+        "schemadb_iter_bytes",
         // metric description
         "Schemadb iter size in bytes",
         // metric labels (dimensions)
@@ -32,10 +32,10 @@ pub static ROCKBOUND_ITER_BYTES: Lazy<HistogramVec> = Lazy::new(|| {
     .unwrap()
 });
 
-pub static ROCKBOUND_GET_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+pub static SCHEMADB_GET_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
     register_histogram_vec!(
         // metric name
-        "rockbound_get_latency_seconds",
+        "schemadb_get_latency_seconds",
         // metric description
         "Schemadb get latency in seconds",
         // metric labels (dimensions)
@@ -45,10 +45,10 @@ pub static ROCKBOUND_GET_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
     .unwrap()
 });
 
-pub static ROCKBOUND_GET_BYTES: Lazy<HistogramVec> = Lazy::new(|| {
+pub static SCHEMADB_GET_BYTES: Lazy<HistogramVec> = Lazy::new(|| {
     register_histogram_vec!(
         // metric name
-        "rockbound_get_bytes",
+        "schemadb_get_bytes",
         // metric description
         "Schemadb get call returned data size in bytes",
         // metric labels (dimensions)
@@ -57,10 +57,10 @@ pub static ROCKBOUND_GET_BYTES: Lazy<HistogramVec> = Lazy::new(|| {
     .unwrap()
 });
 
-pub static ROCKBOUND_BATCH_COMMIT_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+pub static SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
     register_histogram_vec!(
         // metric name
-        "rockbound_batch_commit_latency_seconds",
+        "schemadb_batch_commit_latency_seconds",
         // metric description
         "Schemadb schema batch commit latency in seconds",
         // metric labels (dimensions)
@@ -70,10 +70,10 @@ pub static ROCKBOUND_BATCH_COMMIT_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy::ne
     .unwrap()
 });
 
-pub static ROCKBOUND_BATCH_COMMIT_BYTES: Lazy<HistogramVec> = Lazy::new(|| {
+pub static SCHEMADB_BATCH_COMMIT_BYTES: Lazy<HistogramVec> = Lazy::new(|| {
     register_histogram_vec!(
         // metric name
-        "rockbound_batch_commit_bytes",
+        "schemadb_batch_commit_bytes",
         // metric description
         "Schemadb schema batch commit size in bytes",
         // metric labels (dimensions)
@@ -82,28 +82,28 @@ pub static ROCKBOUND_BATCH_COMMIT_BYTES: Lazy<HistogramVec> = Lazy::new(|| {
     .unwrap()
 });
 
-pub static ROCKBOUND_PUT_BYTES: Lazy<HistogramVec> = Lazy::new(|| {
+pub static SCHEMADB_PUT_BYTES: Lazy<HistogramVec> = Lazy::new(|| {
     register_histogram_vec!(
         // metric name
-        "sov_schema_db_put_bytes",
+        "rockbound_put_bytes",
         // metric description
-        "sov_schema_db put call puts data size in bytes",
+        "rockbound put call puts data size in bytes",
         // metric labels (dimensions)
         &["cf_name"]
     )
     .unwrap()
 });
 
-pub static ROCKBOUND_DELETES: Lazy<IntCounterVec> = Lazy::new(|| {
+pub static SCHEMADB_DELETES: Lazy<IntCounterVec> = Lazy::new(|| {
     register_int_counter_vec!("storage_deletes", "Storage delete calls", &["cf_name"]).unwrap()
 });
 
-pub static ROCKBOUND_BATCH_PUT_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+pub static SCHEMADB_BATCH_PUT_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
     register_histogram_vec!(
         // metric name
-        "sov_schema_db_batch_put_latency_seconds",
+        "rockbound_batch_put_latency_seconds",
         // metric description
-        "sov_schema_db schema batch put latency in seconds",
+        "rockbound schema batch put latency in seconds",
         // metric labels (dimensions)
         &["db_name"],
         exponential_buckets(/*start=*/ 1e-3, /*factor=*/ 2.0, /*count=*/ 20).unwrap(),

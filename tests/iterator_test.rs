@@ -1,13 +1,15 @@
 // Copyright (c) Aptos
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use rockbound::cache::cache_container::CacheContainer;
+use rockbound::cache::cache_db::CacheDb;
 use rockbound::schema::{KeyDecoder, KeyEncoder, ValueCodec};
-use rockbound::snapshot::{DbSnapshot, ReadOnlyLock, SingleSnapshotQueryManager};
 use rockbound::test::{KeyPrefix1, KeyPrefix2, TestCompositeField, TestField};
 use rockbound::{
-    define_schema, Operation, Schema, SchemaBatch, SchemaIterator, SeekKeyEncoder, DB,
+    define_schema, Operation, ReadOnlyLock, Schema, SchemaBatch, SchemaIterator, SeekKeyEncoder, DB,
 };
 use rocksdb::DEFAULT_COLUMN_FAMILY_NAME;
 use tempfile::TempDir;
@@ -37,14 +39,18 @@ struct TestDB {
     db: DB,
 }
 
+fn open_inner_db(path: &std::path::Path) -> DB {
+    let column_families = vec![DEFAULT_COLUMN_FAMILY_NAME, S::COLUMN_FAMILY_NAME];
+    let mut db_opts = rocksdb::Options::default();
+    db_opts.create_if_missing(true);
+    db_opts.create_missing_column_families(true);
+    DB::open(path, "test-iterator-db", column_families, &db_opts).unwrap()
+}
+
 impl TestDB {
     fn new() -> Self {
         let tmpdir = tempfile::tempdir().unwrap();
-        let column_families = vec![DEFAULT_COLUMN_FAMILY_NAME, S::COLUMN_FAMILY_NAME];
-        let mut db_opts = rocksdb::Options::default();
-        db_opts.create_if_missing(true);
-        db_opts.create_missing_column_families(true);
-        let db = DB::open(tmpdir.path(), "test", column_families, &db_opts).unwrap();
+        let db = open_inner_db(tmpdir.path());
 
         db.put::<S>(&TestCompositeField(1, 0, 0), &TestField(100))
             .unwrap();
@@ -244,7 +250,7 @@ fn test_schema_batch_iteration_order() {
         batch.put::<S>(key, value).unwrap();
     }
 
-    let iter = batch.iter::<S>();
+    let iter = batch.iter::<S>().rev();
     let collected: Vec<_> = iter
         .filter_map(|(key, value)| match value {
             Operation::Put { value } => Some((
@@ -271,7 +277,7 @@ fn test_schema_batch_iteration_with_deletions() {
     batch
         .put::<S>(&TestCompositeField(1, 0, 0), &TestField(2))
         .unwrap();
-    let mut iter = batch.iter::<S>().peekable();
+    let mut iter = batch.iter::<S>().rev().peekable();
     let first1 = iter.peek().unwrap();
     assert_eq!(first1.0, &encode_key(&TestCompositeField(12, 0, 0)));
     assert_eq!(
@@ -310,7 +316,7 @@ fn test_schema_batch_iter_range() {
         <TestCompositeField as SeekKeyEncoder<S>>::encode_seek_key(&TestCompositeField(11, 0, 0))
             .unwrap();
 
-    let mut iter = batch.iter_range::<S>(seek_key);
+    let mut iter = batch.iter_range::<S>(..=seek_key).rev();
 
     assert_eq!(
         Some((
@@ -351,11 +357,22 @@ fn test_schema_batch_iter_range() {
 
 #[test]
 fn test_db_snapshot_get_last_value() {
-    let manager = Arc::new(RwLock::new(SingleSnapshotQueryManager::default()));
+    let db = TestDB::new();
+    let to_parent = Arc::new(RwLock::new(HashMap::new()));
+    {
+        let mut to_parent = to_parent.write().unwrap();
+        to_parent.insert(1, 0);
+    }
+    let manager = Arc::new(RwLock::new(CacheContainer::new(db.db, to_parent.into())));
 
-    let snapshot_1 = DbSnapshot::new(0, ReadOnlyLock::new(manager.clone()));
+    let snapshot_1 = CacheDb::new(0, ReadOnlyLock::new(manager.clone()));
 
-    assert!(snapshot_1.get_largest::<S>().unwrap().is_none());
+    {
+        let (largest_key_in_db, largest_value_in_db) =
+            snapshot_1.get_largest::<S>().unwrap().unwrap();
+        assert_eq!(TestCompositeField(2, 0, 2), largest_key_in_db);
+        assert_eq!(TestField(202), largest_value_in_db);
+    }
 
     let key_1 = TestCompositeField(8, 2, 3);
     let value_1 = TestField(6);
@@ -363,20 +380,20 @@ fn test_db_snapshot_get_last_value() {
     snapshot_1.put::<S>(&key_1, &value_1).unwrap();
 
     {
-        let (latest_key, latest_value) = snapshot_1
+        let (largest_key, largest_value) = snapshot_1
             .get_largest::<S>()
             .unwrap()
             .expect("largest key-value pair should be found");
-        assert_eq!(key_1, latest_key);
-        assert_eq!(value_1, latest_value);
+        assert_eq!(key_1, largest_key);
+        assert_eq!(value_1, largest_value);
     }
 
     {
         let mut manager = manager.write().unwrap();
-        manager.add_snapshot(snapshot_1.into());
+        manager.add_snapshot(snapshot_1.into()).unwrap();
     }
 
-    let snapshot_2 = DbSnapshot::new(1, ReadOnlyLock::new(manager.clone()));
+    let snapshot_2 = CacheDb::new(1, ReadOnlyLock::new(manager));
 
     {
         let (latest_key, latest_value) = snapshot_2
@@ -425,11 +442,19 @@ fn test_db_snapshot_get_last_value() {
 }
 
 #[test]
-fn test_db_snapshot_get_prev_value() {
-    let manager = Arc::new(RwLock::new(SingleSnapshotQueryManager::default()));
+fn test_db_cache_container_get_prev_value() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = open_inner_db(tmpdir.path());
+    let to_parent = Arc::new(RwLock::new(HashMap::new()));
+    {
+        let mut to_parent = to_parent.write().unwrap();
+        to_parent.insert(1, 0);
+        to_parent.insert(2, 1);
+    }
+    let cache_container = Arc::new(RwLock::new(CacheContainer::new(db, to_parent.into())));
 
     // Snapshots 1 and 2 are to black box usages of parents iterator
-    let snapshot_1 = DbSnapshot::new(0, ReadOnlyLock::new(manager.clone()));
+    let snapshot_1 = CacheDb::new(0, ReadOnlyLock::new(cache_container.clone()));
 
     let key_1 = TestCompositeField(8, 2, 3);
     let key_2 = TestCompositeField(8, 2, 0);
@@ -465,11 +490,11 @@ fn test_db_snapshot_get_prev_value() {
     );
 
     {
-        let mut manager = manager.write().unwrap();
-        manager.add_snapshot(snapshot_1.into());
+        let mut manager = cache_container.write().unwrap();
+        manager.add_snapshot(snapshot_1.into()).unwrap();
     }
 
-    let snapshot_2 = DbSnapshot::new(1, ReadOnlyLock::new(manager.clone()));
+    let snapshot_2 = CacheDb::new(1, ReadOnlyLock::new(cache_container.clone()));
     // Equal:
     assert_eq!(
         (key_1.clone(), TestField(1)),
@@ -503,10 +528,10 @@ fn test_db_snapshot_get_prev_value() {
         snapshot_2.get_prev::<S>(&key_1).unwrap().unwrap()
     );
     {
-        let mut manager = manager.write().unwrap();
-        manager.add_snapshot(snapshot_2.into());
+        let mut manager = cache_container.write().unwrap();
+        manager.add_snapshot(snapshot_2.into()).unwrap();
     }
-    let snapshot_3 = DbSnapshot::new(2, ReadOnlyLock::new(manager.clone()));
+    let snapshot_3 = CacheDb::new(2, ReadOnlyLock::new(cache_container));
     assert_eq!(
         (key_2.clone(), TestField(20)),
         snapshot_3
@@ -515,7 +540,7 @@ fn test_db_snapshot_get_prev_value() {
             .unwrap()
     );
     assert_eq!(
-        (key_2.clone(), TestField(20)),
+        (key_2, TestField(20)),
         snapshot_3.get_prev::<S>(&key_1).unwrap().unwrap()
     );
     assert_eq!(
