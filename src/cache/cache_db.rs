@@ -127,6 +127,33 @@ impl CacheDb {
         Ok(None)
     }
 
+    /// Get value of smallest key written value for given [`Schema`].
+    pub fn get_smallest<S: Schema>(&self) -> anyhow::Result<Option<(S::Key, S::Value)>> {
+        let change_set = self
+            .local_cache
+            .lock()
+            .expect("SchemaBatch lock must not be poisoned");
+        let local_cache_iter = change_set.iter::<S>().rev();
+
+        let parent = self.db.read().expect("Parent lock must not be poisoned");
+
+        let parent_iter = parent.iter::<S>(change_set.id())?;
+
+        let mut combined_iter: CacheDbIter<'_, _, _> = CacheDbIter {
+            local_cache_iter: local_cache_iter.peekable(),
+            parent_iter: parent_iter.peekable(),
+            direction: ScanDirection::Forward,
+        };
+
+        if let Some((key, value)) = combined_iter.next() {
+            let key = S::Key::decode_key(&key)?;
+            let value = S::Value::decode_value(&value)?;
+            return Ok(Some((key, value)));
+        }
+
+        Ok(None)
+    }
+
     /// Get largest value in [`Schema`] that is smaller than give `seek_key`
     pub fn get_prev<S: Schema>(
         &self,
