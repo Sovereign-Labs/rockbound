@@ -187,6 +187,31 @@ impl CacheDb {
         Ok(None)
     }
 
+    /// Returns the total number of items in the [`Schema`].
+    ///
+    /// # Warning
+    /// This method has to iterate over *all* the items in the [`Schema`], so it
+    /// can be very slow for big datasets. Use with caution.
+    pub fn count_items<S: Schema>(&self) -> anyhow::Result<usize> {
+        let change_set = self
+            .local_cache
+            .lock()
+            .expect("SchemaBatch lock must not be poisoned");
+        let local_cache_iter = change_set.iter::<S>().rev();
+
+        let parent = self.db.read().expect("Parent lock must not be poisoned");
+
+        let parent_iter = parent.iter::<S>(change_set.id())?;
+
+        let combined_iter: CacheDbIter<'_, _, _> = CacheDbIter {
+            local_cache_iter: local_cache_iter.peekable(),
+            parent_iter: parent_iter.peekable(),
+            direction: ScanDirection::Forward,
+        };
+
+        Ok(combined_iter.count())
+    }
+
     /// Get `n` keys >= `seek_key`
     pub fn get_n_from_first_match<S: Schema>(
         &self,
@@ -397,6 +422,8 @@ mod tests {
                 let rem = value - (j + 4);
                 assert_eq!(0, rem % 10);
             }
+
+            assert_eq!(10, cache_db.count_items::<TestSchema>().unwrap());
         }
     }
 
