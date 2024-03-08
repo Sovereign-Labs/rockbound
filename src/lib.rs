@@ -181,7 +181,7 @@ impl DB {
         Ok(())
     }
 
-    pub fn iter_with_direction<S: Schema>(
+    fn iter_with_direction<S: Schema>(
         &self,
         opts: ReadOptions,
         direction: ScanDirection,
