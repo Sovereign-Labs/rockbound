@@ -31,7 +31,7 @@ pub trait SeekKeyEncoder<S: Schema + ?Sized>: Sized {
 }
 
 /// Indicates in which direction iterator should be scanned.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub(crate) enum ScanDirection {
     Forward,
     Backward,
@@ -55,7 +55,12 @@ where
             direction,
             phantom: PhantomData,
         };
-        iter.seek_to_first();
+
+        match direction {
+            ScanDirection::Forward => iter.seek_to_first(),
+            ScanDirection::Backward => iter.seek_to_last(),
+        };
+
         iter
     }
 
