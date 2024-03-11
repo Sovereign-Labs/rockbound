@@ -31,7 +31,7 @@ pub trait SeekKeyEncoder<S: Schema + ?Sized>: Sized {
 }
 
 /// Indicates in which direction iterator should be scanned.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub(crate) enum ScanDirection {
     Forward,
     Backward,
@@ -50,11 +50,18 @@ where
     S: Schema,
 {
     pub(crate) fn new(db_iter: rocksdb::DBRawIterator<'a>, direction: ScanDirection) -> Self {
-        SchemaIterator {
+        let mut iter = SchemaIterator {
             db_iter,
             direction,
             phantom: PhantomData,
-        }
+        };
+
+        match direction {
+            ScanDirection::Forward => iter.seek_to_first(),
+            ScanDirection::Backward => iter.seek_to_last(),
+        };
+
+        iter
     }
 
     /// Seeks to the first key.
