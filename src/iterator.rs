@@ -50,11 +50,13 @@ where
     S: Schema,
 {
     pub(crate) fn new(db_iter: rocksdb::DBRawIterator<'a>, direction: ScanDirection) -> Self {
-        SchemaIterator {
+        let mut iter = SchemaIterator {
             db_iter,
             direction,
             phantom: PhantomData,
-        }
+        };
+        iter.seek_to_first();
+        iter
     }
 
     /// Seeks to the first key.
@@ -103,9 +105,9 @@ where
             .with_label_values(&[S::COLUMN_FAMILY_NAME])
             .start_timer();
 
+        self.db_iter.status()?;
         if !self.db_iter.valid() {
             println!("db is not valid! {:?}", self.db_iter.status());
-            self.db_iter.status()?;
             return Ok(None);
         }
 
