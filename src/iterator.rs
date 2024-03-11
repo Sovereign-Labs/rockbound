@@ -104,6 +104,7 @@ where
             .start_timer();
 
         if !self.db_iter.valid() {
+            println!("db is not valid!");
             self.db_iter.status()?;
             return Ok(None);
         }
