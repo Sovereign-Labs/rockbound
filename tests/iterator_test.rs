@@ -97,15 +97,26 @@ impl std::ops::Deref for TestDB {
 #[test]
 fn test_seek_to_first() {
     let db = TestDB::new();
+    let mut iter;
 
-    let mut iter = db.iter();
+    // Forward iterator from the beginning should return all values.
+    iter = db.iter();
     iter.seek_to_first();
     assert_eq!(
         collect_values(iter),
         [100, 102, 104, 110, 112, 114, 200, 202]
     );
 
-    let mut iter = db.rev_iter();
+    // Similarly, forward iterator *without an explicit seek call* should return
+    // all values.
+    iter = db.iter();
+    assert_eq!(
+        collect_values(iter),
+        [100, 102, 104, 110, 112, 114, 200, 202]
+    );
+
+    // Reverse iterator from the beginning should only return the first value.
+    iter = db.rev_iter();
     iter.seek_to_first();
     assert_eq!(collect_values(iter), [100]);
 }
