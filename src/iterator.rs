@@ -56,6 +56,8 @@ where
             phantom: PhantomData,
         };
 
+        // We need an explicit `seek` call before we can start
+        // iterating.
         match direction {
             ScanDirection::Forward => iter.seek_to_first(),
             ScanDirection::Backward => iter.seek_to_last(),
@@ -110,6 +112,9 @@ where
             .with_label_values(&[S::COLUMN_FAMILY_NAME])
             .start_timer();
 
+        // SAFETY: Calling `next` or `prev` requires to check `valid` first.
+        // Not doing so may result in UB because of a nasty `rust-rocksdb` bug:
+        // <https://github.com/rust-rocksdb/rust-rocksdb/issues/824>.
         if !self.db_iter.valid() {
             self.db_iter.status()?;
             return Ok(None);
