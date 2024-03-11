@@ -105,9 +105,8 @@ where
             .with_label_values(&[S::COLUMN_FAMILY_NAME])
             .start_timer();
 
-        self.db_iter.status()?;
         if !self.db_iter.valid() {
-            println!("db is not valid! {:?}", self.db_iter.status());
+            self.db_iter.status()?;
             return Ok(None);
         }
 
