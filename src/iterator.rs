@@ -469,10 +469,7 @@ mod tests {
                 for direction in [ScanDirection::Forward, ScanDirection::Backward] {
                     // Inverse
                     let err = db
-                        .raw_iter_range::<S>(
-                            upper_bound.clone()..lower_bound.clone(),
-                            direction.clone(),
-                        )
+                        .raw_iter_range::<S>(upper_bound.clone()..lower_bound.clone(), direction)
                         .err()
                         .unwrap();
                     assert_eq!("lower_bound > upper_bound", err.to_string());
@@ -556,10 +553,8 @@ mod tests {
             range: R,
         ) {
             for direction in [ScanDirection::Forward, ScanDirection::Backward] {
-                let iter_range = db
-                    .raw_iter_range::<S>(range.clone(), direction.clone())
-                    .unwrap();
-                validate_iterator(iter_range, range.clone(), direction.clone());
+                let iter_range = db.raw_iter_range::<S>(range.clone(), direction).unwrap();
+                validate_iterator(iter_range, range.clone(), direction);
             }
         }
 
