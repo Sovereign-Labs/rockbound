@@ -32,7 +32,7 @@ pub trait SeekKeyEncoder<S: Schema + ?Sized>: Sized {
 
 /// Indicates in which direction iterator should be scanned.
 #[derive(Debug, Copy, Clone, PartialEq)]
-pub(crate) enum ScanDirection {
+pub enum ScanDirection {
     Forward,
     Backward,
 }
@@ -120,8 +120,15 @@ where
             return Ok(None);
         }
 
-        let raw_key = self.db_iter.key().expect("db_iter.key() failed.");
-        let raw_value = self.db_iter.value().expect("db_iter.value() failed.");
+        let raw_key = self
+            .db_iter
+            .key()
+            .expect("db_iter.key() failed despite valid() check; this is a bug");
+        let raw_value = self
+            .db_iter
+            .value()
+            .expect("db_iter.value() failed despite valid() check; this is a bug");
+        let key_size_bytes = raw_key.len();
         let value_size_bytes = raw_value.len();
         SCHEMADB_ITER_BYTES
             .with_label_values(&[S::COLUMN_FAMILY_NAME])
@@ -138,23 +145,13 @@ where
         Ok(Some(IteratorOutput {
             key,
             value,
+            key_size_bytes,
             value_size_bytes,
         }))
     }
 }
 
-/// The output of [`SchemaIterator`]'s next_impl
-pub struct IteratorOutput<K, V> {
-    pub key: K,
-    pub value: V,
-    pub value_size_bytes: usize,
-}
-
-impl<K, V> IteratorOutput<K, V> {
-    pub fn into_tuple(self) -> (K, V) {
-        (self.key, self.value)
-    }
-}
+impl<'a, S> FusedIterator for SchemaIterator<'_, S> where S: Schema {}
 
 impl<'a, S> Iterator for SchemaIterator<'a, S>
 where
@@ -167,7 +164,19 @@ where
     }
 }
 
-impl<'a, S> FusedIterator for SchemaIterator<'a, S> where S: Schema {}
+/// The output of [`SchemaIterator`]'s next_impl
+pub struct IteratorOutput<K, V> {
+    pub key: K,
+    pub value: V,
+    pub key_size_bytes: usize,
+    pub value_size_bytes: usize,
+}
+
+impl<K, V> IteratorOutput<K, V> {
+    pub fn into_tuple(self) -> (K, V) {
+        (self.key, self.value)
+    }
+}
 
 /// Iterates over given column in [`rocksdb::DB`].
 pub(crate) struct RawDbIter<'a> {
@@ -177,7 +186,7 @@ pub(crate) struct RawDbIter<'a> {
 }
 
 impl<'a> RawDbIter<'a> {
-    pub(crate) fn new(
+    pub fn new(
         inner: &'a rocksdb::DB,
         cf_handle: &ColumnFamily,
         range: impl std::ops::RangeBounds<SchemaKey>,
