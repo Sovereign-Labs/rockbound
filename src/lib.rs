@@ -49,7 +49,7 @@ pub use crate::schema_batch::SchemaBatch;
 #[derive(Debug)]
 pub struct DB {
     name: &'static str, // for logging
-    inner: rocksdb::DB,
+    inner: Arc<rocksdb::DB>,
 }
 
 impl DB {
@@ -116,7 +116,10 @@ impl DB {
 
     fn log_construct(name: &'static str, inner: rocksdb::DB) -> DB {
         info!(rocksdb_name = name, "Opened RocksDB");
-        DB { name, inner }
+        DB {
+            name,
+            inner: Arc::new(inner),
+        }
     }
 
     /// Reads single record by key.
