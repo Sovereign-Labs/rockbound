@@ -181,21 +181,9 @@ impl DB {
         Ok(())
     }
 
-    fn iter_with_direction<S: Schema>(
-        &self,
-        opts: ReadOptions,
-        direction: ScanDirection,
-    ) -> anyhow::Result<SchemaIterator<S>> {
-        let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
-        Ok(SchemaIterator::new(
-            self.inner.raw_iterator_cf_opt(cf_handle, opts),
-            direction,
-        ))
-    }
-
     /// Returns a forward [`SchemaIterator`] on a certain schema with the default read options.
     pub fn iter<S: Schema>(&self) -> anyhow::Result<SchemaIterator<S>> {
-        self.iter_with_direction::<S>(Default::default(), ScanDirection::Forward)
+        self.iter_with_opts(Default::default())
     }
 
     ///  Returns a [`RawDbIter`] which allows to iterate over raw values in specified [`ScanDirection`].
@@ -225,7 +213,11 @@ impl DB {
         &self,
         opts: ReadOptions,
     ) -> anyhow::Result<SchemaIterator<S>> {
-        self.iter_with_direction::<S>(opts, ScanDirection::Forward)
+        let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
+        Ok(SchemaIterator::new(
+            self.inner.raw_iterator_cf_opt(cf_handle, opts),
+            ScanDirection::Forward,
+        ))
     }
 
     /// Writes a group of records wrapped in a [`SchemaBatch`].
