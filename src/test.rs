@@ -6,12 +6,12 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use crate::schema::{KeyDecoder, KeyEncoder, ValueCodec};
 use crate::{CodecError, Schema, SeekKeyEncoder};
 
+/// Key that is composed out of triplet of [`u32`]s.
 #[derive(Debug, Eq, PartialEq, Clone)]
-/// Key that composed out of tuple of r u32
 pub struct TestCompositeField(pub u32, pub u32, pub u32);
 
+/// Simple wrapper around [`u32`].
 #[derive(Debug, Eq, PartialEq, Clone, Copy)]
-/// Simple value around u32
 pub struct TestField(pub u32);
 
 impl<S: Schema> KeyEncoder<S> for TestCompositeField {
