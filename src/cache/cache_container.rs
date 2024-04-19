@@ -71,7 +71,7 @@ impl CacheContainer {
         let snapshot = self.snapshots.remove(snapshot_id).ok_or_else(|| {
             anyhow::anyhow!("Attempt to commit unknown snapshot id={}", snapshot_id)
         })?;
-        self.db.write_schemas(snapshot.into())
+        self.db.write_schemas(&snapshot.into())
     }
 
     /// Indicates, if CacheContainer has any snapshots in memory.
@@ -481,7 +481,7 @@ mod tests {
         let mut db_data = SchemaBatch::new();
         db_data.put::<S>(&one, &one).unwrap();
         db_data.put::<S>(&three, &three).unwrap();
-        db.write_schemas(db_data).unwrap();
+        db.write_schemas(&db_data).unwrap();
 
         let snapshot_manager = Arc::new(RwLock::new(CacheContainer::new(db, to_parent.into())));
 
