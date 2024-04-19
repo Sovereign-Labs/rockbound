@@ -82,7 +82,9 @@ impl SchemaBatch {
             .unwrap_or_default()
     }
 
-    pub(crate) fn merge(&mut self, other: SchemaBatch) {
+    /// Merges another `SchemaBatch` into this one.
+    /// K/V pairs in `other` will overwrite those in `self`.
+    pub fn merge(&mut self, other: SchemaBatch) {
         for (cf_name, other_cf_map) in other.last_writes {
             let cf_map = self.last_writes.entry(cf_name).or_default();
             cf_map.extend(other_cf_map);
