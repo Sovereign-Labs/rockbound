@@ -152,7 +152,7 @@ impl DB {
         // Used in tests only anyway.
         let mut batch = SchemaBatch::new();
         batch.put::<S>(key, value)?;
-        self.write_schemas(batch)
+        self.write_schemas(&batch)
     }
 
     /// Delete a single key from the database.
@@ -161,7 +161,7 @@ impl DB {
         // Used in tests only anyway.
         let mut batch = SchemaBatch::new();
         batch.delete::<S>(key)?;
-        self.write_schemas(batch)
+        self.write_schemas(&batch)
     }
 
     /// Removes the database entries in the range `["from", "to")` using default write options.
@@ -229,7 +229,7 @@ impl DB {
     }
 
     /// Writes a group of records wrapped in a [`SchemaBatch`].
-    pub fn write_schemas(&self, batch: SchemaBatch) -> anyhow::Result<()> {
+    pub fn write_schemas(&self, batch: &SchemaBatch) -> anyhow::Result<()> {
         let _timer = SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS
             .with_label_values(&[self.name])
             .start_timer();

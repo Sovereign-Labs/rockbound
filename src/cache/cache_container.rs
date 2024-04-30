@@ -10,7 +10,7 @@ use crate::iterator::ScanDirection;
 use crate::schema::{KeyCodec, ValueCodec};
 use crate::{Operation, RawDbIter, ReadOnlyLock, Schema, SchemaKey, SchemaValue, DB};
 
-/// Holds collection of [`ChangeSet`]'s associated with particular Snapshot
+/// Holds a collection of [`ChangeSet`]'s associated with particular Snapshot
 /// and knows how to traverse them.
 /// Managed externally.
 /// Should be managed carefully, because discrepancy between `snapshots` and `to_parent` leads to panic
@@ -71,7 +71,7 @@ impl CacheContainer {
         let snapshot = self.snapshots.remove(snapshot_id).ok_or_else(|| {
             anyhow::anyhow!("Attempt to commit unknown snapshot id={}", snapshot_id)
         })?;
-        self.db.write_schemas(snapshot.into())
+        self.db.write_schemas(&snapshot.into())
     }
 
     /// Indicates, if CacheContainer has any snapshots in memory.
@@ -481,7 +481,7 @@ mod tests {
         let mut db_data = SchemaBatch::new();
         db_data.put::<S>(&one, &one).unwrap();
         db_data.put::<S>(&three, &three).unwrap();
-        db.write_schemas(db_data).unwrap();
+        db.write_schemas(&db_data).unwrap();
 
         let snapshot_manager = Arc::new(RwLock::new(CacheContainer::new(db, to_parent.into())));
 
@@ -529,7 +529,7 @@ mod tests {
 
         let mut db_data = SchemaBatch::new();
         db_data.put::<S>(&f1, &f1).unwrap();
-        db.write_schemas(db_data).unwrap();
+        db.write_schemas(&db_data).unwrap();
 
         let snapshot_manager = Arc::new(RwLock::new(CacheContainer::new(db, to_parent.into())));
 
@@ -674,7 +674,7 @@ mod tests {
         db_data.put::<S>(&f4, &f1).unwrap();
         db_data.put::<S>(&f0, &f1).unwrap();
         db_data.put::<S>(&f11, &f9).unwrap();
-        db.write_schemas(db_data).unwrap();
+        db.write_schemas(&db_data).unwrap();
         // DB Data
         // | key | value |
         // |   3 |     9 |

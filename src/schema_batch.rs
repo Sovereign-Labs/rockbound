@@ -82,7 +82,9 @@ impl SchemaBatch {
             .unwrap_or_default()
     }
 
-    pub(crate) fn merge(&mut self, other: SchemaBatch) {
+    /// Merge other [`SchemaBatch`] on top of this one.
+    /// Keys from other will overwrite keys in self.
+    pub fn merge(&mut self, other: SchemaBatch) {
         for (cf_name, other_cf_map) in other.last_writes {
             let cf_map = self.last_writes.entry(cf_name).or_default();
             cf_map.extend(other_cf_map);
@@ -289,6 +291,49 @@ mod tests {
                 .iter_range::<TestSchema1>(encode_key(&field_4)..encode_key(&field_2))
                 .rev()
                 .for_each(drop);
+        }
+    }
+
+    mod merge {
+        use super::*;
+
+        #[test]
+        fn test_simple_merge() {
+            let field_1 = TestField(1);
+            let field_2 = TestField(2);
+            let field_3 = TestField(3);
+            let field_4 = TestField(4);
+            let field_5 = TestField(5);
+
+            let mut batch1 = SchemaBatch::new();
+            batch1.put::<TestSchema1>(&field_1, &field_2).unwrap();
+            batch1.put::<TestSchema1>(&field_3, &field_1).unwrap();
+            batch1.put::<TestSchema1>(&field_5, &field_4).unwrap();
+
+            let mut batch2 = SchemaBatch::new();
+            batch2.put::<TestSchema1>(&field_1, &field_3).unwrap();
+            batch2.put::<TestSchema1>(&field_4, &field_2).unwrap();
+            batch2.delete::<TestSchema1>(&field_5).unwrap();
+
+            batch1.merge(batch2);
+
+            let get_value = |field: &TestField| -> Option<TestField> {
+                batch1
+                    .get::<TestSchema1>(field)
+                    .unwrap()
+                    .unwrap()
+                    .decode_value::<TestSchema1>()
+                    .unwrap()
+            };
+
+            assert_eq!(Some(field_3), get_value(&field_1), "key (1) wasn't updated");
+            assert_eq!(
+                Some(field_1),
+                get_value(&field_3),
+                "key (3) has been be changed, when it shouldn't"
+            );
+            assert_eq!(Some(field_2), get_value(&field_4), "key (4) wasn't added");
+            assert_eq!(None, get_value(&field_5), "key (5) wasn't deleted");
         }
     }
 }
