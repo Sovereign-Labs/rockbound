@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 //! This module contains the next iteration of [`crate::cache::cache_db::CacheDb`]
-use crate::cache::change_set::ChangeSet;
+use crate::cache::change_set::{ChangeSet, ChangeSetIter};
 use crate::cache::SnapshotId;
 use crate::iterator::{RawDbIter, ScanDirection};
 use crate::schema::{KeyCodec, ValueCodec};
@@ -8,7 +8,7 @@ use crate::{
     Operation, PaginatedResponse, Schema, SchemaBatch, SchemaKey, SchemaValue, SeekKeyEncoder, DB,
 };
 use std::cmp::Ordering;
-use std::iter::Peekable;
+use std::iter::{Peekable, Rev};
 use std::sync::{Arc, Mutex};
 
 /// Intermediate step between [`crate::cache::cache_db::CacheDb`] and future DeltaDbReader
@@ -126,29 +126,33 @@ impl DeltaDb {
     }
 
     //
-    fn iter_rev<S: Schema>(&self) -> anyhow::Result<()> {
+    fn iter_rev<S: Schema>(
+        &self,
+    ) -> anyhow::Result<DeltaDbIter<Rev<ChangeSetIter>, Rev<ChangeSetIter>>>
+    {
         // Local iter
         let change_set = self
             .local_cache
             .lock()
             .expect("Local cache lock must not be poisoned");
         let local_cache_iter = change_set.iter::<S>().rev();
-        let _local_cache_iter = local_cache_iter.peekable();
 
         // Snapshot iterators
-        let _snapshot_iterators = self
+        let snapshot_iterators = self
             .snapshots
             .iter()
-            .map(|snapshot| {
-                let snapshot_iter = snapshot.iter::<S>().rev();
-                snapshot_iter.peekable()
-            })
+            .map(|snapshot| snapshot.iter::<S>().rev())
             .collect::<Vec<_>>();
 
         // Db Iter
-        let _db_iter = self.db.raw_iter::<S>(ScanDirection::Backward)?;
+        let db_iter = self.db.raw_iter::<S>(ScanDirection::Backward)?;
 
-        Ok(())
+        Ok(DeltaDbIter::new(
+            local_cache_iter,
+            snapshot_iterators,
+            db_iter,
+            ScanDirection::Backward,
+        ))
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -181,8 +185,8 @@ where
 {
     fn new(
         local_cache_iter: LocalCacheIter,
-        db_iter: RawDbIter<'a>,
         snapshot_iterators: Vec<SnapshotIter>,
+        db_iter: RawDbIter<'a>,
         direction: ScanDirection,
     ) -> Self {
         Self {
@@ -418,6 +422,21 @@ mod tests {
         }
     }
 
+    mod iteration {
+        use crate::cache::delta_db::tests::open_db;
+        use crate::cache::delta_db::DeltaDb;
+
+        #[test]
+        fn test_empty_iterator() {
+            let tmpdir = tempfile::tempdir().unwrap();
+            let db = open_db(tmpdir.path());
+
+            let delta_db = DeltaDb::new(0, db, vec![]);
+
+            let iterator = delta_db.iter_rev()?;
+        }
+    }
+
     mod reading {
 
         #[test]
@@ -428,6 +447,4 @@ mod tests {
         #[ignore = "TBD"]
         fn get_prev() {}
     }
-
-    mod iteration {}
 }
