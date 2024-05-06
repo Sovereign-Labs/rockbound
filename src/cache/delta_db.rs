@@ -1,17 +1,18 @@
 #![allow(dead_code)]
-//! This module contains next iteration of [`crate::cache::cache_db::CacheDb`]
+//! This module contains the next iteration of [`crate::cache::cache_db::CacheDb`]
 use crate::cache::change_set::ChangeSet;
 use crate::cache::SnapshotId;
 use crate::iterator::{RawDbIter, ScanDirection};
 use crate::schema::{KeyCodec, ValueCodec};
 use crate::{
-    Operation, PaginatedResponse, Schema, SchemaBatch, SchemaKey, SeekKeyEncoder, DB,
+    Operation, PaginatedResponse, Schema, SchemaBatch, SchemaKey, SchemaValue, SeekKeyEncoder, DB,
 };
+use std::cmp::Ordering;
 use std::iter::Peekable;
 use std::sync::{Arc, Mutex};
 
 /// Intermediate step between [`crate::cache::cache_db::CacheDb`] and future DeltaDbReader
-/// Supports "local writes". And for historical readings uses `Vec<Arc<ChangeSet>`
+/// Supports "local writes". And for historical reading it uses `Vec<Arc<ChangeSet>`
 #[derive(Debug)]
 pub struct DeltaDb {
     /// Local writes are collected here.
@@ -68,7 +69,7 @@ impl DeltaDb {
     /// Get a value, wherever it is.
     pub fn read<S: Schema>(&self, key: &impl KeyCodec<S>) -> anyhow::Result<Option<S::Value>> {
         // Some(Operation) means that key was touched,
-        // but in case of deletion we early return None
+        // but in case of deletion, we early return None
         // Only in case of not finding operation for key,
         // we go deeper
 
@@ -124,7 +125,6 @@ impl DeltaDb {
         todo!()
     }
 
-
     //
     fn iter_rev<S: Schema>(&self) -> anyhow::Result<()> {
         // Local iter
@@ -136,11 +136,14 @@ impl DeltaDb {
         let _local_cache_iter = local_cache_iter.peekable();
 
         // Snapshot iterators
-        let _snapshot_iterators = self.snapshots.iter().map(|snapshot| {
-            let snapshot_iter = snapshot.iter::<S>().rev();
-            snapshot_iter.peekable()
-        }).collect::<Vec<_>>();
-
+        let _snapshot_iterators = self
+            .snapshots
+            .iter()
+            .map(|snapshot| {
+                let snapshot_iter = snapshot.iter::<S>().rev();
+                snapshot_iter.peekable()
+            })
+            .collect::<Vec<_>>();
 
         // Db Iter
         let _db_iter = self.db.raw_iter::<S>(ScanDirection::Backward)?;
@@ -171,11 +174,10 @@ where
     direction: ScanDirection,
 }
 
-
 impl<'a, LocalCacheIter, SnapshotIter> DeltaDbIter<'a, LocalCacheIter, SnapshotIter>
-    where
-        LocalCacheIter: Iterator<Item = (&'a SchemaKey, &'a Operation)>,
-        SnapshotIter: Iterator<Item = (&'a SchemaKey, &'a Operation)>,
+where
+    LocalCacheIter: Iterator<Item = (&'a SchemaKey, &'a Operation)>,
+    SnapshotIter: Iterator<Item = (&'a SchemaKey, &'a Operation)>,
 {
     fn new(
         local_cache_iter: LocalCacheIter,
@@ -185,11 +187,159 @@ impl<'a, LocalCacheIter, SnapshotIter> DeltaDbIter<'a, LocalCacheIter, SnapshotI
     ) -> Self {
         Self {
             local_cache_iter: local_cache_iter.peekable(),
-            snapshot_iterators: snapshot_iterators.into_iter().map(|iter| iter.peekable()).collect(),
+            snapshot_iterators: snapshot_iterators
+                .into_iter()
+                .map(|iter| iter.peekable())
+                .collect(),
             db_iter: db_iter.peekable(),
             direction,
         }
+    }
+}
 
+#[derive(Debug)]
+enum DataLocation {
+    Db,
+    // Index inside `snapshot_iterators`
+    Snapshot(usize),
+    LocalCache,
+}
+
+impl<'a, LocalCacheIter, SnapshotIter> Iterator for DeltaDbIter<'a, LocalCacheIter, SnapshotIter>
+where
+    LocalCacheIter: Iterator<Item = (&'a SchemaKey, &'a Operation)>,
+    SnapshotIter: Iterator<Item = (&'a SchemaKey, &'a Operation)>,
+{
+    // I wish
+    // type Item = (&'a SchemaKey, &'a Operation);
+    type Item = (SchemaKey, SchemaValue);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let next_values_size = self
+            .snapshot_iterators
+            .len()
+            .checked_add(2)
+            .unwrap_or_default();
+        // In case of equal next key, this vector contains all iterator locations with this key.
+        // It is filled with order: DB, Snapshots, LocalCache
+        // Right most location has the most priority, so last value is taken
+        // And all "other" locations are progressed without taking a value.
+        let mut next_value_locations: Vec<DataLocation> = Vec::with_capacity(next_values_size);
+
+        loop {
+            // Reference to the last next value observed somewhere.
+            // Used for comparing between iterators.
+
+            let mut next_value: Option<&SchemaKey> = None;
+            next_value_locations.clear();
+
+            // Pick next values from each iterator
+            // Going from DB to Snapshots to Local Cache
+            if let Some((db_key, _)) = self.db_iter.peek() {
+                next_value_locations.push(DataLocation::Db);
+                next_value = Some(db_key);
+            };
+
+            // For each snapshot, pick it next value.
+            // Update "global" next value accordingly.
+            for (idx, iter) in self.snapshot_iterators.iter_mut().enumerate() {
+                if let Some(&(peeked_key, _)) = iter.peek() {
+                    let data_location = DataLocation::Snapshot(idx);
+                    match next_value {
+                        None => {
+                            next_value_locations.push(data_location);
+                            next_value = Some(peeked_key);
+                        }
+                        Some(next_key) => {
+                            match (&self.direction, peeked_key.cmp(next_key)) {
+                                (_, Ordering::Equal) => {
+                                    next_value_locations.push(data_location);
+                                }
+                                (ScanDirection::Backward, Ordering::Greater)
+                                | (ScanDirection::Forward, Ordering::Less) => {
+                                    next_value = Some(peeked_key);
+                                    next_value_locations.clear();
+                                    next_value_locations.push(data_location);
+                                }
+                                // Key is not important for given an iterator direction
+                                _ => {}
+                            }
+                        }
+                    };
+                }
+            }
+
+            // Pick the next value from local cache
+            if let Some(&(peeked_key, _)) = self.local_cache_iter.peek() {
+                match next_value {
+                    None => {
+                        next_value_locations.push(DataLocation::LocalCache);
+                    }
+                    Some(next_key) => {
+                        match (&self.direction, peeked_key.cmp(next_key)) {
+                            (_, Ordering::Equal) => {
+                                next_value_locations.push(DataLocation::LocalCache);
+                            }
+                            (ScanDirection::Backward, Ordering::Greater)
+                            | (ScanDirection::Forward, Ordering::Less) => {
+                                next_value_locations.clear();
+                                next_value_locations.push(DataLocation::LocalCache);
+                            }
+                            // Key is not important for given an iterator direction
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            // All next values are observed at this point
+            // Handling actual change of the iterator state.
+            if let Some(latest_next_location) = next_value_locations.pop() {
+                // First, move all iterators to the next position
+                for location in &next_value_locations {
+                    match location {
+                        DataLocation::Db => {
+                            let _ = self.db_iter.next().unwrap();
+                        }
+                        DataLocation::Snapshot(idx) => {
+                            let _ = self.snapshot_iterators[*idx].next().unwrap();
+                        }
+                        DataLocation::LocalCache => {
+                            let _ = self.local_cache_iter.next().unwrap();
+                        }
+                    }
+                }
+
+                // Handle next value
+                match latest_next_location {
+                    DataLocation::Db => {
+                        let (key, value) = self.db_iter.next().unwrap();
+                        return Some((key, value));
+                    }
+                    DataLocation::Snapshot(idx) => {
+                        let (key, operation) = self.snapshot_iterators[idx].next().unwrap();
+                        match operation {
+                            Operation::Put { value } => {
+                                return Some((key.to_vec(), value.to_vec()))
+                            }
+                            Operation::Delete => continue,
+                        }
+                    }
+                    DataLocation::LocalCache => {
+                        let (key, operation) = self.local_cache_iter.next().unwrap();
+                        match operation {
+                            Operation::Put { value } => {
+                                return Some((key.to_vec(), value.to_vec()))
+                            }
+                            Operation::Delete => continue,
+                        }
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+        None
     }
 }
 
