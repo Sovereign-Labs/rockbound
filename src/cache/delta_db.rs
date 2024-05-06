@@ -33,7 +33,7 @@ impl DeltaDb {
         }
     }
 
-    /// Store a value in local cache.
+    /// Set a new value to a given key.
     pub fn put<S: Schema>(
         &self,
         key: &impl KeyCodec<S>,
@@ -46,7 +46,7 @@ impl DeltaDb {
             .put(key, value)
     }
 
-    /// Delete given key from local cache
+    /// Delete given key. Deletion of the key is going to be propagated to the DB eventually.
     pub fn delete<S: Schema>(&self, key: &impl KeyCodec<S>) -> anyhow::Result<()> {
         self.local_cache
             .lock()
@@ -65,7 +65,7 @@ impl DeltaDb {
         Ok(())
     }
 
-    /// Get a value from current snapshot, its parents or underlying database
+    /// Get a value, wherever it is.
     pub fn read<S: Schema>(&self, key: &impl KeyCodec<S>) -> anyhow::Result<Option<S::Value>> {
         // Some(Operation) means that key was touched,
         // but in case of deletion we early return None
@@ -94,12 +94,12 @@ impl DeltaDb {
         self.db.get(key)
     }
 
-    /// Get value of largest key written value for given [`Schema`]
+    /// Get a value of the largest key written value for given [`Schema`].
     pub fn get_largest<S: Schema>(&self) -> anyhow::Result<Option<(S::Key, S::Value)>> {
         todo!()
     }
 
-    /// Get largest value in [`Schema`] that is smaller than give `seek_key`
+    /// Get the largest value in [`Schema`] that is smaller than give `seek_key`.
     pub fn get_prev<S: Schema>(
         &self,
         _seek_key: &impl SeekKeyEncoder<S>,
@@ -126,7 +126,7 @@ impl DeltaDb {
 
 
     //
-    fn iter_rev<S: Schema>(&self) {
+    fn iter_rev<S: Schema>(&self) -> anyhow::Result<()> {
         // Local iter
         let change_set = self
             .local_cache
@@ -136,9 +136,16 @@ impl DeltaDb {
         let _local_cache_iter = local_cache_iter.peekable();
 
         // Snapshot iterators
+        let _snapshot_iterators = self.snapshots.iter().map(|snapshot| {
+            let snapshot_iter = snapshot.iter::<S>().rev();
+            snapshot_iter.peekable()
+        }).collect::<Vec<_>>();
 
 
         // Db Iter
+        let _db_iter = self.db.raw_iter::<S>(ScanDirection::Backward)?;
+
+        Ok(())
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -153,18 +160,38 @@ impl DeltaDb {
     }
 }
 
-struct DeltaDbIter<'a, LocalIter, SnapshotIter>
+struct DeltaDbIter<'a, LocalCacheIter, SnapshotIter>
 where
-    LocalIter: Iterator<Item = (&'a SchemaKey, &'a Operation)>,
+    LocalCacheIter: Iterator<Item = (&'a SchemaKey, &'a Operation)>,
     SnapshotIter: Iterator<Item = (&'a SchemaKey, &'a Operation)>,
 {
-    local_cache_iter: Peekable<LocalIter>,
+    local_cache_iter: Peekable<LocalCacheIter>,
     snapshot_iterators: Vec<Peekable<SnapshotIter>>,
     db_iter: Peekable<RawDbIter<'a>>,
     direction: ScanDirection,
 }
 
 
+impl<'a, LocalCacheIter, SnapshotIter> DeltaDbIter<'a, LocalCacheIter, SnapshotIter>
+    where
+        LocalCacheIter: Iterator<Item = (&'a SchemaKey, &'a Operation)>,
+        SnapshotIter: Iterator<Item = (&'a SchemaKey, &'a Operation)>,
+{
+    fn new(
+        local_cache_iter: LocalCacheIter,
+        db_iter: RawDbIter<'a>,
+        snapshot_iterators: Vec<SnapshotIter>,
+        direction: ScanDirection,
+    ) -> Self {
+        Self {
+            local_cache_iter: local_cache_iter.peekable(),
+            snapshot_iterators: snapshot_iterators.into_iter().map(|iter| iter.peekable()).collect(),
+            db_iter: db_iter.peekable(),
+            direction,
+        }
+
+    }
+}
 
 #[cfg(test)]
 mod tests {
