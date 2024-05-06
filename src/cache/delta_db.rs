@@ -2,9 +2,13 @@
 //! This module contains next iteration of [`crate::cache::cache_db::CacheDb`]
 use crate::cache::change_set::ChangeSet;
 use crate::cache::SnapshotId;
-use crate::{DB, PaginatedResponse, Schema, SchemaBatch, SeekKeyEncoder};
-use std::sync::{Arc, Mutex};
+use crate::iterator::{RawDbIter, ScanDirection};
 use crate::schema::{KeyCodec, ValueCodec};
+use crate::{
+    Operation, PaginatedResponse, Schema, SchemaBatch, SchemaKey, SeekKeyEncoder, DB,
+};
+use std::iter::Peekable;
+use std::sync::{Arc, Mutex};
 
 /// Intermediate step between [`crate::cache::cache_db::CacheDb`] and future DeltaDbReader
 /// Supports "local writes". And for historical readings uses `Vec<Arc<ChangeSet>`
@@ -13,7 +17,7 @@ pub struct DeltaDb {
     /// Local writes are collected here.
     local_cache: Mutex<ChangeSet>,
     /// Set of not finalized changes in **reverse** order.
-    previous_data: Vec<Arc<ChangeSet>>,
+    snapshots: Vec<Arc<ChangeSet>>,
     /// Reading finalized data from here.
     db: DB,
 }
@@ -24,7 +28,7 @@ impl DeltaDb {
     pub fn new(id: SnapshotId, db: DB, uncommited_changes: Vec<Arc<ChangeSet>>) -> Self {
         Self {
             local_cache: Mutex::new(ChangeSet::new(id)),
-            previous_data: uncommited_changes,
+            snapshots: uncommited_changes,
             db,
         }
     }
@@ -79,7 +83,15 @@ impl DeltaDb {
             return operation.decode_value::<S>();
         }
 
-        todo!()
+        // 2. Check in snapshots, in reverse order
+        for snapshot in self.snapshots.iter() {
+            if let Some(operation) = snapshot.get::<S>(key)? {
+                return operation.decode_value::<S>();
+            }
+        }
+
+        // 3. Check in DB
+        self.db.get(key)
     }
 
     /// Get value of largest key written value for given [`Schema`]
@@ -94,7 +106,6 @@ impl DeltaDb {
     ) -> anyhow::Result<Option<(S::Key, S::Value)>> {
         todo!()
     }
-
 
     /// Get `n` keys >= `seek_key`
     pub fn get_n_from_first_match<S: Schema>(
@@ -113,6 +124,23 @@ impl DeltaDb {
         todo!()
     }
 
+
+    //
+    fn iter_rev<S: Schema>(&self) {
+        // Local iter
+        let change_set = self
+            .local_cache
+            .lock()
+            .expect("Local cache lock must not be poisoned");
+        let local_cache_iter = change_set.iter::<S>().rev();
+        let _local_cache_iter = local_cache_iter.peekable();
+
+        // Snapshot iterators
+
+
+        // Db Iter
+    }
+
     // ---------------------------------------------------------------------------------------------
     // ---------------------------------------------------------------------------------------------
     /// Get a clone of internal ChangeSet
@@ -123,4 +151,106 @@ impl DeltaDb {
             .expect("Local change set lock is poisoned");
         change_set.clone()
     }
+}
+
+struct DeltaDbIter<'a, LocalIter, SnapshotIter>
+where
+    LocalIter: Iterator<Item = (&'a SchemaKey, &'a Operation)>,
+    SnapshotIter: Iterator<Item = (&'a SchemaKey, &'a Operation)>,
+{
+    local_cache_iter: Peekable<LocalIter>,
+    snapshot_iterators: Vec<Peekable<SnapshotIter>>,
+    db_iter: Peekable<RawDbIter<'a>>,
+    direction: ScanDirection,
+}
+
+
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use rocksdb::DEFAULT_COLUMN_FAMILY_NAME;
+
+    use super::*;
+    use crate::schema::KeyEncoder;
+    use crate::test::{TestCompositeField, TestField};
+    use crate::{define_schema, SchemaKey, SchemaValue, DB};
+
+    define_schema!(TestSchema, TestCompositeField, TestField, "TestCF");
+
+    fn open_db(dir: impl AsRef<Path>) -> DB {
+        let column_families = vec![DEFAULT_COLUMN_FAMILY_NAME, TestSchema::COLUMN_FAMILY_NAME];
+        let mut db_opts = rocksdb::Options::default();
+        db_opts.create_if_missing(true);
+        db_opts.create_missing_column_families(true);
+        DB::open(dir, "test", column_families, &db_opts).expect("Failed to open DB.")
+    }
+
+    // Test utils
+    fn encode_key(key: &TestCompositeField) -> SchemaKey {
+        <TestCompositeField as KeyEncoder<TestSchema>>::encode_key(key).unwrap()
+    }
+
+    fn encode_value(value: &TestField) -> SchemaValue {
+        <TestField as ValueCodec<TestSchema>>::encode_value(value).unwrap()
+    }
+
+    fn put_value(delta_db: &DeltaDb, key: u32, value: u32) {
+        delta_db
+            .put::<TestSchema>(&TestCompositeField(key, 0, 0), &TestField(value))
+            .unwrap();
+    }
+
+    fn check_value(delta_db: &DeltaDb, key: u32, expected_value: Option<u32>) {
+        let actual_value = delta_db
+            .read::<TestSchema>(&TestCompositeField(key, 0, 0))
+            .unwrap()
+            .map(|v| v.0);
+        assert_eq!(expected_value, actual_value);
+    }
+
+    fn delete_key(delta_db: &DeltaDb, key: u32) {
+        delta_db
+            .delete::<TestSchema>(&TestCompositeField(key, 0, 0))
+            .unwrap();
+    }
+
+    // End of test utils
+
+    mod local_cache {
+        use super::*;
+        #[test]
+        fn test_delta_db_put_get_delete() {
+            // Simple lifecycle of a key-value pair:
+            // 1. Put
+            let tmpdir = tempfile::tempdir().unwrap();
+            let db = open_db(tmpdir.path());
+
+            let delta_db = DeltaDb::new(0, db, vec![]);
+
+            // Not existing
+            check_value(&delta_db, 1, None);
+            // Simple value
+            put_value(&delta_db, 1, 10);
+            check_value(&delta_db, 1, Some(10));
+
+            // Delete
+            delete_key(&delta_db, 1);
+            check_value(&delta_db, 1, None);
+        }
+    }
+
+    mod reading {
+
+        #[test]
+        #[ignore = "TBD"]
+        fn get_largest() {}
+
+        #[test]
+        #[ignore = "TBD"]
+        fn get_prev() {}
+    }
+
+    mod iteration {}
 }
