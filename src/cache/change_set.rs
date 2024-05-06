@@ -25,6 +25,14 @@ impl ChangeSet {
         }
     }
 
+    /// Create new `ChangeSet
+    pub fn new_with_operations(id: SnapshotId, operations: SchemaBatch) -> Self {
+        Self {
+            id, operations
+        }
+
+    }
+
     /// Get value from its own cache
     pub fn get<S: Schema>(&self, key: &impl KeyCodec<S>) -> anyhow::Result<Option<&Operation>> {
         self.operations.get(key)
