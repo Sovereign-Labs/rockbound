@@ -19,6 +19,7 @@ impl SchemaBatch {
     }
 
     /// Adds an insert/update operation to the batch.
+    // TODO: made this pub(crate) ???
     pub fn put<S: Schema>(
         &mut self,
         key: &impl KeyCodec<S>,
@@ -38,6 +39,7 @@ impl SchemaBatch {
     }
 
     /// Adds a delete operation to the batch.
+    // TODO: Make this pub(crate)
     pub fn delete<S: Schema>(&mut self, key: &impl KeyCodec<S>) -> anyhow::Result<()> {
         let key = key.encode_key()?;
         self.insert_operation::<S>(key, Operation::Delete);
@@ -50,10 +52,8 @@ impl SchemaBatch {
         column_writes.insert(key, operation);
     }
 
-    pub(crate) fn get<S: Schema>(
-        &self,
-        key: &impl KeyCodec<S>,
-    ) -> anyhow::Result<Option<&Operation>> {
+    /// Getting the
+    pub fn get<S: Schema>(&self, key: &impl KeyCodec<S>) -> anyhow::Result<Option<&Operation>> {
         let key = key.encode_key()?;
 
         if let Some(column_writes) = self.last_writes.get(&S::COLUMN_FAMILY_NAME) {

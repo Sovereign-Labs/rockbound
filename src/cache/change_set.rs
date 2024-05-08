@@ -27,10 +27,7 @@ impl ChangeSet {
 
     /// Create new `ChangeSet
     pub fn new_with_operations(id: SnapshotId, operations: SchemaBatch) -> Self {
-        Self {
-            id, operations
-        }
-
+        Self { id, operations }
     }
 
     /// Get value from its own cache
