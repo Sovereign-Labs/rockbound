@@ -313,6 +313,7 @@ pub type SchemaValue = Vec<u8>;
 /// Represents operation written to the database.
 #[cfg_attr(feature = "arbitrary", derive(proptest_derive::Arbitrary))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
+// TODO: Do we want "generic" operation, with 2 options: S::Value and SchemaValue?
 pub enum Operation {
     /// Writing a value to the DB.
     Put {

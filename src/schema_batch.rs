@@ -52,8 +52,11 @@ impl SchemaBatch {
         column_writes.insert(key, operation);
     }
 
-    /// Getting the
-    pub fn get<S: Schema>(&self, key: &impl KeyCodec<S>) -> anyhow::Result<Option<&Operation>> {
+    /// Getting the operation from current schema batch if present
+    pub(crate) fn get_operation<S: Schema>(
+        &self,
+        key: &impl KeyCodec<S>,
+    ) -> anyhow::Result<Option<&Operation>> {
         let key = key.encode_key()?;
 
         if let Some(column_writes) = self.last_writes.get(&S::COLUMN_FAMILY_NAME) {
@@ -61,6 +64,17 @@ impl SchemaBatch {
         } else {
             Ok(None)
         }
+    }
+
+    /// Getting value by key if it was written in this batch.
+    /// Deleted operation will return None as well as missing key
+    pub fn get_value<S: Schema>(&self, key: &impl KeyCodec<S>) -> anyhow::Result<Option<S::Value>> {
+        let operation = self.get_operation(key)?;
+        if let Some(operation) = operation {
+            let value = operation.decode_value::<S>()?;
+            return Ok(value);
+        }
+        Ok(None)
     }
 
     /// Iterator over all values in lexicographic order.
@@ -319,7 +333,7 @@ mod tests {
 
             let get_value = |field: &TestField| -> Option<TestField> {
                 batch1
-                    .get::<TestSchema1>(field)
+                    .get_operation::<TestSchema1>(field)
                     .unwrap()
                     .unwrap()
                     .decode_value::<TestSchema1>()

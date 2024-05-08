@@ -32,7 +32,7 @@ impl ChangeSet {
 
     /// Get value from its own cache
     pub fn get<S: Schema>(&self, key: &impl KeyCodec<S>) -> anyhow::Result<Option<&Operation>> {
-        self.operations.get(key)
+        self.operations.get_operation(key)
     }
 
     /// Get the ID of this [`ChangeSet`].
