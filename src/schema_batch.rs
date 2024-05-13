@@ -19,7 +19,6 @@ impl SchemaBatch {
     }
 
     /// Adds an insert/update operation to the batch.
-    // TODO: made this pub(crate) ???
     pub fn put<S: Schema>(
         &mut self,
         key: &impl KeyCodec<S>,
@@ -39,7 +38,6 @@ impl SchemaBatch {
     }
 
     /// Adds a delete operation to the batch.
-    // TODO: Make this pub(crate)
     pub fn delete<S: Schema>(&mut self, key: &impl KeyCodec<S>) -> anyhow::Result<()> {
         let key = key.encode_key()?;
         self.insert_operation::<S>(key, Operation::Delete);
