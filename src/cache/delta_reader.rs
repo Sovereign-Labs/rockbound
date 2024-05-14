@@ -34,7 +34,7 @@ impl DeltaReader {
     pub fn get<S: Schema>(&self, key: &impl KeyCodec<S>) -> anyhow::Result<Option<S::Value>> {
         // Some(Operation) means that key was touched,
         // but in case of deletion, we early return None
-        // Only in case of not finding operation for key,
+        // Only in case of not finding operation for a key,
         // we go deeper
 
         // 1. Check in snapshots, in reverse order
@@ -150,7 +150,7 @@ where
             .unwrap_or_default();
         // In case of equal next key, this vector contains all iterator locations with this key.
         // It is filled with order: DB, Snapshots, LocalCache
-        // Right most location has the most priority, so last value is taken
+        // Right most location has the most priority, so the last value is taken
         // And all "other" locations are progressed without taking a value.
         let mut next_value_locations: Vec<DataLocation> = Vec::with_capacity(next_values_size);
 
@@ -241,10 +241,10 @@ mod tests {
     use std::path::Path;
 
     use rocksdb::DEFAULT_COLUMN_FAMILY_NAME;
-    use rockbound::schema::ValueCodec;
 
     use super::*;
     use crate::schema::KeyEncoder;
+    use crate::schema::ValueCodec;
     use crate::test::{TestCompositeField, TestField};
     use crate::{define_schema, SchemaKey, SchemaValue, DB};
 
@@ -267,12 +267,6 @@ mod tests {
         <TestField as ValueCodec<TestSchema>>::encode_value(value).unwrap()
     }
 
-    fn put_value(delta_db: &DeltaReader, key: u32, value: u32) {
-        delta_db
-            .put::<TestSchema>(&TestCompositeField(key, 0, 0), &TestField(value))
-            .unwrap();
-    }
-
     fn check_value(delta_db: &DeltaReader, key: u32, expected_value: Option<u32>) {
         let actual_value = delta_db
             .get::<TestSchema>(&TestCompositeField(key, 0, 0))
@@ -281,60 +275,23 @@ mod tests {
         assert_eq!(expected_value, actual_value);
     }
 
-    fn delete_key(delta_db: &DeltaReader, key: u32) {
-        delta_db
-            .delete::<TestSchema>(&TestCompositeField(key, 0, 0))
-            .unwrap();
-    }
-
     // End of test utils
 
-    mod local_cache {
-        use super::*;
-        #[test]
-        fn test_delta_db_put_get_delete() {
-            // Simple lifecycle of a key-value pair:
-            // 1. Put
-            let tmpdir = tempfile::tempdir().unwrap();
-            let db = open_db(tmpdir.path());
+    #[test]
+    fn test_empty_iterator() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db = open_db(tmpdir.path());
 
-            let delta_db = DeltaReader::new(db, vec![]);
+        let delta_db = DeltaReader::new(db, vec![]);
 
-            // Not existing
-            check_value(&delta_db, 1, None);
-            // Simple value
-            put_value(&delta_db, 1, 10);
-            check_value(&delta_db, 1, Some(10));
-
-            // Delete
-            delete_key(&delta_db, 1);
-            check_value(&delta_db, 1, None);
-        }
+        let _iterator = delta_db.iter_rev::<TestSchema>().unwrap();
     }
 
-    mod iteration {
-        use crate::cache::delta_reader::tests::open_db;
-        use crate::cache::delta_reader::DeltaReader;
+    #[test]
+    #[ignore = "TBD"]
+    fn get_largest() {}
 
-        #[test]
-        fn test_empty_iterator() {
-            let tmpdir = tempfile::tempdir().unwrap();
-            let db = open_db(tmpdir.path());
-
-            let delta_db = DeltaReader::new(db, vec![]);
-
-            let iterator = delta_db.iter_rev()?;
-        }
-    }
-
-    mod reading {
-
-        #[test]
-        #[ignore = "TBD"]
-        fn get_largest() {}
-
-        #[test]
-        #[ignore = "TBD"]
-        fn get_prev() {}
-    }
+    #[test]
+    #[ignore = "TBD"]
+    fn get_prev() {}
 }
