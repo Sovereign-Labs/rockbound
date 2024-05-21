@@ -100,6 +100,14 @@ impl CacheDb {
         parent.get::<S>(local_cache.id(), key)
     }
 
+    /// Get a value from current snapshot, its parents or underlying database
+    pub async fn read_async<S: Schema>(
+        &self,
+        key: &impl KeyCodec<S>,
+    ) -> anyhow::Result<Option<S::Value>> {
+        tokio::task::block_in_place(|| self.read(key))
+    }
+
     /// Get value of largest key written value for given [`Schema`]
     pub fn get_largest<S: Schema>(&self) -> anyhow::Result<Option<(S::Key, S::Value)>> {
         let change_set = self
@@ -125,6 +133,11 @@ impl CacheDb {
         }
 
         Ok(None)
+    }
+
+    /// Get value of largest key written value for given [`Schema`]
+    pub async fn get_largest_async<S: Schema>(&self) -> anyhow::Result<Option<(S::Key, S::Value)>> {
+        tokio::task::block_in_place(|| self.get_largest::<S>())
     }
 
     /// Get largest value in [`Schema`] that is smaller than give `seek_key`
@@ -158,6 +171,14 @@ impl CacheDb {
             return Ok(Some((key, value)));
         }
         Ok(None)
+    }
+
+    /// Get largest value in [`Schema`] that is smaller than give `seek_key`
+    pub async fn get_prev_async<S: Schema>(
+        &self,
+        seek_key: &impl SeekKeyEncoder<S>,
+    ) -> anyhow::Result<Option<(S::Key, S::Value)>> {
+        tokio::task::block_in_place(|| self.get_prev(seek_key))
     }
 
     /// Get `n` keys >= `seek_key`
@@ -206,6 +227,15 @@ impl CacheDb {
         })
     }
 
+    /// Get `n` keys >= `seek_key`
+    pub async fn get_n_from_first_match_async<S: Schema>(
+        &self,
+        seek_key: &impl SeekKeyEncoder<S>,
+        n: usize,
+    ) -> anyhow::Result<PaginatedResponse<S>> {
+        tokio::task::block_in_place(|| self.get_n_from_first_match(seek_key, n))
+    }
+
     /// Get a clone of internal ChangeSet
     pub fn clone_change_set(&self) -> ChangeSet {
         let change_set = self
@@ -250,6 +280,14 @@ impl CacheDb {
             .collect();
 
         Ok(result)
+    }
+
+    /// Collects all key-value pairs in given range, from smallest to largest.
+    pub async fn collect_in_range_async<S: Schema, Sk: SeekKeyEncoder<S>>(
+        &self,
+        range: std::ops::Range<Sk>,
+    ) -> anyhow::Result<Vec<(S::Key, S::Value)>> {
+        tokio::task::block_in_place(|| self.collect_in_range(range))
     }
 }
 
