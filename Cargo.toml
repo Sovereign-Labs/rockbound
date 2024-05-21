@@ -23,7 +23,7 @@ proptest-derive = { version = "0.4", optional = true }
 rocksdb = { version = "0.21" }
 thiserror = "1"
 tracing = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [dev-dependencies]
 rockbound = { path = ".", features = ["test-utils"] }
