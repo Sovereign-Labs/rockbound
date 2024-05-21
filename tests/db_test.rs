@@ -345,3 +345,66 @@ fn test_checkpoint() {
         assert_eq!(db.get::<TestSchema1>(&TestField(1)).unwrap(), None);
     }
 }
+
+mod async_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_async_ops() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db = open_db(tmpdir);
+
+        db.put_async::<TestSchema1>(&TestField(1), &TestField(55))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_async::<TestSchema1>(&TestField(1)).await.unwrap(),
+            Some(TestField(55)),
+        );
+
+        db.delete_async::<TestSchema1>(&TestField(1)).await.unwrap();
+        assert!(db
+            .get_async::<TestSchema1>(&TestField(1))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_checkpoint() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let checkpoint_parent = tempfile::tempdir().unwrap();
+        let checkpoint = checkpoint_parent.path().join("checkpoint");
+        {
+            let db = open_db(&tmpdir);
+            db.put_async::<TestSchema1>(&TestField(0), &TestField(0))
+                .await
+                .unwrap();
+            db.create_checkpoint_async(&checkpoint).await.unwrap();
+        }
+        {
+            let db = open_db(&tmpdir);
+            assert_eq!(
+                db.get_async::<TestSchema1>(&TestField(0)).await.unwrap(),
+                Some(TestField(0)),
+            );
+
+            let cp = open_db(&checkpoint);
+            assert_eq!(
+                cp.get_async::<TestSchema1>(&TestField(0)).await.unwrap(),
+                Some(TestField(0)),
+            );
+            cp.put_async::<TestSchema1>(&TestField(1), &TestField(1))
+                .await
+                .unwrap();
+            assert_eq!(
+                cp.get_async::<TestSchema1>(&TestField(1)).await.unwrap(),
+                Some(TestField(1)),
+            );
+            assert_eq!(
+                db.get_async::<TestSchema1>(&TestField(1)).await.unwrap(),
+                None
+            );
+        }
+    }
+}

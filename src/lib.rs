@@ -142,6 +142,14 @@ impl DB {
             .map_err(|err| err.into())
     }
 
+    /// Reads a single record by key asynchronously.
+    pub async fn get_async<S: Schema>(
+        &self,
+        schema_key: &impl KeyCodec<S>,
+    ) -> anyhow::Result<Option<S::Value>> {
+        tokio::task::block_in_place(|| self.get(schema_key))
+    }
+
     /// Writes single record.
     pub fn put<S: Schema>(
         &self,
@@ -155,6 +163,15 @@ impl DB {
         self.write_schemas(&batch)
     }
 
+    /// Writes a single record asynchronously.
+    pub async fn put_async<S: Schema>(
+        &self,
+        key: &impl KeyCodec<S>,
+        value: &impl ValueCodec<S>,
+    ) -> anyhow::Result<()> {
+        tokio::task::block_in_place(|| self.put(key, value))
+    }
+
     /// Delete a single key from the database.
     pub fn delete<S: Schema>(&self, key: &impl KeyCodec<S>) -> anyhow::Result<()> {
         // Not necessary to use a batch, but we'd like a central place to bump counters.
@@ -162,6 +179,11 @@ impl DB {
         let mut batch = SchemaBatch::new();
         batch.delete::<S>(key)?;
         self.write_schemas(&batch)
+    }
+
+    /// Delete a single key from the database asynchronously.
+    pub async fn delete_async<S: Schema>(&self, key: &impl KeyCodec<S>) -> anyhow::Result<()> {
+        tokio::task::block_in_place(|| self.delete(key))
     }
 
     /// Removes the database entries in the range `["from", "to")` using default write options.
@@ -179,6 +201,19 @@ impl DB {
         let to = to.encode_seek_key()?;
         self.inner.delete_range_cf(cf_handle, from, to)?;
         Ok(())
+    }
+
+    /// Removes the database entries in the range `["from", "to")` using default write options asynchronously.
+    ///
+    /// Note that this operation will be done lexicographic on the *encoding* of the seek keys. It is
+    /// up to the table creator to ensure that the lexicographic ordering of the encoded seek keys matches the
+    /// logical ordering of the type.
+    pub async fn delete_range_async<S: Schema>(
+        &self,
+        from: &impl SeekKeyEncoder<S>,
+        to: &impl SeekKeyEncoder<S>,
+    ) -> anyhow::Result<()> {
+        tokio::task::block_in_place(|| self.delete_range(from, to))
     }
 
     fn iter_with_direction<S: Schema>(
@@ -269,6 +304,11 @@ impl DB {
         Ok(())
     }
 
+    /// Writes a group of records wrapped in a [`SchemaBatch`] asynchronously.
+    pub async fn write_schemas_async(&self, batch: &SchemaBatch) -> anyhow::Result<()> {
+        tokio::task::block_in_place(|| self.write_schemas(batch))
+    }
+
     fn get_cf_handle(&self, cf_name: &str) -> anyhow::Result<&rocksdb::ColumnFamily> {
         self.inner.cf_handle(cf_name).ok_or_else(|| {
             format_err!(
@@ -302,6 +342,11 @@ impl DB {
     pub fn create_checkpoint<P: AsRef<Path>>(&self, path: P) -> anyhow::Result<()> {
         rocksdb::checkpoint::Checkpoint::new(&self.inner)?.create_checkpoint(path)?;
         Ok(())
+    }
+
+    /// Creates new physical DB checkpoint in directory specified by `path` asynchronously.
+    pub async fn create_checkpoint_async<P: AsRef<Path>>(&self, path: P) -> anyhow::Result<()> {
+        tokio::task::block_in_place(|| self.create_checkpoint(path))
     }
 }
 
