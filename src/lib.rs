@@ -69,13 +69,15 @@ impl Operation {
 }
 
 fn is_range_bounds_inverse(range: &impl std::ops::RangeBounds<SchemaKey>) -> bool {
+    use std::ops::Bound;
+
     match (range.start_bound(), range.end_bound()) {
-        (std::ops::Bound::Included(start), std::ops::Bound::Included(end)) => start > end,
-        (std::ops::Bound::Included(start), std::ops::Bound::Excluded(end)) => start > end,
-        (std::ops::Bound::Excluded(start), std::ops::Bound::Included(end)) => start > end,
-        (std::ops::Bound::Excluded(start), std::ops::Bound::Excluded(end)) => start > end,
-        (std::ops::Bound::Unbounded, _) => false,
-        (_, std::ops::Bound::Unbounded) => false,
+        (Bound::Unbounded, _) => false,
+        (_, Bound::Unbounded) => false,
+        (
+            Bound::Excluded(start) | Bound::Included(start),
+            Bound::Excluded(end) | Bound::Included(end),
+        ) => start > end,
     }
 }
 
