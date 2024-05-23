@@ -22,10 +22,10 @@ pub trait Schema: Debug + Send + Sync + 'static + Sized {
     const COLUMN_FAMILY_NAME: ColumnFamilyName;
 
     /// Type of the key.
-    type Key: KeyCodec<Self>;
+    type Key: KeyCodec<Self> + Send + 'static;
 
     /// Type of the value.
-    type Value: ValueCodec<Self>;
+    type Value: ValueCodec<Self> + Send + 'static;
 }
 
 /// A [`core::result::Result`] alias with [`CodecError`] as the error type.
