@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::iterator::ScanDirection;
 use crate::iterator::{SchemaIterator, SeekKeyEncoder};
@@ -18,10 +19,10 @@ use crate::schema_batch::SchemaBatch;
 
 /// This DB is a schematized RocksDB wrapper where all data passed in and out are typed according to
 /// [`Schema`]s.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DB {
     name: &'static str, // for logging
-    inner: rocksdb::DB,
+    inner: Arc<rocksdb::DB>,
 }
 
 impl DB {
@@ -88,7 +89,10 @@ impl DB {
 
     fn log_construct(name: &'static str, inner: rocksdb::DB) -> DB {
         info!(rocksdb_name = name, "Opened RocksDB");
-        DB { name, inner }
+        DB {
+            name,
+            inner: Arc::new(inner),
+        }
     }
 
     /// Reads single record by key.
