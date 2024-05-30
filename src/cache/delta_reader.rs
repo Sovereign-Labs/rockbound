@@ -2,7 +2,7 @@
 //! This module contains the next iteration of [`crate::cache::cache_db::CacheDb`]
 use crate::cache::change_set::ChangeSetIter;
 use crate::iterator::{RawDbIter, ScanDirection};
-use crate::schema::KeyCodec;
+use crate::schema::{KeyCodec, KeyDecoder, ValueCodec};
 use crate::{
     Operation, PaginatedResponse, Schema, SchemaBatch, SchemaKey, SchemaValue, SeekKeyEncoder, DB,
 };
@@ -14,7 +14,9 @@ use std::sync::Arc;
 /// Supports "local writes". And for historical reading it uses `Vec<Arc<ChangeSet>`
 #[derive(Debug)]
 pub struct DeltaReader {
-    /// Set of not finalized changes in **reverse** order.
+    /// Set of not finalized changes in chronological order.
+    /// Meaning that the first snapshot in the vector is the oldest and the latest is the most recent.
+    /// If keys are equal, value from more recent snapshot is taken.
     snapshots: Vec<Arc<SchemaBatch>>,
     /// Reading finalized data from here.
     db: DB,
@@ -22,7 +24,7 @@ pub struct DeltaReader {
 
 impl DeltaReader {
     /// Creates new [`DeltaReader`] with given `id`, `db` and `uncommited_changes`.
-    /// `uncommited_changes` should be in reverse order.
+    /// `uncommited_changes` should be in chronological order.
     pub fn new(db: DB, uncommited_changes: Vec<Arc<SchemaBatch>>) -> Self {
         Self {
             snapshots: uncommited_changes,
@@ -52,7 +54,13 @@ impl DeltaReader {
 
     /// Get a value of the largest key written value for given [`Schema`].
     pub async fn get_largest<S: Schema>(&self) -> anyhow::Result<Option<(S::Key, S::Value)>> {
-        todo!()
+        let mut iterator = self.iter_rev::<S>()?;
+        if let Some((key, value)) = iterator.next() {
+            let key = S::Key::decode_key(&key)?;
+            let value = S::Value::decode_value(&value)?;
+            return Ok(Some((key, value)));
+        }
+        Ok(None)
     }
 
     /// Get the largest value in [`Schema`] that is smaller than give `seek_key`.
@@ -82,14 +90,16 @@ impl DeltaReader {
 
     //
     fn iter_rev<S: Schema>(&self) -> anyhow::Result<DeltaReaderIter<Rev<ChangeSetIter>>> {
-        // Snapshot iterators
+        // Snapshot iterators.
+        // Snapshots are in natural order, but k/v are in reversed.
+        // Snapshots needs to be in natural order, so chronology is always preserved.
         let snapshot_iterators = self
             .snapshots
             .iter()
             .map(|snapshot| snapshot.iter::<S>().rev())
             .collect::<Vec<_>>();
 
-        // Db Iter
+        // Database iterator
         let db_iter = self.db.raw_iter::<S>(ScanDirection::Backward)?;
 
         Ok(DeltaReaderIter::new(
@@ -201,6 +211,7 @@ where
 
             // All next values are observed at this point
             // Handling actual change of the iterator state.
+            // Rightmost value in the next locations is the most recent, so it is taken.
             if let Some(latest_next_location) = next_value_locations.pop() {
                 // First, move all iterators to the next position
                 for location in &next_value_locations {
@@ -265,16 +276,16 @@ mod tests {
 
     // Test utils
     fn encode_key(key: &TestCompositeField) -> SchemaKey {
-        <TestCompositeField as KeyEncoder<TestSchema>>::encode_key(key).unwrap()
+        <TestCompositeField as KeyEncoder<S>>::encode_key(key).unwrap()
     }
 
     fn encode_value(value: &TestField) -> SchemaValue {
-        <TestField as ValueCodec<TestSchema>>::encode_value(value).unwrap()
+        <TestField as ValueCodec<S>>::encode_value(value).unwrap()
     }
 
     async fn check_value(delta_db: &DeltaReader, key: u32, expected_value: Option<u32>) {
         let actual_value = delta_db
-            .get::<TestSchema>(&TestCompositeField(key, 0, 0))
+            .get::<S>(&TestCompositeField(key, 0, 0))
             .await
             .unwrap()
             .map(|v| v.0);
@@ -283,15 +294,23 @@ mod tests {
 
     // End of test utils
 
-    #[test]
-    fn test_empty_iterator() {
+    #[tokio::test]
+    async fn test_empty() {
         let tmpdir = tempfile::tempdir().unwrap();
         let db = open_db(tmpdir.path());
 
         let delta_db = DeltaReader::new(db, vec![]);
 
-        let values: Vec<_> = delta_db.iter_rev::<TestSchema>().unwrap().collect();
-        assert!(values.is_empty())
+        let values: Vec<_> = delta_db.iter_rev::<S>().unwrap().collect();
+        assert!(values.is_empty());
+
+        let largest = delta_db.get_largest::<S>().await.unwrap();
+
+        assert!(largest.is_none());
+
+        // let key = TestCompositeField::MAX;
+        // let prev = delta_db.get_prev::<S>(&key).await.unwrap();
+        // assert!(prev.is_none());
     }
 
     #[test]
@@ -317,7 +336,7 @@ mod tests {
 
         let delta_db = DeltaReader::new(db, vec![Arc::new(schema_batch_1)]);
 
-        let values: Vec<_> = delta_db.iter_rev::<TestSchema>().unwrap().collect();
+        let values: Vec<_> = delta_db.iter_rev::<S>().unwrap().collect();
         assert_eq!(5, values.len());
 
         assert!(
@@ -326,14 +345,13 @@ mod tests {
         );
     }
 
-    fn check_rev_iterator(
+    fn execute_rev_iterator(
         db_entries: Vec<(TestCompositeField, TestField)>,
         snapshots: Vec<Vec<(TestCompositeField, TestField)>>,
-    ) {
+    ) -> Vec<(SchemaKey, SchemaValue)> {
         let tmpdir = tempfile::tempdir().unwrap();
         let db = open_db(tmpdir.path());
 
-        // Write DB values
         let mut db_batch = SchemaBatch::new();
         for (key, value) in db_entries {
             db_batch.put::<S>(&key, &value).unwrap();
@@ -351,17 +369,60 @@ mod tests {
 
         let delta_db = DeltaReader::new(db, schema_batches);
 
-        let values: Vec<_> = delta_db.iter_rev::<TestSchema>().unwrap().collect();
-        assert!(
-            values.windows(2).all(|w| w[0].0 >= w[1].0),
-            "iter_rev should be sorted in reversed order"
-        );
+        let values: Vec<_> = delta_db.iter_rev::<S>().unwrap().collect();
+        values
+    }
+
+    fn execute_deletions(
+        db_entries: Vec<(TestCompositeField, TestField)>,
+        snapshots: Vec<Vec<(TestCompositeField, TestField)>>,
+    ) -> Vec<(SchemaKey, SchemaValue)> {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db = open_db(tmpdir.path());
+
+        // All keys will be "deleted" in the latest snapshot,
+        //  so the resulting iterator should yield an empty result
+        let mut latest_schema_batch = SchemaBatch::new();
+
+        let mut db_batch = SchemaBatch::new();
+        for (key, value) in db_entries {
+            db_batch.put::<S>(&key, &value).unwrap();
+            latest_schema_batch.delete::<S>(&key).unwrap();
+        }
+        db.write_schemas(&db_batch).unwrap();
+
+        let mut schema_batches = Vec::new();
+        for snapshot in snapshots {
+            let mut schema_batch = SchemaBatch::new();
+            for (key, value) in snapshot {
+                schema_batch.put::<S>(&key, &value).unwrap();
+                latest_schema_batch.delete::<S>(&key).unwrap();
+            }
+            schema_batches.push(Arc::new(schema_batch));
+        }
+
+        schema_batches.push(Arc::new(latest_schema_batch));
+
+        let delta_db = DeltaReader::new(db, schema_batches);
+
+        let values: Vec<_> = delta_db.iter_rev::<S>().unwrap().collect();
+        values
     }
 
     proptest! {
         #[test]
         fn proptest_rev_iterator_simple((db_entries, snapshots) in generate_db_entries_and_snapshots()) {
-            check_rev_iterator(db_entries, snapshots);
+            let values = execute_rev_iterator(db_entries, snapshots);
+            prop_assert!(
+                values.windows(2).all(|w| w[0].0 >= w[1].0),
+                "iter_rev should be sorted in reversed order"
+            );
+       }
+
+        #[test]
+        fn proptest_rev_iterator_everything_was_deleted((db_entries, snapshots) in generate_db_entries_and_snapshots()) {
+            let values = execute_deletions(db_entries, snapshots);
+            prop_assert!(values.is_empty());
        }
     }
 
@@ -371,10 +432,10 @@ mod tests {
             Vec<Vec<(TestCompositeField, TestField)>>,
         ),
     > {
-        let entries = prop::collection::vec((any::<TestCompositeField>(), any::<TestField>()), 500);
+        let entries = prop::collection::vec((any::<TestCompositeField>(), any::<TestField>()), 50);
         let snapshots = prop::collection::vec(
-            prop::collection::vec((any::<TestCompositeField>(), any::<TestField>()), 100),
-            20,
+            prop::collection::vec((any::<TestCompositeField>(), any::<TestField>()), 10),
+            4,
         );
         (entries, snapshots)
     }

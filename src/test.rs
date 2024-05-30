@@ -10,6 +10,13 @@ use crate::{CodecError, Schema, SeekKeyEncoder};
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub struct TestCompositeField(pub u32, pub u32, pub u32);
 
+impl TestCompositeField {
+    /// Max value wrapper.
+    pub const MAX: Self = TestCompositeField(u32::MAX, u32::MAX, u32::MAX);
+    /// Min value wrapper.
+    pub const MIN: Self = TestCompositeField(0, 0, 0);
+}
+
 /// Simple wrapper around [`u32`].
 #[derive(Debug, Eq, PartialEq, Clone, Copy)]
 pub struct TestField(pub u32);
