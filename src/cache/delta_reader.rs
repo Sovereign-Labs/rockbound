@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 //! This module contains the next iteration of [`crate::cache::cache_db::CacheDb`]
-use crate::cache::change_set::ChangeSetIter;
+use crate::cache::change_set::{ChangeSetIter, ChangeSetRange};
 use crate::iterator::{RawDbIter, ScanDirection};
 use crate::schema::{KeyCodec, KeyDecoder, ValueCodec};
 use crate::{
@@ -38,8 +38,7 @@ impl DeltaReader {
         // we go deeper
 
         tokio::task::block_in_place(|| {
-            // 1. Check in snapshots, in reverse order
-            for snapshot in self.snapshots.iter() {
+            for snapshot in self.snapshots.iter().rev() {
                 if let Some(operation) = snapshot.get_operation::<S>(key)? {
                     return operation.decode_value::<S>();
                 }
@@ -64,9 +63,18 @@ impl DeltaReader {
     /// Get the largest value in [`Schema`] that is smaller than give `seek_key`.
     pub async fn get_prev<S: Schema>(
         &self,
-        _seek_key: &impl SeekKeyEncoder<S>,
+        seek_key: &impl SeekKeyEncoder<S>,
     ) -> anyhow::Result<Option<(S::Key, S::Value)>> {
-        todo!()
+        let seek_key = seek_key.encode_seek_key()?;
+        let range = ..=seek_key;
+
+        let mut iterator = self.iter_rev_range::<S>(range)?;
+        if let Some((key, value)) = iterator.next() {
+            let key = S::Key::decode_key(&key)?;
+            let value = S::Value::decode_value(&value)?;
+            return Ok(Some((key, value)));
+        }
+        Ok(None)
     }
 
     /// Get `n` keys >= `seek_key`
@@ -90,7 +98,7 @@ impl DeltaReader {
     fn iter_rev<S: Schema>(&self) -> anyhow::Result<DeltaReaderIter<Rev<ChangeSetIter>>> {
         // Snapshot iterators.
         // Snapshots are in natural order, but k/v are in reversed.
-        // Snapshots needs to be in natural order, so chronology is always preserved.
+        // Snapshots need to be in natural order, so chronology is always preserved.
         let snapshot_iterators = self
             .snapshots
             .iter()
@@ -99,6 +107,27 @@ impl DeltaReader {
 
         // Database iterator
         let db_iter = self.db.raw_iter::<S>(ScanDirection::Backward)?;
+
+        Ok(DeltaReaderIter::new(
+            snapshot_iterators,
+            db_iter,
+            ScanDirection::Backward,
+        ))
+    }
+
+    fn iter_rev_range<S: Schema>(
+        &self,
+        range: impl std::ops::RangeBounds<SchemaKey> + Clone,
+    ) -> anyhow::Result<DeltaReaderIter<Rev<ChangeSetRange>>> {
+        let snapshot_iterators = self
+            .snapshots
+            .iter()
+            .map(|snapshot| snapshot.iter_range::<S>(range.clone()).rev())
+            .collect::<Vec<_>>();
+
+        let db_iter = self
+            .db
+            .raw_iter_range::<S>(range, ScanDirection::Backward)?;
 
         Ok(DeltaReaderIter::new(
             snapshot_iterators,
@@ -156,23 +185,21 @@ where
         let next_values_size = self
             .snapshot_iterators
             .len()
-            .checked_add(2)
+            .checked_add(1)
             .unwrap_or_default();
         // In case of equal next key, this vector contains all iterator locations with this key.
-        // It is filled with order: DB, Snapshots, LocalCache
-        // Right most location has the most priority, so the last value is taken
+        // It is filled with order: DB, Snapshots.
+        // Right most location has the most priority, so the last value is taken.
         // And all "other" locations are progressed without taking a value.
         let mut next_value_locations: Vec<DataLocation> = Vec::with_capacity(next_values_size);
 
         loop {
             // Reference to the last next value observed somewhere.
             // Used for comparing between iterators.
-
             let mut next_value: Option<&SchemaKey> = None;
             next_value_locations.clear();
 
-            // Pick next values from each iterator
-            // Going from DB to Snapshots to Local Cache
+            // Going to DB first.
             if let Some((db_key, _)) = self.db_iter.peek() {
                 next_value_locations.push(DataLocation::Db);
                 next_value = Some(db_key);
@@ -267,8 +294,8 @@ mod tests {
     // Minimal fields
     const FIELD_1: TestCompositeField = TestCompositeField(0, 1, 0);
     const FIELD_2: TestCompositeField = TestCompositeField(0, 1, 2);
-    const FIELD_3: TestCompositeField = TestCompositeField(3, 1, 0);
-    const FIELD_4: TestCompositeField = TestCompositeField(3, 2, 0);
+    const FIELD_3: TestCompositeField = TestCompositeField(3, 4, 0);
+    const FIELD_4: TestCompositeField = TestCompositeField(3, 7, 0);
     // Extra fields
     const FIELD_5: TestCompositeField = TestCompositeField(4, 2, 0);
     const FIELD_6: TestCompositeField = TestCompositeField(4, 2, 1);
@@ -316,9 +343,9 @@ mod tests {
 
         assert!(largest.is_none());
 
-        // let key = TestCompositeField::MAX;
-        // let prev = delta_db.get_prev::<S>(&key).await.unwrap();
-        // assert!(prev.is_none());
+        let key = TestCompositeField::MAX;
+        let prev = delta_db.get_prev::<S>(&key).await.unwrap();
+        assert!(prev.is_none());
     }
 
     // DeltaReader with a simple set of known values. Useful for minimal checks.
@@ -326,9 +353,6 @@ mod tests {
     fn build_simple_delta_reader(path: impl AsRef<Path>) -> DeltaReader {
         let db = open_db(path.as_ref());
         let mut db_data = SchemaBatch::new();
-        db_data
-            .put::<S>(&TestCompositeField::MIN, &TestField(0))
-            .unwrap();
         db_data.put::<S>(&FIELD_1, &TestField(1)).unwrap();
         db_data.put::<S>(&FIELD_4, &TestField(4)).unwrap();
         db.write_schemas(&db_data).unwrap();
@@ -349,9 +373,6 @@ mod tests {
     fn build_elaborate_delta_reader(path: impl AsRef<Path>) -> DeltaReader {
         let db = open_db(path.as_ref());
         let mut schema_batch_0 = SchemaBatch::new();
-        schema_batch_0
-            .put::<S>(&TestCompositeField::MIN, &TestField(0))
-            .unwrap();
         schema_batch_0.put::<S>(&FIELD_1, &TestField(1)).unwrap();
         schema_batch_0.put::<S>(&FIELD_4, &TestField(4)).unwrap();
         schema_batch_0.put::<S>(&FIELD_5, &TestField(5)).unwrap();
@@ -372,11 +393,14 @@ mod tests {
         snapshot_3.delete::<S>(&FIELD_1).unwrap();
         snapshot_3.delete::<S>(&FIELD_7).unwrap();
 
-        DeltaReader::new(db, vec![
-            Arc::new(snapshot_1),
-            Arc::new(snapshot_2),
-            Arc::new(snapshot_3),
-        ])
+        DeltaReader::new(
+            db,
+            vec![
+                Arc::new(snapshot_1),
+                Arc::new(snapshot_2),
+                Arc::new(snapshot_3),
+            ],
+        )
     }
 
     #[test]
@@ -385,7 +409,7 @@ mod tests {
         let delta_reader = build_simple_delta_reader(tmpdir.path());
 
         let values: Vec<_> = delta_reader.iter_rev::<S>().unwrap().collect();
-        assert_eq!(5, values.len());
+        assert_eq!(4, values.len());
 
         assert!(
             values.windows(2).all(|w| w[0].0 >= w[1].0),
@@ -399,14 +423,13 @@ mod tests {
         let delta_reader = build_elaborate_delta_reader(tmpdir.path());
 
         let values: Vec<_> = delta_reader.iter_rev::<S>().unwrap().collect();
-        assert_eq!(5, values.len());
+        assert_eq!(4, values.len());
 
         assert!(
             values.windows(2).all(|w| w[0].0 >= w[1].0),
             "iter_rev should be sorted in reversed order"
         );
     }
-
 
     #[tokio::test]
     async fn get_largest_simple() {
@@ -434,9 +457,49 @@ mod tests {
         assert_eq!(TestField(6000), largest_value);
     }
 
-    #[test]
-    #[ignore = "TBD"]
-    fn get_prev() {}
+    #[tokio::test]
+    async fn get_prev_simple() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let delta_reader = build_simple_delta_reader(tmpdir.path());
+
+        // MIN, should not find anything
+        let prev = delta_reader
+            .get_prev::<S>(&TestCompositeField::MIN)
+            .await
+            .unwrap();
+        assert!(prev.is_none());
+
+        // Should get the lowest value in
+        let prev = delta_reader.get_prev::<S>(&FIELD_1).await.unwrap();
+        assert!(prev.is_some());
+        let (prev_key, prev_value) = prev.unwrap();
+        assert_eq!(FIELD_1, prev_key);
+        assert_eq!(TestField(1), prev_value);
+
+        // Some value in the middle
+        let (prev_key, prev_value) = delta_reader.get_prev::<S>(&FIELD_3).await.unwrap().unwrap();
+        assert_eq!(FIELD_3, prev_key);
+        assert_eq!(TestField(3), prev_value);
+
+        // Value in between
+        let (prev_key, prev_value) = delta_reader
+            .get_prev::<S>(&TestCompositeField(3, 5, 8))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(FIELD_3, prev_key);
+        assert_eq!(TestField(3), prev_value);
+
+        // MAX Should return largest value
+        let (prev_key, prev_value) = delta_reader
+            .get_prev::<S>(&TestCompositeField::MAX)
+            .await
+            .unwrap()
+            .unwrap();
+        let (largest_key, largest_value) = delta_reader.get_largest::<S>().await.unwrap().unwrap();
+        assert_eq!(largest_key, prev_key);
+        assert_eq!(largest_value, prev_value);
+    }
 
     fn execute_rev_iterator(
         db_entries: Vec<(TestCompositeField, TestField)>,
