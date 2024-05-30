@@ -31,30 +31,32 @@ impl DeltaReader {
     }
 
     /// Get a value, wherever it is.
-    pub fn get<S: Schema>(&self, key: &impl KeyCodec<S>) -> anyhow::Result<Option<S::Value>> {
+    pub async fn get<S: Schema>(&self, key: &impl KeyCodec<S>) -> anyhow::Result<Option<S::Value>> {
         // Some(Operation) means that key was touched,
         // but in case of deletion, we early return None
         // Only in case of not finding operation for a key,
         // we go deeper
 
-        // 1. Check in snapshots, in reverse order
-        for snapshot in self.snapshots.iter() {
-            if let Some(operation) = snapshot.get_operation::<S>(key)? {
-                return operation.decode_value::<S>();
+        tokio::task::block_in_place(|| {
+            // 1. Check in snapshots, in reverse order
+            for snapshot in self.snapshots.iter() {
+                if let Some(operation) = snapshot.get_operation::<S>(key)? {
+                    return operation.decode_value::<S>();
+                }
             }
-        }
 
-        // 2. Check in DB
-        self.db.get(key)
+            // 2. Check in DB
+            self.db.get(key)
+        })
     }
 
     /// Get a value of the largest key written value for given [`Schema`].
-    pub fn get_largest<S: Schema>(&self) -> anyhow::Result<Option<(S::Key, S::Value)>> {
+    pub async fn get_largest<S: Schema>(&self) -> anyhow::Result<Option<(S::Key, S::Value)>> {
         todo!()
     }
 
     /// Get the largest value in [`Schema`] that is smaller than give `seek_key`.
-    pub fn get_prev<S: Schema>(
+    pub async fn get_prev<S: Schema>(
         &self,
         _seek_key: &impl SeekKeyEncoder<S>,
     ) -> anyhow::Result<Option<(S::Key, S::Value)>> {
@@ -62,7 +64,7 @@ impl DeltaReader {
     }
 
     /// Get `n` keys >= `seek_key`
-    pub fn get_n_from_first_match<S: Schema>(
+    pub async fn get_n_from_first_match<S: Schema>(
         &self,
         _seek_key: &impl SeekKeyEncoder<S>,
         _n: usize,
@@ -71,7 +73,7 @@ impl DeltaReader {
     }
 
     /// Collects all key-value pairs in given range, from smallest to largest.
-    pub fn collect_in_range<S: Schema, Sk: SeekKeyEncoder<S>>(
+    pub async fn collect_in_range<S: Schema, Sk: SeekKeyEncoder<S>>(
         &self,
         _range: std::ops::Range<Sk>,
     ) -> anyhow::Result<Vec<(S::Key, S::Value)>> {
@@ -250,6 +252,8 @@ mod tests {
 
     define_schema!(TestSchema, TestCompositeField, TestField, "TestCF");
 
+    type S = TestSchema;
+
     fn open_db(dir: impl AsRef<Path>) -> DB {
         let column_families = vec![DEFAULT_COLUMN_FAMILY_NAME, TestSchema::COLUMN_FAMILY_NAME];
         let mut db_opts = rocksdb::Options::default();
@@ -267,9 +271,10 @@ mod tests {
         <TestField as ValueCodec<TestSchema>>::encode_value(value).unwrap()
     }
 
-    fn check_value(delta_db: &DeltaReader, key: u32, expected_value: Option<u32>) {
+    async fn check_value(delta_db: &DeltaReader, key: u32, expected_value: Option<u32>) {
         let actual_value = delta_db
             .get::<TestSchema>(&TestCompositeField(key, 0, 0))
+            .await
             .unwrap()
             .map(|v| v.0);
         assert_eq!(expected_value, actual_value);
@@ -284,7 +289,37 @@ mod tests {
 
         let delta_db = DeltaReader::new(db, vec![]);
 
-        let _iterator = delta_db.iter_rev::<TestSchema>().unwrap();
+        let values: Vec<_> = delta_db.iter_rev::<TestSchema>().unwrap().collect();
+        assert!(values.is_empty())
+    }
+
+    #[test]
+    fn test_simple_iterator() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db = open_db(tmpdir.path());
+
+        let k0 = TestCompositeField(0, 0, 0);
+        let k1 = TestCompositeField(0, 1, 0);
+        let k2 = TestCompositeField(0, 1, 2);
+        let k3 = TestCompositeField(3, 1, 0);
+        let k4 = TestCompositeField(3, 2, 0);
+
+        let mut schema_batch_0 = SchemaBatch::new();
+        schema_batch_0.put::<S>(&k0, &TestField(0)).unwrap();
+        schema_batch_0.put::<S>(&k1, &TestField(1)).unwrap();
+        schema_batch_0.put::<S>(&k4, &TestField(4)).unwrap();
+        db.write_schemas(&schema_batch_0).unwrap();
+
+        let mut schema_batch_1 = SchemaBatch::new();
+        schema_batch_1.put::<S>(&k2, &TestField(2)).unwrap();
+        schema_batch_1.put::<S>(&k3, &TestField(3)).unwrap();
+
+        let delta_db = DeltaReader::new(db, vec![Arc::new(schema_batch_1)]);
+
+        let values: Vec<_> = delta_db.iter_rev::<TestSchema>().unwrap().collect();
+        assert_eq!(5, values.len());
+
+        assert!(values.windows(2).all(|w| w[0].0 >= w[1].0), "iter_rev should be sorted in reversed order");
     }
 
     #[test]
