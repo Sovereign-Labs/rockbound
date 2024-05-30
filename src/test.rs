@@ -119,14 +119,15 @@ impl<S: Schema> SeekKeyEncoder<S> for KeyPrefix2 {
 impl proptest::arbitrary::Arbitrary for TestField {
     type Parameters = std::ops::Range<u32>;
 
+    fn arbitrary() -> Self::Strategy {
+        use proptest::strategy::Strategy;
+        (0u32..1000).prop_map(TestField).boxed()
+    }
+
     fn arbitrary_with(args: Self::Parameters) -> Self::Strategy {
-        use proptest::prelude::any;
         use proptest::strategy::Strategy;
 
-        any::<u32>()
-            .prop_filter("Value should be in range", move |v| args.contains(v))
-            .prop_map(TestField)
-            .boxed()
+        args.prop_map(TestField).boxed()
     }
 
     type Strategy = proptest::strategy::BoxedStrategy<Self>;

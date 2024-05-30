@@ -249,6 +249,7 @@ mod tests {
     use crate::schema::ValueCodec;
     use crate::test::{TestCompositeField, TestField};
     use crate::{define_schema, SchemaKey, SchemaValue, DB};
+    use proptest::prelude::*;
 
     define_schema!(TestSchema, TestCompositeField, TestField, "TestCF");
 
@@ -319,7 +320,63 @@ mod tests {
         let values: Vec<_> = delta_db.iter_rev::<TestSchema>().unwrap().collect();
         assert_eq!(5, values.len());
 
-        assert!(values.windows(2).all(|w| w[0].0 >= w[1].0), "iter_rev should be sorted in reversed order");
+        assert!(
+            values.windows(2).all(|w| w[0].0 >= w[1].0),
+            "iter_rev should be sorted in reversed order"
+        );
+    }
+
+    fn check_rev_iterator(
+        db_entries: Vec<(TestCompositeField, TestField)>,
+        snapshots: Vec<Vec<(TestCompositeField, TestField)>>,
+    ) {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db = open_db(tmpdir.path());
+
+        // Write DB values
+        let mut db_batch = SchemaBatch::new();
+        for (key, value) in db_entries {
+            db_batch.put::<S>(&key, &value).unwrap();
+        }
+        db.write_schemas(&db_batch).unwrap();
+
+        let mut schema_batches = Vec::new();
+        for snapshot in snapshots {
+            let mut schema_batch = SchemaBatch::new();
+            for (key, value) in snapshot {
+                schema_batch.put::<S>(&key, &value).unwrap();
+            }
+            schema_batches.push(Arc::new(schema_batch));
+        }
+
+        let delta_db = DeltaReader::new(db, schema_batches);
+
+        let values: Vec<_> = delta_db.iter_rev::<TestSchema>().unwrap().collect();
+        assert!(
+            values.windows(2).all(|w| w[0].0 >= w[1].0),
+            "iter_rev should be sorted in reversed order"
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_rev_iterator_simple((db_entries, snapshots) in generate_db_entries_and_snapshots()) {
+            check_rev_iterator(db_entries, snapshots);
+       }
+    }
+
+    fn generate_db_entries_and_snapshots() -> impl Strategy<
+        Value = (
+            Vec<(TestCompositeField, TestField)>,
+            Vec<Vec<(TestCompositeField, TestField)>>,
+        ),
+    > {
+        let entries = prop::collection::vec((any::<TestCompositeField>(), any::<TestField>()), 500);
+        let snapshots = prop::collection::vec(
+            prop::collection::vec((any::<TestCompositeField>(), any::<TestField>()), 100),
+            20,
+        );
+        (entries, snapshots)
     }
 
     #[test]
