@@ -23,13 +23,11 @@ pub struct DeltaReader {
 }
 
 impl DeltaReader {
-    /// Creates new [`DeltaReader`] with given `id`, `db` and `uncommited_changes`.
-    /// `uncommited_changes` should be in chronological order.
-    pub fn new(db: DB, uncommited_changes: Vec<Arc<SchemaBatch>>) -> Self {
-        Self {
-            snapshots: uncommited_changes,
-            db,
-        }
+    /// Creates new [`DeltaReader`] with given [`DB`] and
+    /// vector of uncommited snapshots of [`SchemaBatch`].
+    /// `snapshots` should be in chronological order.
+    pub fn new(db: DB, snapshots: Vec<Arc<SchemaBatch>>) -> Self {
+        Self { snapshots, db }
     }
 
     /// Get a value, wherever it is.
@@ -266,10 +264,15 @@ mod tests {
 
     type S = TestSchema;
 
+    // Minimal fields
     const FIELD_1: TestCompositeField = TestCompositeField(0, 1, 0);
     const FIELD_2: TestCompositeField = TestCompositeField(0, 1, 2);
     const FIELD_3: TestCompositeField = TestCompositeField(3, 1, 0);
     const FIELD_4: TestCompositeField = TestCompositeField(3, 2, 0);
+    // Extra fields
+    const FIELD_5: TestCompositeField = TestCompositeField(4, 2, 0);
+    const FIELD_6: TestCompositeField = TestCompositeField(4, 2, 1);
+    const FIELD_7: TestCompositeField = TestCompositeField(4, 3, 0);
 
     fn open_db(dir: impl AsRef<Path>) -> DB {
         let column_families = vec![DEFAULT_COLUMN_FAMILY_NAME, TestSchema::COLUMN_FAMILY_NAME];
@@ -318,26 +321,68 @@ mod tests {
         // assert!(prev.is_none());
     }
 
-    // Delta reader with a simple set of known values. Useful for minimal checks.
-    fn get_simple_delta_reader(path: impl AsRef<Path>) -> DeltaReader {
+    // DeltaReader with a simple set of known values. Useful for minimal checks.
+    // Contains only writes.
+    fn build_simple_delta_reader(path: impl AsRef<Path>) -> DeltaReader {
+        let db = open_db(path.as_ref());
+        let mut db_data = SchemaBatch::new();
+        db_data
+            .put::<S>(&TestCompositeField::MIN, &TestField(0))
+            .unwrap();
+        db_data.put::<S>(&FIELD_1, &TestField(1)).unwrap();
+        db_data.put::<S>(&FIELD_4, &TestField(4)).unwrap();
+        db.write_schemas(&db_data).unwrap();
+
+        let mut snapshot_1 = SchemaBatch::new();
+        snapshot_1.put::<S>(&FIELD_2, &TestField(2)).unwrap();
+        snapshot_1.put::<S>(&FIELD_3, &TestField(3)).unwrap();
+
+        DeltaReader::new(db, vec![Arc::new(snapshot_1)])
+    }
+
+    // DeltaReader with a known set of values, but more complex combination, includes deletion.
+    // DB contains fields 1, 4, 5, and 7.
+    // Have 3 snapshots:
+    // 1. Written: field 6.
+    // 2. Written: fields 2, 7. Deleted: field 5.
+    // 3. Written: fields 3, 6. Deleted: fields 1, 7.
+    fn build_elaborate_delta_reader(path: impl AsRef<Path>) -> DeltaReader {
         let db = open_db(path.as_ref());
         let mut schema_batch_0 = SchemaBatch::new();
-        schema_batch_0.put::<S>(&TestCompositeField::MIN, &TestField(0)).unwrap();
+        schema_batch_0
+            .put::<S>(&TestCompositeField::MIN, &TestField(0))
+            .unwrap();
         schema_batch_0.put::<S>(&FIELD_1, &TestField(1)).unwrap();
         schema_batch_0.put::<S>(&FIELD_4, &TestField(4)).unwrap();
+        schema_batch_0.put::<S>(&FIELD_5, &TestField(5)).unwrap();
+        schema_batch_0.put::<S>(&FIELD_7, &TestField(7)).unwrap();
         db.write_schemas(&schema_batch_0).unwrap();
 
-        let mut schema_batch_1 = SchemaBatch::new();
-        schema_batch_1.put::<S>(&FIELD_2, &TestField(2)).unwrap();
-        schema_batch_1.put::<S>(&FIELD_3, &TestField(3)).unwrap();
+        let mut snapshot_1 = SchemaBatch::new();
+        snapshot_1.put::<S>(&FIELD_6, &TestField(60)).unwrap();
 
-        DeltaReader::new(db, vec![Arc::new(schema_batch_1)])
+        let mut snapshot_2 = SchemaBatch::new();
+        snapshot_2.put::<S>(&FIELD_2, &TestField(200)).unwrap();
+        snapshot_2.put::<S>(&FIELD_7, &TestField(700)).unwrap();
+        snapshot_2.delete::<S>(&FIELD_5).unwrap();
+
+        let mut snapshot_3 = SchemaBatch::new();
+        snapshot_3.put::<S>(&FIELD_3, &TestField(3000)).unwrap();
+        snapshot_3.put::<S>(&FIELD_6, &TestField(6000)).unwrap();
+        snapshot_3.delete::<S>(&FIELD_1).unwrap();
+        snapshot_3.delete::<S>(&FIELD_7).unwrap();
+
+        DeltaReader::new(db, vec![
+            Arc::new(snapshot_1),
+            Arc::new(snapshot_2),
+            Arc::new(snapshot_3),
+        ])
     }
 
     #[test]
-    fn test_simple_iterator() {
+    fn iterator_simple() {
         let tmpdir = tempfile::tempdir().unwrap();
-        let delta_reader = get_simple_delta_reader(tmpdir.path());
+        let delta_reader = build_simple_delta_reader(tmpdir.path());
 
         let values: Vec<_> = delta_reader.iter_rev::<S>().unwrap().collect();
         assert_eq!(5, values.len());
@@ -348,10 +393,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn iterator_elaborate() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let delta_reader = build_elaborate_delta_reader(tmpdir.path());
+
+        let values: Vec<_> = delta_reader.iter_rev::<S>().unwrap().collect();
+        assert_eq!(5, values.len());
+
+        assert!(
+            values.windows(2).all(|w| w[0].0 >= w[1].0),
+            "iter_rev should be sorted in reversed order"
+        );
+    }
+
+
     #[tokio::test]
     async fn get_largest_simple() {
         let tmpdir = tempfile::tempdir().unwrap();
-        let delta_reader = get_simple_delta_reader(tmpdir.path());
+        let delta_reader = build_simple_delta_reader(tmpdir.path());
 
         let largest = delta_reader.get_largest::<S>().await.unwrap();
         assert!(largest.is_some(), "largest value is not found");
@@ -359,6 +419,19 @@ mod tests {
 
         assert_eq!(FIELD_4, largest_key);
         assert_eq!(TestField(4), largest_value);
+    }
+
+    #[tokio::test]
+    async fn get_largest_elaborate() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let delta_reader = build_elaborate_delta_reader(tmpdir.path());
+
+        let largest = delta_reader.get_largest::<S>().await.unwrap();
+        assert!(largest.is_some(), "largest value is not found");
+        let (largest_key, largest_value) = largest.unwrap();
+
+        assert_eq!(FIELD_6, largest_key);
+        assert_eq!(TestField(6000), largest_value);
     }
 
     #[test]
