@@ -266,6 +266,11 @@ mod tests {
 
     type S = TestSchema;
 
+    const FIELD_1: TestCompositeField = TestCompositeField(0, 1, 0);
+    const FIELD_2: TestCompositeField = TestCompositeField(0, 1, 2);
+    const FIELD_3: TestCompositeField = TestCompositeField(3, 1, 0);
+    const FIELD_4: TestCompositeField = TestCompositeField(3, 2, 0);
+
     fn open_db(dir: impl AsRef<Path>) -> DB {
         let column_families = vec![DEFAULT_COLUMN_FAMILY_NAME, TestSchema::COLUMN_FAMILY_NAME];
         let mut db_opts = rocksdb::Options::default();
@@ -283,8 +288,8 @@ mod tests {
         <TestField as ValueCodec<S>>::encode_value(value).unwrap()
     }
 
-    async fn check_value(delta_db: &DeltaReader, key: u32, expected_value: Option<u32>) {
-        let actual_value = delta_db
+    async fn check_value(delta_reader: &DeltaReader, key: u32, expected_value: Option<u32>) {
+        let actual_value = delta_reader
             .get::<S>(&TestCompositeField(key, 0, 0))
             .await
             .unwrap()
@@ -313,30 +318,28 @@ mod tests {
         // assert!(prev.is_none());
     }
 
-    #[test]
-    fn test_simple_iterator() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let db = open_db(tmpdir.path());
-
-        let k0 = TestCompositeField(0, 0, 0);
-        let k1 = TestCompositeField(0, 1, 0);
-        let k2 = TestCompositeField(0, 1, 2);
-        let k3 = TestCompositeField(3, 1, 0);
-        let k4 = TestCompositeField(3, 2, 0);
-
+    // Delta reader with a simple set of known values. Useful for minimal checks.
+    fn get_simple_delta_reader(path: impl AsRef<Path>) -> DeltaReader {
+        let db = open_db(path.as_ref());
         let mut schema_batch_0 = SchemaBatch::new();
-        schema_batch_0.put::<S>(&k0, &TestField(0)).unwrap();
-        schema_batch_0.put::<S>(&k1, &TestField(1)).unwrap();
-        schema_batch_0.put::<S>(&k4, &TestField(4)).unwrap();
+        schema_batch_0.put::<S>(&TestCompositeField::MIN, &TestField(0)).unwrap();
+        schema_batch_0.put::<S>(&FIELD_1, &TestField(1)).unwrap();
+        schema_batch_0.put::<S>(&FIELD_4, &TestField(4)).unwrap();
         db.write_schemas(&schema_batch_0).unwrap();
 
         let mut schema_batch_1 = SchemaBatch::new();
-        schema_batch_1.put::<S>(&k2, &TestField(2)).unwrap();
-        schema_batch_1.put::<S>(&k3, &TestField(3)).unwrap();
+        schema_batch_1.put::<S>(&FIELD_2, &TestField(2)).unwrap();
+        schema_batch_1.put::<S>(&FIELD_3, &TestField(3)).unwrap();
 
-        let delta_db = DeltaReader::new(db, vec![Arc::new(schema_batch_1)]);
+        DeltaReader::new(db, vec![Arc::new(schema_batch_1)])
+    }
 
-        let values: Vec<_> = delta_db.iter_rev::<S>().unwrap().collect();
+    #[test]
+    fn test_simple_iterator() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let delta_reader = get_simple_delta_reader(tmpdir.path());
+
+        let values: Vec<_> = delta_reader.iter_rev::<S>().unwrap().collect();
         assert_eq!(5, values.len());
 
         assert!(
@@ -344,6 +347,23 @@ mod tests {
             "iter_rev should be sorted in reversed order"
         );
     }
+
+    #[tokio::test]
+    async fn get_largest_simple() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let delta_reader = get_simple_delta_reader(tmpdir.path());
+
+        let largest = delta_reader.get_largest::<S>().await.unwrap();
+        assert!(largest.is_some(), "largest value is not found");
+        let (largest_key, largest_value) = largest.unwrap();
+
+        assert_eq!(FIELD_4, largest_key);
+        assert_eq!(TestField(4), largest_value);
+    }
+
+    #[test]
+    #[ignore = "TBD"]
+    fn get_prev() {}
 
     fn execute_rev_iterator(
         db_entries: Vec<(TestCompositeField, TestField)>,
@@ -367,9 +387,9 @@ mod tests {
             schema_batches.push(Arc::new(schema_batch));
         }
 
-        let delta_db = DeltaReader::new(db, schema_batches);
+        let delta_reader = DeltaReader::new(db, schema_batches);
 
-        let values: Vec<_> = delta_db.iter_rev::<S>().unwrap().collect();
+        let values: Vec<_> = delta_reader.iter_rev::<S>().unwrap().collect();
         values
     }
 
@@ -403,10 +423,24 @@ mod tests {
 
         schema_batches.push(Arc::new(latest_schema_batch));
 
-        let delta_db = DeltaReader::new(db, schema_batches);
+        let delta_reader = DeltaReader::new(db, schema_batches);
 
-        let values: Vec<_> = delta_db.iter_rev::<S>().unwrap().collect();
+        let values: Vec<_> = delta_reader.iter_rev::<S>().unwrap().collect();
         values
+    }
+
+    fn generate_db_entries_and_snapshots() -> impl Strategy<
+        Value = (
+            Vec<(TestCompositeField, TestField)>,
+            Vec<Vec<(TestCompositeField, TestField)>>,
+        ),
+    > {
+        let entries = prop::collection::vec((any::<TestCompositeField>(), any::<TestField>()), 50);
+        let snapshots = prop::collection::vec(
+            prop::collection::vec((any::<TestCompositeField>(), any::<TestField>()), 10),
+            8,
+        );
+        (entries, snapshots)
     }
 
     proptest! {
@@ -425,26 +459,4 @@ mod tests {
             prop_assert!(values.is_empty());
        }
     }
-
-    fn generate_db_entries_and_snapshots() -> impl Strategy<
-        Value = (
-            Vec<(TestCompositeField, TestField)>,
-            Vec<Vec<(TestCompositeField, TestField)>>,
-        ),
-    > {
-        let entries = prop::collection::vec((any::<TestCompositeField>(), any::<TestField>()), 50);
-        let snapshots = prop::collection::vec(
-            prop::collection::vec((any::<TestCompositeField>(), any::<TestField>()), 10),
-            4,
-        );
-        (entries, snapshots)
-    }
-
-    #[test]
-    #[ignore = "TBD"]
-    fn get_largest() {}
-
-    #[test]
-    #[ignore = "TBD"]
-    fn get_prev() {}
 }
