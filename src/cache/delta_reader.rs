@@ -171,7 +171,7 @@ impl DeltaReader {
         Ok(DeltaReaderIter::new(
             snapshot_iterators,
             db_iter,
-            ScanDirection::Backward,
+            ScanDirection::Forward,
         ))
     }
 
