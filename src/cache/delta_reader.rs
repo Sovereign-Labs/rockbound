@@ -363,7 +363,6 @@ mod tests {
 
     use super::*;
     use crate::schema::KeyEncoder;
-    use crate::schema::ValueCodec;
     use crate::test::{TestCompositeField, TestField};
     use crate::{define_schema, SchemaKey, SchemaValue, DB};
     use proptest::prelude::*;
@@ -393,10 +392,6 @@ mod tests {
     // Test utils
     fn encode_key(key: &TestCompositeField) -> SchemaKey {
         <TestCompositeField as KeyEncoder<S>>::encode_key(key).unwrap()
-    }
-
-    fn encode_value(value: &TestField) -> SchemaValue {
-        <TestField as ValueCodec<S>>::encode_value(value).unwrap()
     }
 
     async fn check_value(delta_reader: &DeltaReader, key: u32, expected_value: Option<u32>) {
@@ -576,6 +571,31 @@ mod tests {
         assert!(value.is_none());
     }
 
+    fn basic_check_iterator_range(
+        delta_reader: &DeltaReader,
+        expected_len: usize,
+        range: impl std::ops::RangeBounds<SchemaKey> + Clone + std::fmt::Debug,
+    ) {
+        let values: Vec<_> = delta_reader
+            .iter_range::<S>(range.clone())
+            .unwrap()
+            .collect();
+        assert_eq!(expected_len, values.len(), "length do no match for iter_range: {:?} ", range);
+        assert!(
+            values.windows(2).all(|w| w[0].0 <= w[1].0),
+            "iter should be sorted for range: {:?}", range
+        );
+        let values_rev: Vec<_> = delta_reader
+            .iter_rev_range::<S>(range.clone())
+            .unwrap()
+            .collect();
+        assert_eq!(expected_len, values_rev.len(), "length do no match for iter_rev_range:{:?}", range);
+        assert!(
+            values_rev.windows(2).all(|w| w[0].0 >= w[1].0),
+            "iter_rev should be sorted in reversed order for range: {:?}", range
+        );
+    }
+
     // Checks that values returned by iterator are sorted.
     fn basic_check_iterator(delta_reader: &DeltaReader, expected_len: usize) {
         let values: Vec<_> = delta_reader.iter::<S>().unwrap().collect();
@@ -587,11 +607,21 @@ mod tests {
 
         let values_rev: Vec<_> = delta_reader.iter_rev::<S>().unwrap().collect();
         assert_eq!(expected_len, values_rev.len());
-
         assert!(
             values_rev.windows(2).all(|w| w[0].0 >= w[1].0),
             "iter_rev should be sorted in reversed order"
         );
+
+        // Effectively, all these ranges are full, so iterator should return all possible values
+        let min_key = encode_key(&TestCompositeField::MIN);
+        let max_key = encode_key(&TestCompositeField::MAX);
+
+        basic_check_iterator_range(delta_reader, expected_len, ..);
+        basic_check_iterator_range(delta_reader, expected_len, min_key.clone()..);
+        basic_check_iterator_range(delta_reader, expected_len, min_key.clone()..max_key.clone());
+        basic_check_iterator_range(delta_reader, expected_len, min_key.clone()..=max_key.clone());
+        basic_check_iterator_range(delta_reader, expected_len, ..max_key.clone());
+        basic_check_iterator_range(delta_reader, expected_len, ..=max_key.clone());
     }
 
     #[test]
@@ -599,6 +629,10 @@ mod tests {
         let tmpdir = tempfile::tempdir().unwrap();
         let delta_reader = build_simple_delta_reader(tmpdir.path());
         basic_check_iterator(&delta_reader, 4);
+
+        let range_1 = encode_key(&FIELD_1)..=encode_key(&FIELD_2);
+        let values_range_1: Vec<_> = delta_reader.iter_range::<S>(range_1).unwrap().collect();
+        assert_eq!(2, values_range_1.len());
     }
 
     #[test]
