@@ -646,9 +646,14 @@ mod tests {
         let delta_reader = build_simple_delta_reader(tmpdir.path());
         basic_check_iterator(&delta_reader, 4);
 
-        let range_1 = encode_key(&FIELD_1)..=encode_key(&FIELD_2);
-        let values_range_1: Vec<_> = delta_reader.iter_range::<S>(range_1).unwrap().collect();
-        assert_eq!(2, values_range_1.len());
+        let range = encode_key(&FIELD_1)..encode_key(&FIELD_2);
+        basic_check_iterator_range(&delta_reader, 1, range);
+        let range = ..encode_key(&FIELD_2);
+        basic_check_iterator_range(&delta_reader, 1, range);
+        let range = encode_key(&FIELD_1)..=encode_key(&FIELD_2);
+        basic_check_iterator_range(&delta_reader, 2, range);
+        let range = encode_key(&FIELD_2)..=encode_key(&FIELD_3);
+        basic_check_iterator_range(&delta_reader, 2, range);
     }
 
     #[test]
@@ -657,6 +662,15 @@ mod tests {
         let delta_reader = build_elaborate_delta_reader(tmpdir.path());
 
         basic_check_iterator(&delta_reader, 4);
+
+        let range = encode_key(&FIELD_1)..encode_key(&FIELD_2);
+        basic_check_iterator_range(&delta_reader, 0, range);
+        let range = ..encode_key(&FIELD_2);
+        basic_check_iterator_range(&delta_reader, 0, range);
+        let range = encode_key(&FIELD_1)..=encode_key(&FIELD_2);
+        basic_check_iterator_range(&delta_reader, 1, range);
+        let range = encode_key(&FIELD_3)..=encode_key(&FIELD_6);
+        basic_check_iterator_range(&delta_reader, 3, range);
     }
 
     #[tokio::test(flavor = "multi_thread")]
