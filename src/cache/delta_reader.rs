@@ -580,19 +580,31 @@ mod tests {
             .iter_range::<S>(range.clone())
             .unwrap()
             .collect();
-        assert_eq!(expected_len, values.len(), "length do no match for iter_range: {:?} ", range);
+        assert_eq!(
+            expected_len,
+            values.len(),
+            "length do no match for iter_range: {:?} ",
+            range
+        );
         assert!(
             values.windows(2).all(|w| w[0].0 <= w[1].0),
-            "iter should be sorted for range: {:?}", range
+            "iter should be sorted for range: {:?}",
+            range
         );
         let values_rev: Vec<_> = delta_reader
             .iter_rev_range::<S>(range.clone())
             .unwrap()
             .collect();
-        assert_eq!(expected_len, values_rev.len(), "length do no match for iter_rev_range:{:?}", range);
+        assert_eq!(
+            expected_len,
+            values_rev.len(),
+            "length do no match for iter_rev_range:{:?}",
+            range
+        );
         assert!(
             values_rev.windows(2).all(|w| w[0].0 >= w[1].0),
-            "iter_rev should be sorted in reversed order for range: {:?}", range
+            "iter_rev should be sorted in reversed order for range: {:?}",
+            range
         );
     }
 
@@ -619,7 +631,11 @@ mod tests {
         basic_check_iterator_range(delta_reader, expected_len, ..);
         basic_check_iterator_range(delta_reader, expected_len, min_key.clone()..);
         basic_check_iterator_range(delta_reader, expected_len, min_key.clone()..max_key.clone());
-        basic_check_iterator_range(delta_reader, expected_len, min_key.clone()..=max_key.clone());
+        basic_check_iterator_range(
+            delta_reader,
+            expected_len,
+            min_key.clone()..=max_key.clone(),
+        );
         basic_check_iterator_range(delta_reader, expected_len, ..max_key.clone());
         basic_check_iterator_range(delta_reader, expected_len, ..=max_key.clone());
     }
