@@ -353,6 +353,7 @@ mod tests {
     use std::path::Path;
 
     use rocksdb::DEFAULT_COLUMN_FAMILY_NAME;
+    use tokio::runtime::Runtime;
 
     use super::*;
     use crate::schema::KeyEncoder;
@@ -464,11 +465,7 @@ mod tests {
 
         let delta_reader = DeltaReader::new(db, vec![]);
 
-        let values: Vec<_> = delta_reader.iter_rev::<S>().unwrap().collect();
-        assert!(values.is_empty());
-
         let largest = delta_reader.get_largest::<S>().await.unwrap();
-
         assert!(largest.is_none());
 
         let key = TestCompositeField::MAX;
@@ -477,6 +474,25 @@ mod tests {
 
         let value_1 = delta_reader.get::<S>(&FIELD_1).await.unwrap();
         assert!(value_1.is_none());
+
+        let values: Vec<_> = delta_reader.iter::<S>().unwrap().collect();
+        assert!(values.is_empty());
+
+        let full_range = encode_key(&TestCompositeField::MIN)..=encode_key(&TestCompositeField::MAX);
+        let values: Vec<_> = delta_reader.iter_range::<S>(full_range.clone()).unwrap().collect();
+        assert!(values.is_empty());
+
+        let values: Vec<_> = delta_reader.iter_rev::<S>().unwrap().collect();
+        assert!(values.is_empty());
+        let values: Vec<_> = delta_reader.iter_rev_range::<S>(full_range).unwrap().collect();
+        assert!(values.is_empty());
+
+        let paginated_response= delta_reader.get_n_from_first_match::<S>(&TestCompositeField::MAX, 100).await.unwrap();
+        assert!(paginated_response.key_value.is_empty());
+        assert!(paginated_response.next.is_none());
+
+        let values: Vec<_> = delta_reader.collect_in_range::<S, TestCompositeField>(TestCompositeField::MIN..TestCompositeField::MAX).await.unwrap();
+        assert!(values.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -522,26 +538,46 @@ mod tests {
         assert!(value.is_none());
 
         // Not found
-        let value = delta_reader.get::<S>(&TestCompositeField::MIN).await.unwrap();
+        let value = delta_reader
+            .get::<S>(&TestCompositeField::MIN)
+            .await
+            .unwrap();
         assert!(value.is_none());
-        let value = delta_reader.get::<S>(&TestCompositeField::MAX).await.unwrap();
+        let value = delta_reader
+            .get::<S>(&TestCompositeField::MAX)
+            .await
+            .unwrap();
         assert!(value.is_none());
-        let value = delta_reader.get::<S>(&TestCompositeField(3, 5, 1)).await.unwrap();
+        let value = delta_reader
+            .get::<S>(&TestCompositeField(3, 5, 1))
+            .await
+            .unwrap();
         assert!(value.is_none());
+    }
+
+    // Checks that values returned by iterator are sorted.
+    fn basic_check_iterator(delta_reader: &DeltaReader, expected_len: usize) {
+        let values: Vec<_> = delta_reader.iter::<S>().unwrap().collect();
+        assert_eq!(expected_len, values.len());
+        assert!(
+            values.windows(2).all(|w| w[0].0 <= w[1].0),
+            "iter should be sorted"
+        );
+
+        let values_rev: Vec<_> = delta_reader.iter_rev::<S>().unwrap().collect();
+        assert_eq!(expected_len, values_rev.len());
+
+        assert!(
+            values_rev.windows(2).all(|w| w[0].0 >= w[1].0),
+            "iter_rev should be sorted in reversed order"
+        );
     }
 
     #[test]
     fn iterator_simple() {
         let tmpdir = tempfile::tempdir().unwrap();
         let delta_reader = build_simple_delta_reader(tmpdir.path());
-
-        let values: Vec<_> = delta_reader.iter_rev::<S>().unwrap().collect();
-        assert_eq!(4, values.len());
-
-        assert!(
-            values.windows(2).all(|w| w[0].0 >= w[1].0),
-            "iter_rev should be sorted in reversed order"
-        );
+        basic_check_iterator(&delta_reader, 4);
     }
 
     #[test]
@@ -549,13 +585,7 @@ mod tests {
         let tmpdir = tempfile::tempdir().unwrap();
         let delta_reader = build_elaborate_delta_reader(tmpdir.path());
 
-        let values: Vec<_> = delta_reader.iter_rev::<S>().unwrap().collect();
-        assert_eq!(4, values.len());
-
-        assert!(
-            values.windows(2).all(|w| w[0].0 >= w[1].0),
-            "iter_rev should be sorted in reversed order"
-        );
+        basic_check_iterator(&delta_reader, 4);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -628,16 +658,16 @@ mod tests {
         assert_eq!(largest_value, prev_value);
     }
 
-    fn execute_rev_iterator(
-        db_entries: Vec<(TestCompositeField, TestField)>,
-        snapshots: Vec<Vec<(TestCompositeField, TestField)>>,
-    ) -> Vec<(SchemaKey, SchemaValue)> {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let db = open_db(tmpdir.path());
+    fn build_delta_reader_from(
+        path: impl AsRef<Path>,
+        db_entries: &[(TestCompositeField, TestField)],
+        snapshots: &[Vec<(TestCompositeField, TestField)>],
+    ) -> DeltaReader {
+        let db = open_db(path.as_ref());
 
         let mut db_batch = SchemaBatch::new();
         for (key, value) in db_entries {
-            db_batch.put::<S>(&key, &value).unwrap();
+            db_batch.put::<S>(key, value).unwrap();
         }
         db.write_schemas(&db_batch).unwrap();
 
@@ -645,18 +675,15 @@ mod tests {
         for snapshot in snapshots {
             let mut schema_batch = SchemaBatch::new();
             for (key, value) in snapshot {
-                schema_batch.put::<S>(&key, &value).unwrap();
+                schema_batch.put::<S>(key, value).unwrap();
             }
             schema_batches.push(Arc::new(schema_batch));
         }
 
-        let delta_reader = DeltaReader::new(db, schema_batches);
-
-        let values: Vec<_> = delta_reader.iter_rev::<S>().unwrap().collect();
-        values
+        DeltaReader::new(db, schema_batches)
     }
 
-    fn execute_deletions(
+    fn execute_with_all_deleted_in_last_snapshot(
         db_entries: Vec<(TestCompositeField, TestField)>,
         snapshots: Vec<Vec<(TestCompositeField, TestField)>>,
     ) -> Vec<(SchemaKey, SchemaValue)> {
@@ -708,17 +735,46 @@ mod tests {
 
     proptest! {
         #[test]
+        fn proptest_get((db_entries, snapshots) in generate_db_entries_and_snapshots()) {
+            let tmpdir = tempfile::tempdir().unwrap();
+            let db_reader = build_delta_reader_from(tmpdir.path(), &db_entries, &snapshots);
+            let rt = Runtime::new().unwrap();
+            let _ = rt.block_on(async {
+                for (k, _) in &db_entries {
+                    let value = db_reader.get::<S>(k).await;
+                    prop_assert!(value.is_ok());
+                    let value = value.unwrap();
+                    prop_assert!(value.is_some());
+                }
+                Ok(())
+            });
+        }
+
+        #[test]
         fn proptest_rev_iterator_simple((db_entries, snapshots) in generate_db_entries_and_snapshots()) {
-            let values = execute_rev_iterator(db_entries, snapshots);
+            let tmpdir = tempfile::tempdir().unwrap();
+            let delta_reader = build_delta_reader_from(tmpdir.path(), &db_entries, &snapshots);
+
+            let iterator = delta_reader.iter::<S>();
+            prop_assert!(iterator.is_ok());
+            let values: Vec<_> = iterator.unwrap().collect();
             prop_assert!(
-                values.windows(2).all(|w| w[0].0 >= w[1].0),
+                values.windows(2).all(|w| w[0].0 <= w[1].0),
+                "iter should be sorted"
+            );
+
+            let iterator_rev = delta_reader.iter_rev::<S>();
+            prop_assert!(iterator_rev.is_ok());
+            let values_rev: Vec<_> = iterator_rev.unwrap().collect();
+            prop_assert!(
+                values_rev.windows(2).all(|w| w[0].0 >= w[1].0),
                 "iter_rev should be sorted in reversed order"
             );
        }
 
         #[test]
         fn proptest_rev_iterator_everything_was_deleted((db_entries, snapshots) in generate_db_entries_and_snapshots()) {
-            let values = execute_deletions(db_entries, snapshots);
+            let values = execute_with_all_deleted_in_last_snapshot(db_entries, snapshots);
             prop_assert!(values.is_empty());
        }
     }
