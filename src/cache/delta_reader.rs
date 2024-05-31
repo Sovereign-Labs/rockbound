@@ -1,5 +1,4 @@
-#![allow(dead_code)]
-//! This module contains the next iteration of [`crate::cache::cache_db::CacheDb`]
+//! Module with `DeltaReader`, a handler of `DB` and uncommited snapshots.
 use crate::iterator::{RawDbIter, ScanDirection};
 use crate::schema::{KeyCodec, KeyDecoder, ValueCodec};
 use crate::{
@@ -140,6 +139,7 @@ impl DeltaReader {
         })
     }
 
+    #[allow(dead_code)]
     fn iter<S: Schema>(&self) -> anyhow::Result<DeltaReaderIter<SnapshotIter>> {
         let snapshot_iterators = self
             .snapshots
