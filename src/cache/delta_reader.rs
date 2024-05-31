@@ -1,14 +1,19 @@
 #![allow(dead_code)]
 //! This module contains the next iteration of [`crate::cache::cache_db::CacheDb`]
-use crate::cache::change_set::{ChangeSetIter, ChangeSetRange};
 use crate::iterator::{RawDbIter, ScanDirection};
 use crate::schema::{KeyCodec, KeyDecoder, ValueCodec};
 use crate::{
     Operation, PaginatedResponse, Schema, SchemaBatch, SchemaKey, SchemaValue, SeekKeyEncoder, DB,
 };
 use std::cmp::Ordering;
+use std::collections::btree_map;
 use std::iter::{Peekable, Rev};
 use std::sync::Arc;
+
+/// Iterator type returned by [`DeltaReader::iter`].
+pub type SnapshotIter<'a> = btree_map::Iter<'a, SchemaKey, Operation>;
+/// Range type returned by [`DeltaReader::iter_range`].
+pub type SnapshotIterRange<'a> = btree_map::Range<'a, SchemaKey, Operation>;
 
 /// Intermediate step between [`crate::cache::cache_db::CacheDb`] and future DeltaDbReader
 /// Supports "local writes". And for historical reading it uses `Vec<Arc<ChangeSet>`
@@ -134,7 +139,7 @@ impl DeltaReader {
         })
     }
 
-    fn iter<S: Schema>(&self) -> anyhow::Result<DeltaReaderIter<ChangeSetIter>> {
+    fn iter<S: Schema>(&self) -> anyhow::Result<DeltaReaderIter<SnapshotIter>> {
         let snapshot_iterators = self
             .snapshots
             .iter()
@@ -153,7 +158,7 @@ impl DeltaReader {
     fn iter_range<S: Schema>(
         &self,
         range: impl std::ops::RangeBounds<SchemaKey> + Clone,
-    ) -> anyhow::Result<DeltaReaderIter<ChangeSetRange>> {
+    ) -> anyhow::Result<DeltaReaderIter<SnapshotIterRange>> {
         let snapshot_iterators = self
             .snapshots
             .iter()
@@ -170,7 +175,7 @@ impl DeltaReader {
     }
 
     //
-    fn iter_rev<S: Schema>(&self) -> anyhow::Result<DeltaReaderIter<Rev<ChangeSetIter>>> {
+    fn iter_rev<S: Schema>(&self) -> anyhow::Result<DeltaReaderIter<Rev<SnapshotIter>>> {
         // Snapshot iterators.
         // Snapshots are in natural order, but k/v are in reversed.
         // Snapshots need to be in natural order, so chronology is always preserved.
@@ -192,7 +197,7 @@ impl DeltaReader {
     fn iter_rev_range<S: Schema>(
         &self,
         range: impl std::ops::RangeBounds<SchemaKey> + Clone,
-    ) -> anyhow::Result<DeltaReaderIter<Rev<ChangeSetRange>>> {
+    ) -> anyhow::Result<DeltaReaderIter<Rev<SnapshotIterRange>>> {
         let snapshot_iterators = self
             .snapshots
             .iter()
@@ -478,20 +483,35 @@ mod tests {
         let values: Vec<_> = delta_reader.iter::<S>().unwrap().collect();
         assert!(values.is_empty());
 
-        let full_range = encode_key(&TestCompositeField::MIN)..=encode_key(&TestCompositeField::MAX);
-        let values: Vec<_> = delta_reader.iter_range::<S>(full_range.clone()).unwrap().collect();
+        let full_range =
+            encode_key(&TestCompositeField::MIN)..=encode_key(&TestCompositeField::MAX);
+        let values: Vec<_> = delta_reader
+            .iter_range::<S>(full_range.clone())
+            .unwrap()
+            .collect();
         assert!(values.is_empty());
 
         let values: Vec<_> = delta_reader.iter_rev::<S>().unwrap().collect();
         assert!(values.is_empty());
-        let values: Vec<_> = delta_reader.iter_rev_range::<S>(full_range).unwrap().collect();
+        let values: Vec<_> = delta_reader
+            .iter_rev_range::<S>(full_range)
+            .unwrap()
+            .collect();
         assert!(values.is_empty());
 
-        let paginated_response= delta_reader.get_n_from_first_match::<S>(&TestCompositeField::MAX, 100).await.unwrap();
+        let paginated_response = delta_reader
+            .get_n_from_first_match::<S>(&TestCompositeField::MAX, 100)
+            .await
+            .unwrap();
         assert!(paginated_response.key_value.is_empty());
         assert!(paginated_response.next.is_none());
 
-        let values: Vec<_> = delta_reader.collect_in_range::<S, TestCompositeField>(TestCompositeField::MIN..TestCompositeField::MAX).await.unwrap();
+        let values: Vec<_> = delta_reader
+            .collect_in_range::<S, TestCompositeField>(
+                TestCompositeField::MIN..TestCompositeField::MAX,
+            )
+            .await
+            .unwrap();
         assert!(values.is_empty());
     }
 
