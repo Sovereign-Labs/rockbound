@@ -394,6 +394,14 @@ mod tests {
         <TestCompositeField as KeyEncoder<S>>::encode_key(key).unwrap()
     }
 
+    fn decode_key(key: &SchemaKey) -> TestCompositeField {
+        <<S as Schema>::Key as KeyDecoder<S>>::decode_key(&key).unwrap()
+    }
+
+    fn decode_value(value: &SchemaValue) -> TestField {
+        <<S as Schema>::Value as ValueCodec<S>>::decode_value(&value).unwrap()
+    }
+
     async fn check_value(delta_reader: &DeltaReader, key: u32, expected_value: Option<u32>) {
         let actual_value = delta_reader
             .get::<S>(&TestCompositeField(key, 0, 0))
@@ -425,6 +433,16 @@ mod tests {
     // 1. Written: field 6.
     // 2. Written: fields 2, 7. Deleted: field 5.
     // 3. Written: fields 3, 6. Deleted: fields 1, 7.
+    // The final available values are:
+    // [(2, 200), (3, 3000), (4, 4), (6, 6000)]
+    // Idea behind each field:
+    // FIELD_1: Value from DB deleted in snapshot
+    // FIELD_2: Value written in previous snapshot
+    // FIELD_3: Value written in the most recent snapshot (traversal to the most recent)
+    // FIELD_4: Value written in DB and wasn't touched since (traversal to DB)
+    // FIELD_5: Value was deleted before a recent snapshot.
+    // FIELD_6: Value from snapshot has been overwritten.
+    // FIELD_7: Value has been deleted in the most recent snapshot.
     fn build_elaborate_delta_reader(path: impl AsRef<Path>) -> DeltaReader {
         let db = open_db(path.as_ref());
         let mut schema_batch_0 = SchemaBatch::new();
@@ -743,6 +761,89 @@ mod tests {
         assert_eq!(largest_value, prev_value);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_n_simple() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let delta_reader = build_simple_delta_reader(tmpdir.path());
+
+        let paginated_response = delta_reader
+            .get_n_from_first_match::<S>(&TestCompositeField::MIN, 2)
+            .await
+            .unwrap();
+        assert_eq!(2, paginated_response.key_value.len());
+        let expected_first_page = vec![(FIELD_1, TestField(1)), (FIELD_2, TestField(2))];
+        assert_eq!(expected_first_page, paginated_response.key_value);
+        assert_eq!(Some(FIELD_3), paginated_response.next);
+
+        let paginated_response = delta_reader
+            .get_n_from_first_match::<S>(&FIELD_3, 2)
+            .await
+            .unwrap();
+        assert_eq!(2, paginated_response.key_value.len());
+        let expected_first_page = vec![(FIELD_3, TestField(3)), (FIELD_4, TestField(4))];
+        assert_eq!(expected_first_page, paginated_response.key_value);
+        assert!(paginated_response.next.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_n_elaborate() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let delta_reader = build_elaborate_delta_reader(tmpdir.path());
+
+        let paginated_response = delta_reader
+            .get_n_from_first_match::<S>(&TestCompositeField::MIN, 2)
+            .await
+            .unwrap();
+        assert_eq!(2, paginated_response.key_value.len());
+        let expected_first_page = vec![(FIELD_2, TestField(200)), (FIELD_3, TestField(3000))];
+        assert_eq!(expected_first_page, paginated_response.key_value);
+        assert_eq!(Some(FIELD_4), paginated_response.next);
+
+        let paginated_response = delta_reader
+            .get_n_from_first_match::<S>(&FIELD_4, 2)
+            .await
+            .unwrap();
+        assert_eq!(2, paginated_response.key_value.len());
+        let expected_first_page = vec![(FIELD_4, TestField(4)), (FIELD_6, TestField(6000))];
+        assert_eq!(expected_first_page, paginated_response.key_value);
+        assert!(paginated_response.next.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn collect_in_range_elaborate() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let delta_reader = build_elaborate_delta_reader(tmpdir.path());
+
+        let all_values: Vec<_> = delta_reader
+            .iter::<S>()
+            .unwrap()
+            .map(|(k, v)| (decode_key(&k), decode_value(&v)))
+            .collect();
+        assert_eq!(4, all_values.len());
+
+        let test_cases = vec![
+            (FIELD_2..FIELD_3, ..1),
+            (FIELD_2..FIELD_4, ..2),
+            (FIELD_2..FIELD_5, ..3),
+            (FIELD_2..FIELD_6, ..3),
+            (FIELD_2..FIELD_7, ..4),
+        ];
+
+        for (field_range, expected_range) in test_cases {
+            let range_values = delta_reader
+                .collect_in_range::<S, TestCompositeField>(field_range.clone())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                all_values[expected_range].to_vec(),
+                range_values,
+                "failed for range {:?}",
+                field_range
+            )
+        }
+    }
+
     fn build_delta_reader_from(
         path: impl AsRef<Path>,
         db_entries: &[(TestCompositeField, TestField)],
@@ -836,10 +937,12 @@ mod tests {
         }
 
         #[test]
-        fn proptest_rev_iterator_simple((db_entries, snapshots) in generate_db_entries_and_snapshots()) {
+        fn proptest_iterator_only_writes((db_entries, snapshots) in generate_db_entries_and_snapshots()) {
             let tmpdir = tempfile::tempdir().unwrap();
             let delta_reader = build_delta_reader_from(tmpdir.path(), &db_entries, &snapshots);
 
+
+            // Check ordering.
             let iterator = delta_reader.iter::<S>();
             prop_assert!(iterator.is_ok());
             let values: Vec<_> = iterator.unwrap().collect();
