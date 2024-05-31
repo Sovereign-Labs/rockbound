@@ -7,7 +7,7 @@ use crate::schema::{KeyDecoder, KeyEncoder, ValueCodec};
 use crate::{CodecError, Schema, SeekKeyEncoder};
 
 /// Key that is composed out of triplet of [`u32`]s.
-#[derive(Debug, Eq, PartialEq, Clone)]
+#[derive(Debug, Eq, PartialEq, Clone, Ord, PartialOrd)]
 pub struct TestCompositeField(pub u32, pub u32, pub u32);
 
 impl TestCompositeField {
@@ -18,7 +18,7 @@ impl TestCompositeField {
 }
 
 /// Simple wrapper around [`u32`].
-#[derive(Debug, Eq, PartialEq, Clone, Copy)]
+#[derive(Debug, Eq, PartialEq, Clone, Copy, Ord, PartialOrd)]
 pub struct TestField(pub u32);
 
 impl<S: Schema> KeyEncoder<S> for TestCompositeField {

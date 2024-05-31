@@ -356,6 +356,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::Path;
 
     use rocksdb::DEFAULT_COLUMN_FAMILY_NAME;
@@ -395,11 +396,11 @@ mod tests {
     }
 
     fn decode_key(key: &SchemaKey) -> TestCompositeField {
-        <<S as Schema>::Key as KeyDecoder<S>>::decode_key(&key).unwrap()
+        <<S as Schema>::Key as KeyDecoder<S>>::decode_key(key).unwrap()
     }
 
     fn decode_value(value: &SchemaValue) -> TestField {
-        <<S as Schema>::Value as ValueCodec<S>>::decode_value(&value).unwrap()
+        <<S as Schema>::Value as ValueCodec<S>>::decode_value(value).unwrap()
     }
 
     async fn check_value(delta_reader: &DeltaReader, key: u32, expected_value: Option<u32>) {
@@ -427,7 +428,7 @@ mod tests {
         DeltaReader::new(db, vec![Arc::new(snapshot_1)])
     }
 
-    // DeltaReader with a known set of values, but more complex combination, includes deletion.
+    // DeltaReader with a known set of sample values, includes deletion.
     // DB contains fields 1, 4, 5, and 7.
     // Have 3 snapshots, value is equal to field_id * 10^snapshot_level:
     // 1. Written: field 6.
@@ -443,7 +444,7 @@ mod tests {
     // FIELD_5: Value was deleted before a recent snapshot.
     // FIELD_6: Value from snapshot has been overwritten.
     // FIELD_7: Value has been deleted in the most recent snapshot.
-    fn build_elaborate_delta_reader(path: impl AsRef<Path>) -> DeltaReader {
+    fn build_sample_delta_reader(path: impl AsRef<Path>) -> DeltaReader {
         let db = open_db(path.as_ref());
         let mut schema_batch_0 = SchemaBatch::new();
         schema_batch_0.put::<S>(&FIELD_1, &TestField(1)).unwrap();
@@ -478,7 +479,7 @@ mod tests {
     // End of test utils
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_empty() {
+    async fn empty() {
         let tmpdir = tempfile::tempdir().unwrap();
         let db = open_db(tmpdir.path());
 
@@ -530,26 +531,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn get_simple() {
+    async fn get_from_sample() {
         let tmpdir = tempfile::tempdir().unwrap();
-        let delta_reader = build_simple_delta_reader(tmpdir.path());
-
-        // From DB
-        let value_1 = delta_reader.get::<S>(&FIELD_1).await.unwrap();
-        assert_eq!(Some(TestField(1)), value_1);
-
-        // From Snapshot
-        let value_2 = delta_reader.get::<S>(&FIELD_2).await.unwrap();
-        assert_eq!(Some(TestField(2)), value_2);
-
-        let not_found = delta_reader.get::<S>(&FIELD_7).await.unwrap();
-        assert!(not_found.is_none());
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn get_elaborate() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let delta_reader = build_elaborate_delta_reader(tmpdir.path());
+        let delta_reader = build_sample_delta_reader(tmpdir.path());
 
         // From DB
         let value = delta_reader.get::<S>(&FIELD_4).await.unwrap();
@@ -659,25 +643,9 @@ mod tests {
     }
 
     #[test]
-    fn iterator_simple() {
+    fn iterator_sample() {
         let tmpdir = tempfile::tempdir().unwrap();
-        let delta_reader = build_simple_delta_reader(tmpdir.path());
-        basic_check_iterator(&delta_reader, 4);
-
-        let range = encode_key(&FIELD_1)..encode_key(&FIELD_2);
-        basic_check_iterator_range(&delta_reader, 1, range);
-        let range = ..encode_key(&FIELD_2);
-        basic_check_iterator_range(&delta_reader, 1, range);
-        let range = encode_key(&FIELD_1)..=encode_key(&FIELD_2);
-        basic_check_iterator_range(&delta_reader, 2, range);
-        let range = encode_key(&FIELD_2)..=encode_key(&FIELD_3);
-        basic_check_iterator_range(&delta_reader, 2, range);
-    }
-
-    #[test]
-    fn iterator_elaborate() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let delta_reader = build_elaborate_delta_reader(tmpdir.path());
+        let delta_reader = build_sample_delta_reader(tmpdir.path());
 
         basic_check_iterator(&delta_reader, 4);
 
@@ -692,22 +660,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn get_largest_simple() {
+    async fn get_largest_sample() {
         let tmpdir = tempfile::tempdir().unwrap();
-        let delta_reader = build_simple_delta_reader(tmpdir.path());
-
-        let largest = delta_reader.get_largest::<S>().await.unwrap();
-        assert!(largest.is_some(), "largest value is not found");
-        let (largest_key, largest_value) = largest.unwrap();
-
-        assert_eq!(FIELD_4, largest_key);
-        assert_eq!(TestField(4), largest_value);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn get_largest_elaborate() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let delta_reader = build_elaborate_delta_reader(tmpdir.path());
+        let delta_reader = build_sample_delta_reader(tmpdir.path());
 
         let largest = delta_reader.get_largest::<S>().await.unwrap();
         assert!(largest.is_some(), "largest value is not found");
@@ -718,9 +673,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn get_prev_simple() {
+    async fn get_prev_sample() {
         let tmpdir = tempfile::tempdir().unwrap();
-        let delta_reader = build_simple_delta_reader(tmpdir.path());
+        let delta_reader = build_sample_delta_reader(tmpdir.path());
 
         // MIN, should not find anything
         let prev = delta_reader
@@ -731,15 +686,17 @@ mod tests {
 
         // Should get the lowest value in
         let prev = delta_reader.get_prev::<S>(&FIELD_1).await.unwrap();
-        assert!(prev.is_some());
+        assert!(prev.is_none());
+
+        let prev = delta_reader.get_prev::<S>(&FIELD_2).await.unwrap();
         let (prev_key, prev_value) = prev.unwrap();
-        assert_eq!(FIELD_1, prev_key);
-        assert_eq!(TestField(1), prev_value);
+        assert_eq!(FIELD_2, prev_key);
+        assert_eq!(TestField(200), prev_value);
 
         // Some value in the middle
         let (prev_key, prev_value) = delta_reader.get_prev::<S>(&FIELD_3).await.unwrap().unwrap();
         assert_eq!(FIELD_3, prev_key);
-        assert_eq!(TestField(3), prev_value);
+        assert_eq!(TestField(3000), prev_value);
 
         // Value in between
         let (prev_key, prev_value) = delta_reader
@@ -748,17 +705,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(FIELD_3, prev_key);
-        assert_eq!(TestField(3), prev_value);
-
-        // MAX Should return the largest value
-        let (prev_key, prev_value) = delta_reader
-            .get_prev::<S>(&TestCompositeField::MAX)
-            .await
-            .unwrap()
-            .unwrap();
-        let (largest_key, largest_value) = delta_reader.get_largest::<S>().await.unwrap().unwrap();
-        assert_eq!(largest_key, prev_key);
-        assert_eq!(largest_value, prev_value);
+        assert_eq!(TestField(3000), prev_value);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -788,7 +735,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn get_n_elaborate() {
         let tmpdir = tempfile::tempdir().unwrap();
-        let delta_reader = build_elaborate_delta_reader(tmpdir.path());
+        let delta_reader = build_sample_delta_reader(tmpdir.path());
 
         let paginated_response = delta_reader
             .get_n_from_first_match::<S>(&TestCompositeField::MIN, 2)
@@ -810,9 +757,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn collect_in_range_elaborate() {
+    async fn collect_in_range_sample() {
         let tmpdir = tempfile::tempdir().unwrap();
-        let delta_reader = build_elaborate_delta_reader(tmpdir.path());
+        let delta_reader = build_sample_delta_reader(tmpdir.path());
 
         let all_values: Vec<_> = delta_reader
             .iter::<S>()
@@ -851,9 +798,12 @@ mod tests {
     ) -> DeltaReader {
         let db = open_db(path.as_ref());
 
+        let mut all_kv: BTreeMap<TestCompositeField, TestField> = BTreeMap::new();
+
         let mut db_batch = SchemaBatch::new();
         for (key, value) in db_entries {
             db_batch.put::<S>(key, value).unwrap();
+            all_kv.insert(key.clone(), *value);
         }
         db.write_schemas(&db_batch).unwrap();
 
@@ -862,6 +812,7 @@ mod tests {
             let mut schema_batch = SchemaBatch::new();
             for (key, value) in snapshot {
                 schema_batch.put::<S>(key, value).unwrap();
+                all_kv.insert(key.clone(), *value);
             }
             schema_batches.push(Arc::new(schema_batch));
         }
@@ -923,15 +874,50 @@ mod tests {
         #[test]
         fn proptest_get((db_entries, snapshots) in generate_db_entries_and_snapshots()) {
             let tmpdir = tempfile::tempdir().unwrap();
-            let db_reader = build_delta_reader_from(tmpdir.path(), &db_entries, &snapshots);
+            let delta_reader = build_delta_reader_from(tmpdir.path(), &db_entries, &snapshots);
+
+            // Building a reference for all K/V for validation.
+            let mut all_kv: BTreeMap<TestCompositeField, TestField> = BTreeMap::new();
+            for (key, value) in db_entries {
+                all_kv.insert(key, value);
+            }
+            for snapshot in snapshots {
+                for (key, value) in snapshot {
+                    all_kv.insert(key.clone(), value);
+                }
+            }
+
+
             let rt = Runtime::new().unwrap();
             let _ = rt.block_on(async {
-                for (k, _) in &db_entries {
-                    let value = db_reader.get::<S>(k).await;
+
+                let largest = delta_reader.get_largest::<S>().await.unwrap();
+                let prev = delta_reader
+                            .get_prev::<S>(&TestCompositeField::MAX)
+                            .await;
+                prop_assert!(prev.is_ok());
+                let prev = prev.unwrap();
+                prop_assert_eq!(largest.clone(), prev);
+                match all_kv.iter().max() {
+                    None => {
+                        prop_assert!(largest.is_none());
+                    },
+                    Some((k, v)) => {
+                        prop_assert_eq!(Some((k.clone(), *v)), largest);
+                    }
+                }
+
+                for (key, expected_value) in all_kv.into_iter() {
+                    let value = delta_reader.get::<S>(&key).await;
                     prop_assert!(value.is_ok());
                     let value = value.unwrap();
-                    prop_assert!(value.is_some());
+                    prop_assert_eq!(Some(expected_value), value);
+                    let prev_value = delta_reader.get_prev::<S>(&key).await;
+                    prop_assert!(prev_value.is_ok());
+                    let prev_value = prev_value.unwrap();
+                    prop_assert_eq!(Some((key, expected_value)), prev_value);
                 }
+
                 Ok(())
             });
         }
@@ -940,7 +926,6 @@ mod tests {
         fn proptest_iterator_only_writes((db_entries, snapshots) in generate_db_entries_and_snapshots()) {
             let tmpdir = tempfile::tempdir().unwrap();
             let delta_reader = build_delta_reader_from(tmpdir.path(), &db_entries, &snapshots);
-
 
             // Check ordering.
             let iterator = delta_reader.iter::<S>();
