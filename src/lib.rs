@@ -456,7 +456,6 @@ pub struct PaginatedResponse<S: Schema> {
     pub next: Option<S::Key>,
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

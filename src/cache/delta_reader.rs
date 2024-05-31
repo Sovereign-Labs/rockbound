@@ -16,7 +16,7 @@ use std::sync::Arc;
 pub struct DeltaReader {
     /// Set of not finalized changes in chronological order.
     /// Meaning that the first snapshot in the vector is the oldest and the latest is the most recent.
-    /// If keys are equal, value from more recent snapshot is taken.
+    /// If keys are equal, the value from more recent snapshot is taken.
     snapshots: Vec<Arc<SchemaBatch>>,
     /// Reading finalized data from here.
     db: DB,
@@ -305,7 +305,7 @@ where
 
             // All next values are observed at this point
             // Handling actual change of the iterator state.
-            // Rightmost value in the next locations is the most recent, so it is taken.
+            // the rightmost value in the next locations is the most recent, so it is taken.
             if let Some(latest_next_location) = next_value_locations.pop() {
                 // First, move all iterators to the next position
                 for location in &next_value_locations {
@@ -457,17 +457,17 @@ mod tests {
         let tmpdir = tempfile::tempdir().unwrap();
         let db = open_db(tmpdir.path());
 
-        let delta_db = DeltaReader::new(db, vec![]);
+        let delta_reader = DeltaReader::new(db, vec![]);
 
-        let values: Vec<_> = delta_db.iter_rev::<S>().unwrap().collect();
+        let values: Vec<_> = delta_reader.iter_rev::<S>().unwrap().collect();
         assert!(values.is_empty());
 
-        let largest = delta_db.get_largest::<S>().await.unwrap();
+        let largest = delta_reader.get_largest::<S>().await.unwrap();
 
         assert!(largest.is_none());
 
         let key = TestCompositeField::MAX;
-        let prev = delta_db.get_prev::<S>(&key).await.unwrap();
+        let prev = delta_reader.get_prev::<S>(&key).await.unwrap();
         assert!(prev.is_none());
     }
 
