@@ -12,14 +12,15 @@ use std::sync::Arc;
 
 /// Iterator type returned by [`DeltaReader::iter`].
 pub type SnapshotIter<'a> = btree_map::Iter<'a, SchemaKey, Operation>;
-/// Range type returned by [`DeltaReader::iter_range`].
+/// Range type returned by [`DeltaReader::iter_range`].``
 pub type SnapshotIterRange<'a> = btree_map::Range<'a, SchemaKey, Operation>;
 
-/// Intermediate step between [`crate::cache::cache_db::CacheDb`] and future DeltaDbReader
-/// Supports "local writes". And for historical reading it uses `Vec<Arc<ChangeSet>`
+/// Read-only data provider that supports a list of snapshots on top of `DB`.
+/// Maintains total ordering and respects uncommited deletions.
+/// Should not write to underlying `DB`
 #[derive(Debug)]
 pub struct DeltaReader {
-    /// Set of not finalized changes in chronological order.
+    /// Set of not commited changes in chronological order.
     /// Meaning that the first snapshot in the vector is the oldest and the latest is the most recent.
     /// If keys are equal, the value from more recent snapshot is taken.
     snapshots: Vec<Arc<SchemaBatch>>,
@@ -34,7 +35,7 @@ impl DeltaReader {
         Self { snapshots, db }
     }
 
-    /// Get a value, wherever it is.
+    /// Get a value for given [`Schema`]. If value has been deleted in uncommitted changes, returns None.
     pub async fn get<S: Schema>(&self, key: &impl KeyCodec<S>) -> anyhow::Result<Option<S::Value>> {
         // Some(Operation) means that key was touched,
         // but in case of deletion, we early return None
@@ -65,7 +66,7 @@ impl DeltaReader {
         })
     }
 
-    /// Get the largest value in [`Schema`] that is smaller than give `seek_key`.
+    /// Get the largest value in [`Schema`] that is smaller or equal given `seek_key`.
     pub async fn get_prev<S: Schema>(
         &self,
         seek_key: &impl SeekKeyEncoder<S>,
@@ -84,7 +85,7 @@ impl DeltaReader {
         })
     }
 
-    /// Get `n` keys >= `seek_key`
+    /// Get `n` keys >= `seek_key`, paginated.
     pub async fn get_n_from_first_match<S: Schema>(
         &self,
         seek_key: &impl SeekKeyEncoder<S>,
@@ -117,7 +118,7 @@ impl DeltaReader {
         })
     }
 
-    /// Collects all key-value pairs in given range, from smallest to largest.
+    /// Collects all key-value pairs in given range: `smallest..largest`.
     pub async fn collect_in_range<S: Schema, Sk: SeekKeyEncoder<S>>(
         &self,
         range: std::ops::Range<Sk>,
@@ -174,7 +175,6 @@ impl DeltaReader {
         ))
     }
 
-    //
     fn iter_rev<S: Schema>(&self) -> anyhow::Result<DeltaReaderIter<Rev<SnapshotIter>>> {
         // Snapshot iterators.
         // Snapshots are in natural order, but k/v are in reversed.
@@ -216,6 +216,7 @@ impl DeltaReader {
     }
 }
 
+/// Core logic of [`DeltaReader`]. Handles matching key and progresses underlying iterators.
 struct DeltaReaderIter<'a, SnapshotIter>
 where
     SnapshotIter: Iterator<Item = (&'a SchemaKey, &'a Operation)>,
@@ -284,7 +285,7 @@ where
                 next_value = Some(db_key);
             };
 
-            // For each snapshot, pick it next value.
+            // For each snapshot, pick its next value.
             // Update "global" next value accordingly.
             for (idx, iter) in self.snapshot_iterators.iter_mut().enumerate() {
                 if let Some(&(peeked_key, _)) = iter.peek() {
