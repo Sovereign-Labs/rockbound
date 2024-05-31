@@ -419,7 +419,7 @@ mod tests {
 
     // DeltaReader with a known set of values, but more complex combination, includes deletion.
     // DB contains fields 1, 4, 5, and 7.
-    // Have 3 snapshots:
+    // Have 3 snapshots, value is equal to field_id * 10^snapshot_level:
     // 1. Written: field 6.
     // 2. Written: fields 2, 7. Deleted: field 5.
     // 3. Written: fields 3, 6. Deleted: fields 1, 7.
@@ -477,6 +477,57 @@ mod tests {
 
         let value_1 = delta_reader.get::<S>(&FIELD_1).await.unwrap();
         assert!(value_1.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_simple() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let delta_reader = build_simple_delta_reader(tmpdir.path());
+
+        // From DB
+        let value_1 = delta_reader.get::<S>(&FIELD_1).await.unwrap();
+        assert_eq!(Some(TestField(1)), value_1);
+
+        // From Snapshot
+        let value_2 = delta_reader.get::<S>(&FIELD_2).await.unwrap();
+        assert_eq!(Some(TestField(2)), value_2);
+
+        let not_found = delta_reader.get::<S>(&FIELD_7).await.unwrap();
+        assert!(not_found.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_elaborate() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let delta_reader = build_elaborate_delta_reader(tmpdir.path());
+
+        // From DB
+        let value = delta_reader.get::<S>(&FIELD_4).await.unwrap();
+        assert_eq!(Some(TestField(4)), value);
+
+        // From the most recent snapshot
+        let value = delta_reader.get::<S>(&FIELD_3).await.unwrap();
+        assert_eq!(Some(TestField(3000)), value);
+        let value = delta_reader.get::<S>(&FIELD_6).await.unwrap();
+        assert_eq!(Some(TestField(6000)), value);
+
+        // From middle snapshot
+        let value = delta_reader.get::<S>(&FIELD_2).await.unwrap();
+        assert_eq!(Some(TestField(200)), value);
+
+        // Deleted values
+        let value = delta_reader.get::<S>(&FIELD_7).await.unwrap();
+        assert!(value.is_none());
+        let value = delta_reader.get::<S>(&FIELD_5).await.unwrap();
+        assert!(value.is_none());
+
+        // Not found
+        let value = delta_reader.get::<S>(&TestCompositeField::MIN).await.unwrap();
+        assert!(value.is_none());
+        let value = delta_reader.get::<S>(&TestCompositeField::MAX).await.unwrap();
+        assert!(value.is_none());
+        let value = delta_reader.get::<S>(&TestCompositeField(3, 5, 1)).await.unwrap();
+        assert!(value.is_none());
     }
 
     #[test]
