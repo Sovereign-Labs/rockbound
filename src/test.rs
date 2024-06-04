@@ -7,11 +7,18 @@ use crate::schema::{KeyDecoder, KeyEncoder, ValueCodec};
 use crate::{CodecError, Schema, SeekKeyEncoder};
 
 /// Key that is composed out of triplet of [`u32`]s.
-#[derive(Debug, Eq, PartialEq, Clone)]
+#[derive(Debug, Eq, PartialEq, Clone, Ord, PartialOrd)]
 pub struct TestCompositeField(pub u32, pub u32, pub u32);
 
+impl TestCompositeField {
+    /// Max value wrapper.
+    pub const MAX: Self = TestCompositeField(u32::MAX, u32::MAX, u32::MAX);
+    /// Min value wrapper.
+    pub const MIN: Self = TestCompositeField(0, 0, 0);
+}
+
 /// Simple wrapper around [`u32`].
-#[derive(Debug, Eq, PartialEq, Clone, Copy)]
+#[derive(Debug, Eq, PartialEq, Clone, Copy, Ord, PartialOrd)]
 pub struct TestField(pub u32);
 
 impl<S: Schema> KeyEncoder<S> for TestCompositeField {
@@ -119,14 +126,15 @@ impl<S: Schema> SeekKeyEncoder<S> for KeyPrefix2 {
 impl proptest::arbitrary::Arbitrary for TestField {
     type Parameters = std::ops::Range<u32>;
 
+    fn arbitrary() -> Self::Strategy {
+        use proptest::strategy::Strategy;
+        (0u32..1000).prop_map(TestField).boxed()
+    }
+
     fn arbitrary_with(args: Self::Parameters) -> Self::Strategy {
-        use proptest::prelude::any;
         use proptest::strategy::Strategy;
 
-        any::<u32>()
-            .prop_filter("Value should be in range", move |v| args.contains(v))
-            .prop_map(TestField)
-            .boxed()
+        args.prop_map(TestField).boxed()
     }
 
     type Strategy = proptest::strategy::BoxedStrategy<Self>;

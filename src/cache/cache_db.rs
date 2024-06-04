@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use crate::cache::cache_container::CacheContainer;
 use crate::cache::change_set::ChangeSet;
-use crate::cache::SnapshotId;
+use crate::cache::{PaginatedResponse, SnapshotId};
 use crate::iterator::ScanDirection;
 use crate::schema::KeyDecoder;
 use crate::{
@@ -17,16 +17,6 @@ use crate::{
 pub struct CacheDb {
     local_cache: Mutex<ChangeSet>,
     db: ReadOnlyLock<CacheContainer>,
-}
-
-/// Response for a paginated query which also includes the "next" key to pass
-#[derive(Debug)]
-pub struct PaginatedResponse<S: Schema> {
-    /// A vector of storage keys and their values
-    pub key_value: Vec<(S::Key, S::Value)>,
-    /// Key indicating the first key after the final pair from key_value.
-    /// Meant to be passed in in subsequent queries
-    pub next: Option<S::Key>,
 }
 
 impl CacheDb {
