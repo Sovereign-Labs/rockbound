@@ -1,4 +1,4 @@
-//! Module with `DeltaReader`, a handler of `DB` and uncommited snapshots.
+//! Module with [`DeltaReader`], a handler of [`DB`] and the list of uncommited snapshots.
 use crate::cache::PaginatedResponse;
 use crate::iterator::{RawDbIter, ScanDirection};
 use crate::schema::{KeyCodec, KeyDecoder, ValueCodec};
@@ -10,12 +10,12 @@ use std::sync::Arc;
 
 /// Iterator type returned by [`DeltaReader::iter`].
 pub type SnapshotIter<'a> = btree_map::Iter<'a, SchemaKey, Operation>;
-/// Range type returned by [`DeltaReader::iter_range`].``
+/// Range type returned by [`DeltaReader::iter_range`].
 pub type SnapshotIterRange<'a> = btree_map::Range<'a, SchemaKey, Operation>;
 
-/// Read-only data provider that supports a list of snapshots on top of `DB`.
+/// Read-only data provider that supports a list of snapshots on top of [`DB`].
 /// Maintains total ordering and respects uncommited deletions.
-/// Should not write to underlying `DB`
+/// Should not write to underlying [`DB`].
 #[derive(Debug)]
 pub struct DeltaReader {
     /// Set of not commited changes in chronological order.
