@@ -1,9 +1,8 @@
 //! Module with `DeltaReader`, a handler of `DB` and uncommited snapshots.
+use crate::cache::PaginatedResponse;
 use crate::iterator::{RawDbIter, ScanDirection};
 use crate::schema::{KeyCodec, KeyDecoder, ValueCodec};
-use crate::{
-    Operation, PaginatedResponse, Schema, SchemaBatch, SchemaKey, SchemaValue, SeekKeyEncoder, DB,
-};
+use crate::{Operation, Schema, SchemaBatch, SchemaKey, SchemaValue, SeekKeyEncoder, DB};
 use std::cmp::Ordering;
 use std::collections::btree_map;
 use std::iter::{Peekable, Rev};

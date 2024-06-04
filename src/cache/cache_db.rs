@@ -4,10 +4,9 @@ use std::sync::Mutex;
 
 use crate::cache::cache_container::CacheContainer;
 use crate::cache::change_set::ChangeSet;
-use crate::cache::SnapshotId;
+use crate::cache::{PaginatedResponse, SnapshotId};
 use crate::iterator::ScanDirection;
 use crate::schema::KeyDecoder;
-use crate::PaginatedResponse;
 use crate::{
     KeyCodec, Operation, ReadOnlyLock, Schema, SchemaBatch, SchemaKey, SchemaValue, SeekKeyEncoder,
     ValueCodec,
