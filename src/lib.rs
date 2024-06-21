@@ -20,9 +20,9 @@ mod metrics;
 pub mod schema;
 mod schema_batch;
 
+mod config;
 #[cfg(feature = "test-utils")]
 pub mod test;
-mod config;
 
 pub use config::RocksdbConfig;
 
