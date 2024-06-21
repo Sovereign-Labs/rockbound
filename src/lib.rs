@@ -24,7 +24,7 @@ mod config;
 #[cfg(feature = "test-utils")]
 pub mod test;
 
-pub use config::RocksdbConfig;
+pub use config::{gen_rocksdb_options, RocksdbConfig};
 
 use std::path::Path;
 use std::sync::{Arc, LockResult, RwLock, RwLockReadGuard};
