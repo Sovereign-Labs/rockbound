@@ -22,6 +22,7 @@ mod schema_batch;
 
 #[cfg(feature = "test-utils")]
 pub mod test;
+mod config;
 
 use std::path::Path;
 use std::sync::{Arc, LockResult, RwLock, RwLockReadGuard};
