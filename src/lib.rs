@@ -24,6 +24,8 @@ mod schema_batch;
 pub mod test;
 mod config;
 
+pub use config::RocksdbConfig;
+
 use std::path::Path;
 use std::sync::{Arc, LockResult, RwLock, RwLockReadGuard};
 
