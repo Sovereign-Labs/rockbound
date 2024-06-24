@@ -20,8 +20,11 @@ mod metrics;
 pub mod schema;
 mod schema_batch;
 
+mod config;
 #[cfg(feature = "test-utils")]
 pub mod test;
+
+pub use config::{gen_rocksdb_options, RocksdbConfig};
 
 use std::path::Path;
 use std::sync::{Arc, LockResult, RwLock, RwLockReadGuard};
