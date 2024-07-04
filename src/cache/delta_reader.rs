@@ -16,20 +16,20 @@ pub type SnapshotIterRange<'a> = btree_map::Range<'a, SchemaKey, Operation>;
 /// Read-only data provider that supports a list of snapshots on top of [`DB`].
 /// Maintains total ordering and respects uncommited deletions.
 /// Should not write to underlying [`DB`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DeltaReader {
     /// Set of not commited changes in chronological order.
     /// Meaning that the first snapshot in the vector is the oldest and the latest is the most recent.
     /// If keys are equal, the value from more recent snapshot is taken.
     snapshots: Vec<Arc<SchemaBatch>>,
     /// Reading finalized data from here.
-    db: DB,
+    db: Arc<DB>,
 }
 
 impl DeltaReader {
     /// Creates new [`DeltaReader`] with given [`DB`] and vector with uncommited snapshots of [`SchemaBatch`].
     /// Snapshots should be in chronological order.
-    pub fn new(db: DB, snapshots: Vec<Arc<SchemaBatch>>) -> Self {
+    pub fn new(db: Arc<DB>, snapshots: Vec<Arc<SchemaBatch>>) -> Self {
         Self { snapshots, db }
     }
 
@@ -381,12 +381,12 @@ mod tests {
     const FIELD_6: TestCompositeField = TestCompositeField(4, 2, 1);
     const FIELD_7: TestCompositeField = TestCompositeField(4, 3, 0);
 
-    fn open_db(dir: impl AsRef<Path>) -> DB {
+    fn open_db(dir: impl AsRef<Path>) -> Arc<DB> {
         let column_families = vec![DEFAULT_COLUMN_FAMILY_NAME, TestSchema::COLUMN_FAMILY_NAME];
         let mut db_opts = rocksdb::Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
-        DB::open(dir, "test", column_families, &db_opts).expect("Failed to open DB.")
+        Arc::new(DB::open(dir, "test", column_families, &db_opts).expect("Failed to open DB."))
     }
 
     // Test utils
@@ -893,7 +893,7 @@ mod tests {
                 "iter_rev should be sorted in reversed order"
             );
 
-            // Building a reference for all K/V for validation if basic check is passed.
+            // Building a reference for all K/V for validation if the basic check is passed.
             let mut all_kv: BTreeMap<TestCompositeField, TestField> = BTreeMap::new();
             for (key, value) in db_entries {
                 all_kv.insert(key, value);
