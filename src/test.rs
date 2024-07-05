@@ -97,6 +97,12 @@ impl<S: Schema> KeyEncoder<S> for TestField {
     }
 }
 
+impl<S: Schema> SeekKeyEncoder<S> for TestField {
+    fn encode_seek_key(&self) -> Result<Vec<u8>, CodecError> {
+        Ok(self.0.to_be_bytes().to_vec())
+    }
+}
+
 /// KeyPrefix over single u32
 pub struct KeyPrefix1(pub u32);
 
