@@ -16,75 +16,89 @@ pub type SnapshotIterRange<'a> = btree_map::Range<'a, SchemaKey, Operation>;
 /// Read-only data provider that supports a list of snapshots on top of [`DB`].
 /// Maintains total ordering and respects uncommited deletions.
 /// Should not write to underlying [`DB`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DeltaReader {
     /// Set of not commited changes in chronological order.
     /// Meaning that the first snapshot in the vector is the oldest and the latest is the most recent.
     /// If keys are equal, the value from more recent snapshot is taken.
     snapshots: Vec<Arc<SchemaBatch>>,
     /// Reading finalized data from here.
-    db: DB,
+    db: Arc<DB>,
 }
 
 impl DeltaReader {
     /// Creates new [`DeltaReader`] with given [`DB`] and vector with uncommited snapshots of [`SchemaBatch`].
     /// Snapshots should be in chronological order.
-    pub fn new(db: DB, snapshots: Vec<Arc<SchemaBatch>>) -> Self {
+    pub fn new(db: Arc<DB>, snapshots: Vec<Arc<SchemaBatch>>) -> Self {
         Self { snapshots, db }
     }
 
     /// Get a value for given [`Schema`]. If value has been deleted in uncommitted changes, returns None.
-    pub async fn get<S: Schema>(&self, key: &impl KeyCodec<S>) -> anyhow::Result<Option<S::Value>> {
+    pub fn get<S: Schema>(&self, key: &impl KeyCodec<S>) -> anyhow::Result<Option<S::Value>> {
         // Some(Operation) means that key was touched,
         // but in case of deletion, we early return None
         // Only in case of not finding operation for a key,
         // we go deeper
-
-        tokio::task::block_in_place(|| {
-            for snapshot in self.snapshots.iter().rev() {
-                if let Some(operation) = snapshot.get_operation::<S>(key)? {
-                    return operation.decode_value::<S>();
-                }
+        for snapshot in self.snapshots.iter().rev() {
+            if let Some(operation) = snapshot.get_operation::<S>(key)? {
+                return operation.decode_value::<S>();
             }
+        }
 
-            self.db.get(key)
-        })
+        self.db.get(key)
+    }
+
+    /// Async version of [`DeltaReader::get`].
+    pub async fn get_async<S: Schema>(
+        &self,
+        key: &impl KeyCodec<S>,
+    ) -> anyhow::Result<Option<S::Value>> {
+        tokio::task::block_in_place(|| self.get(key))
     }
 
     /// Get a value of the largest key written value for given [`Schema`].
-    pub async fn get_largest<S: Schema>(&self) -> anyhow::Result<Option<(S::Key, S::Value)>> {
-        tokio::task::block_in_place(|| {
-            let mut iterator = self.iter_rev::<S>()?;
-            if let Some((key, value)) = iterator.next() {
-                let key = S::Key::decode_key(&key)?;
-                let value = S::Value::decode_value(&value)?;
-                return Ok(Some((key, value)));
-            }
-            Ok(None)
-        })
+    pub fn get_largest<S: Schema>(&self) -> anyhow::Result<Option<(S::Key, S::Value)>> {
+        let mut iterator = self.iter_rev::<S>()?;
+        if let Some((key, value)) = iterator.next() {
+            let key = S::Key::decode_key(&key)?;
+            let value = S::Value::decode_value(&value)?;
+            return Ok(Some((key, value)));
+        }
+        Ok(None)
+    }
+
+    /// Async version [`DeltaReader::get_largest`].
+    pub async fn get_largest_async<S: Schema>(&self) -> anyhow::Result<Option<(S::Key, S::Value)>> {
+        tokio::task::block_in_place(|| self.get_largest::<S>())
     }
 
     /// Get the largest value in [`Schema`] that is smaller or equal given `seek_key`.
-    pub async fn get_prev<S: Schema>(
+    pub fn get_prev<S: Schema>(
         &self,
         seek_key: &impl SeekKeyEncoder<S>,
     ) -> anyhow::Result<Option<(S::Key, S::Value)>> {
         let seek_key = seek_key.encode_seek_key()?;
         let range = ..=seek_key;
 
-        tokio::task::block_in_place(|| {
-            let mut iterator = self.iter_rev_range::<S>(range)?;
-            if let Some((key, value)) = iterator.next() {
-                let key = S::Key::decode_key(&key)?;
-                let value = S::Value::decode_value(&value)?;
-                return Ok(Some((key, value)));
-            }
-            Ok(None)
-        })
+        let mut iterator = self.iter_rev_range::<S>(range)?;
+        if let Some((key, value)) = iterator.next() {
+            let key = S::Key::decode_key(&key)?;
+            let value = S::Value::decode_value(&value)?;
+            return Ok(Some((key, value)));
+        }
+        Ok(None)
+    }
+
+    /// Async version of [`DeltaReader::get_prev`].
+    pub async fn get_prev_async<S: Schema>(
+        &self,
+        seek_key: &impl SeekKeyEncoder<S>,
+    ) -> anyhow::Result<Option<(S::Key, S::Value)>> {
+        tokio::task::block_in_place(|| self.get_prev(seek_key))
     }
 
     /// Get `n` keys >= `seek_key`, paginated.
-    pub async fn get_n_from_first_match<S: Schema>(
+    pub fn get_n_from_first_match<S: Schema>(
         &self,
         seek_key: &impl SeekKeyEncoder<S>,
         n: usize,
@@ -92,32 +106,39 @@ impl DeltaReader {
         let seek_key = seek_key.encode_seek_key()?;
         let range = seek_key..;
 
-        tokio::task::block_in_place(|| {
-            let mut iterator = self.iter_range::<S>(range)?;
-            let results: Vec<(S::Key, S::Value)> = iterator
-                .by_ref()
-                .filter_map(|(key_bytes, value_bytes)| {
-                    let key = S::Key::decode_key(&key_bytes).ok()?;
-                    let value = S::Value::decode_value(&value_bytes).ok()?;
-                    Some((key, value))
-                })
-                .take(n)
-                .collect();
-
-            let next_start_key = match iterator.next().map(|(key_bytes, _)| key_bytes) {
-                None => None,
-                Some(key_bytes) => Some(S::Key::decode_key(&key_bytes)?),
-            };
-
-            Ok(PaginatedResponse {
-                key_value: results,
-                next: next_start_key,
+        let mut iterator = self.iter_range::<S>(range)?;
+        let results: Vec<(S::Key, S::Value)> = iterator
+            .by_ref()
+            .filter_map(|(key_bytes, value_bytes)| {
+                let key = S::Key::decode_key(&key_bytes).ok()?;
+                let value = S::Value::decode_value(&value_bytes).ok()?;
+                Some((key, value))
             })
+            .take(n)
+            .collect();
+
+        let next_start_key = match iterator.next().map(|(key_bytes, _)| key_bytes) {
+            None => None,
+            Some(key_bytes) => Some(S::Key::decode_key(&key_bytes)?),
+        };
+
+        Ok(PaginatedResponse {
+            key_value: results,
+            next: next_start_key,
         })
     }
 
+    /// Async version of  [`DeltaReader::get_n_from_first_match`].
+    pub async fn get_n_from_first_match_async<S: Schema>(
+        &self,
+        seek_key: &impl SeekKeyEncoder<S>,
+        n: usize,
+    ) -> anyhow::Result<PaginatedResponse<S>> {
+        tokio::task::block_in_place(|| self.get_n_from_first_match::<S>(seek_key, n))
+    }
+
     /// Collects all key-value pairs in given range: `smallest..largest`.
-    pub async fn collect_in_range<S: Schema, Sk: SeekKeyEncoder<S>>(
+    pub fn collect_in_range<S: Schema, Sk: SeekKeyEncoder<S>>(
         &self,
         range: std::ops::Range<Sk>,
     ) -> anyhow::Result<Vec<(S::Key, S::Value)>> {
@@ -125,17 +146,23 @@ impl DeltaReader {
         let upper_bound = range.end.encode_seek_key()?;
         let range = lower_bound..upper_bound;
 
-        tokio::task::block_in_place(|| {
-            let result = self
-                .iter_range::<S>(range)?
-                .map(|(key, value)| {
-                    let key = S::Key::decode_key(&key).unwrap();
-                    let value = S::Value::decode_value(&value).unwrap();
-                    (key, value)
-                })
-                .collect();
-            Ok(result)
-        })
+        let result = self
+            .iter_range::<S>(range)?
+            .map(|(key, value)| {
+                let key = S::Key::decode_key(&key).unwrap();
+                let value = S::Value::decode_value(&value).unwrap();
+                (key, value)
+            })
+            .collect();
+        Ok(result)
+    }
+
+    /// Async version of [`DeltaReader::collect_in_range`].
+    pub async fn collect_in_range_async<S: Schema, Sk: SeekKeyEncoder<S>>(
+        &self,
+        range: std::ops::Range<Sk>,
+    ) -> anyhow::Result<Vec<(S::Key, S::Value)>> {
+        tokio::task::block_in_place(|| self.collect_in_range(range))
     }
 
     #[allow(dead_code)]
@@ -381,12 +408,12 @@ mod tests {
     const FIELD_6: TestCompositeField = TestCompositeField(4, 2, 1);
     const FIELD_7: TestCompositeField = TestCompositeField(4, 3, 0);
 
-    fn open_db(dir: impl AsRef<Path>) -> DB {
+    fn open_db(dir: impl AsRef<Path>) -> Arc<DB> {
         let column_families = vec![DEFAULT_COLUMN_FAMILY_NAME, TestSchema::COLUMN_FAMILY_NAME];
         let mut db_opts = rocksdb::Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
-        DB::open(dir, "test", column_families, &db_opts).expect("Failed to open DB.")
+        Arc::new(DB::open(dir, "test", column_families, &db_opts).expect("Failed to open DB."))
     }
 
     // Test utils
@@ -459,14 +486,14 @@ mod tests {
 
         let delta_reader = DeltaReader::new(db, vec![]);
 
-        let largest = delta_reader.get_largest::<S>().await.unwrap();
+        let largest = delta_reader.get_largest_async::<S>().await.unwrap();
         assert!(largest.is_none());
 
         let key = TestCompositeField::MAX;
-        let prev = delta_reader.get_prev::<S>(&key).await.unwrap();
+        let prev = delta_reader.get_prev_async::<S>(&key).await.unwrap();
         assert!(prev.is_none());
 
-        let value_1 = delta_reader.get::<S>(&FIELD_1).await.unwrap();
+        let value_1 = delta_reader.get_async::<S>(&FIELD_1).await.unwrap();
         assert!(value_1.is_none());
 
         let values: Vec<_> = delta_reader.iter::<S>().unwrap().collect();
@@ -489,14 +516,14 @@ mod tests {
         assert!(values.is_empty());
 
         let paginated_response = delta_reader
-            .get_n_from_first_match::<S>(&TestCompositeField::MAX, 100)
+            .get_n_from_first_match_async::<S>(&TestCompositeField::MAX, 100)
             .await
             .unwrap();
         assert!(paginated_response.key_value.is_empty());
         assert!(paginated_response.next.is_none());
 
         let values: Vec<_> = delta_reader
-            .collect_in_range::<S, TestCompositeField>(
+            .collect_in_range_async::<S, TestCompositeField>(
                 TestCompositeField::MIN..TestCompositeField::MAX,
             )
             .await
@@ -510,38 +537,38 @@ mod tests {
         let delta_reader = build_sample_delta_reader(tmpdir.path());
 
         // From DB
-        let value = delta_reader.get::<S>(&FIELD_4).await.unwrap();
+        let value = delta_reader.get_async::<S>(&FIELD_4).await.unwrap();
         assert_eq!(Some(TestField(4)), value);
 
         // From the most recent snapshot
-        let value = delta_reader.get::<S>(&FIELD_3).await.unwrap();
+        let value = delta_reader.get_async::<S>(&FIELD_3).await.unwrap();
         assert_eq!(Some(TestField(3000)), value);
-        let value = delta_reader.get::<S>(&FIELD_6).await.unwrap();
+        let value = delta_reader.get_async::<S>(&FIELD_6).await.unwrap();
         assert_eq!(Some(TestField(6000)), value);
 
         // From middle snapshot
-        let value = delta_reader.get::<S>(&FIELD_2).await.unwrap();
+        let value = delta_reader.get_async::<S>(&FIELD_2).await.unwrap();
         assert_eq!(Some(TestField(200)), value);
 
         // Deleted values
-        let value = delta_reader.get::<S>(&FIELD_7).await.unwrap();
+        let value = delta_reader.get_async::<S>(&FIELD_7).await.unwrap();
         assert!(value.is_none());
-        let value = delta_reader.get::<S>(&FIELD_5).await.unwrap();
+        let value = delta_reader.get_async::<S>(&FIELD_5).await.unwrap();
         assert!(value.is_none());
 
         // Not found
         let value = delta_reader
-            .get::<S>(&TestCompositeField::MIN)
+            .get_async::<S>(&TestCompositeField::MIN)
             .await
             .unwrap();
         assert!(value.is_none());
         let value = delta_reader
-            .get::<S>(&TestCompositeField::MAX)
+            .get_async::<S>(&TestCompositeField::MAX)
             .await
             .unwrap();
         assert!(value.is_none());
         let value = delta_reader
-            .get::<S>(&TestCompositeField(3, 5, 1))
+            .get_async::<S>(&TestCompositeField(3, 5, 1))
             .await
             .unwrap();
         assert!(value.is_none());
@@ -638,7 +665,7 @@ mod tests {
         let tmpdir = tempfile::tempdir().unwrap();
         let delta_reader = build_sample_delta_reader(tmpdir.path());
 
-        let largest = delta_reader.get_largest::<S>().await.unwrap();
+        let largest = delta_reader.get_largest_async::<S>().await.unwrap();
         assert!(largest.is_some(), "largest value is not found");
         let (largest_key, largest_value) = largest.unwrap();
 
@@ -653,28 +680,32 @@ mod tests {
 
         // MIN, should not find anything
         let prev = delta_reader
-            .get_prev::<S>(&TestCompositeField::MIN)
+            .get_prev_async::<S>(&TestCompositeField::MIN)
             .await
             .unwrap();
         assert!(prev.is_none());
 
         // Should get the lowest value in
-        let prev = delta_reader.get_prev::<S>(&FIELD_1).await.unwrap();
+        let prev = delta_reader.get_prev_async::<S>(&FIELD_1).await.unwrap();
         assert!(prev.is_none());
 
-        let prev = delta_reader.get_prev::<S>(&FIELD_2).await.unwrap();
+        let prev = delta_reader.get_prev_async::<S>(&FIELD_2).await.unwrap();
         let (prev_key, prev_value) = prev.unwrap();
         assert_eq!(FIELD_2, prev_key);
         assert_eq!(TestField(200), prev_value);
 
         // Some value in the middle
-        let (prev_key, prev_value) = delta_reader.get_prev::<S>(&FIELD_3).await.unwrap().unwrap();
+        let (prev_key, prev_value) = delta_reader
+            .get_prev_async::<S>(&FIELD_3)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(FIELD_3, prev_key);
         assert_eq!(TestField(3000), prev_value);
 
         // Value in between
         let (prev_key, prev_value) = delta_reader
-            .get_prev::<S>(&TestCompositeField(3, 5, 8))
+            .get_prev_async::<S>(&TestCompositeField(3, 5, 8))
             .await
             .unwrap()
             .unwrap();
@@ -688,7 +719,7 @@ mod tests {
         let delta_reader = build_sample_delta_reader(tmpdir.path());
 
         let paginated_response = delta_reader
-            .get_n_from_first_match::<S>(&TestCompositeField::MIN, 2)
+            .get_n_from_first_match_async::<S>(&TestCompositeField::MIN, 2)
             .await
             .unwrap();
         assert_eq!(2, paginated_response.key_value.len());
@@ -697,7 +728,7 @@ mod tests {
         assert_eq!(Some(FIELD_4), paginated_response.next);
 
         let paginated_response = delta_reader
-            .get_n_from_first_match::<S>(&FIELD_4, 2)
+            .get_n_from_first_match_async::<S>(&FIELD_4, 2)
             .await
             .unwrap();
         assert_eq!(2, paginated_response.key_value.len());
@@ -728,7 +759,7 @@ mod tests {
 
         for (field_range, expected_range) in test_cases {
             let range_values = delta_reader
-                .collect_in_range::<S, TestCompositeField>(field_range.clone())
+                .collect_in_range_async::<S, TestCompositeField>(field_range.clone())
                 .await
                 .unwrap();
 
@@ -840,9 +871,9 @@ mod tests {
             let rt = Runtime::new().unwrap();
             let _ = rt.block_on(async {
 
-                let largest = delta_reader.get_largest::<S>().await.unwrap();
+                let largest = delta_reader.get_largest_async::<S>().await.unwrap();
                 let prev = delta_reader
-                            .get_prev::<S>(&TestCompositeField::MAX)
+                            .get_prev_async::<S>(&TestCompositeField::MAX)
                             .await;
                 prop_assert!(prev.is_ok());
                 let prev = prev.unwrap();
@@ -857,11 +888,11 @@ mod tests {
                 }
 
                 for (key, expected_value) in all_kv.into_iter() {
-                    let value = delta_reader.get::<S>(&key).await;
+                    let value = delta_reader.get_async::<S>(&key).await;
                     prop_assert!(value.is_ok());
                     let value = value.unwrap();
                     prop_assert_eq!(Some(expected_value), value);
-                    let prev_value = delta_reader.get_prev::<S>(&key).await;
+                    let prev_value = delta_reader.get_prev_async::<S>(&key).await;
                     prop_assert!(prev_value.is_ok());
                     let prev_value = prev_value.unwrap();
                     prop_assert_eq!(Some((key, expected_value)), prev_value);
@@ -893,7 +924,7 @@ mod tests {
                 "iter_rev should be sorted in reversed order"
             );
 
-            // Building a reference for all K/V for validation if basic check is passed.
+            // Building a reference for all K/V for validation if the basic check is passed.
             let mut all_kv: BTreeMap<TestCompositeField, TestField> = BTreeMap::new();
             for (key, value) in db_entries {
                 all_kv.insert(key, value);
@@ -911,7 +942,7 @@ mod tests {
                     let mut next_key = Some(TestCompositeField::MIN);
                     while let Some(actual_next_key) = next_key {
                         let paginated_response = delta_reader
-                            .get_n_from_first_match::<S>(&actual_next_key, n)
+                            .get_n_from_first_match_async::<S>(&actual_next_key, n)
                             .await;
                         prop_assert!(paginated_response.is_ok());
                         let paginated_response = paginated_response.unwrap();
@@ -949,7 +980,7 @@ mod tests {
 
                 for range in def_chopped_ranges {
                      let range_values = delta_reader
-                        .collect_in_range::<S, TestCompositeField>(range)
+                        .collect_in_range_async::<S, TestCompositeField>(range)
                         .await;
                     prop_assert!(range_values.is_ok());
                     let range_values = range_values.unwrap();
@@ -961,7 +992,7 @@ mod tests {
 
                 for range in full_ranges {
                      let range_values = delta_reader
-                        .collect_in_range::<S, TestCompositeField>(range)
+                        .collect_in_range_async::<S, TestCompositeField>(range)
                         .await;
                     prop_assert!(range_values.is_ok());
                     let range_values = range_values.unwrap();
