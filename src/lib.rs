@@ -27,7 +27,6 @@ pub mod test;
 pub use config::{gen_rocksdb_options, RocksdbConfig};
 
 use std::path::Path;
-use std::sync::{Arc, LockResult, RwLock, RwLockReadGuard};
 
 use anyhow::format_err;
 use iterator::ScanDirection;
@@ -103,7 +102,7 @@ impl DB {
         Ok(Self::log_construct(name, inner))
     }
 
-    /// Open db in secondary mode. A secondary db is does not support writes, but can be dynamically caught up
+    /// Open db in secondary mode. A secondary db does not support writes, but can be dynamically caught up
     /// to the primary instance by a manual call. See <https://github.com/facebook/rocksdb/wiki/Read-only-and-Secondary-instances>
     /// for more details.
     pub fn open_cf_as_secondary<P: AsRef<Path>>(
@@ -413,40 +412,13 @@ pub enum CodecError {
     Io(#[from] std::io::Error),
 }
 
-/// For now we always use synchronous writes. This makes sure that once the operation returns
+/// For now, we always use synchronous writes. This makes sure that once the operation returns
 /// `Ok(())` the data is persisted even if the machine crashes. In the future we might consider
 /// selectively turning this off for some non-critical writes to improve performance.
 fn default_write_options() -> rocksdb::WriteOptions {
     let mut opts = rocksdb::WriteOptions::default();
     opts.set_sync(true);
     opts
-}
-
-/// Wrapper around `RwLock` that only allows read access.
-/// This type implies that wrapped type suppose to be used only for reading.
-/// It is useful to indicate that user of this type can only do reading.
-/// This also implies that that inner `Arc<RwLock<T>>` is a clone and some other part can do writing.
-#[derive(Debug, Clone)]
-pub struct ReadOnlyLock<T> {
-    lock: Arc<RwLock<T>>,
-}
-
-impl<T> ReadOnlyLock<T> {
-    /// Create new [`ReadOnlyLock`] from [`Arc<RwLock<T>>`].
-    pub fn new(lock: Arc<RwLock<T>>) -> Self {
-        Self { lock }
-    }
-
-    /// Acquires a read lock on the underlying [`RwLock`].
-    pub fn read(&self) -> LockResult<RwLockReadGuard<'_, T>> {
-        self.lock.read()
-    }
-}
-
-impl<T> From<Arc<RwLock<T>>> for ReadOnlyLock<T> {
-    fn from(value: Arc<RwLock<T>>) -> Self {
-        Self::new(value)
-    }
 }
 
 #[cfg(test)]
