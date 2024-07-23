@@ -2,13 +2,7 @@
 
 use crate::Schema;
 
-pub mod cache_container;
-pub mod cache_db;
-pub mod change_set;
 pub mod delta_reader;
-
-/// Id of ChangeSet/snapshot/cache layer
-pub type SnapshotId = u64;
 
 /// Response for a paginated query which also includes the "next" key to pass.
 #[derive(Debug)]

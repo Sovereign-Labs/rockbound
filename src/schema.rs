@@ -15,7 +15,7 @@ use crate::CodecError;
 pub type ColumnFamilyName = &'static str;
 
 /// A [`Schema`] is a type-safe interface over a specific column family in a
-/// [`DB`](crate::DB). It always a key type ([`KeyCodec`]) and a value type ([`ValueCodec`]).
+/// [`DB`](crate::DB). It is always a key type ([`KeyCodec`]) and a value type ([`ValueCodec`]).
 pub trait Schema: Debug + Send + Sync + 'static + Sized {
     /// The column family name associated with this struct.
     /// Note: all schemas within the same SchemaDB must have distinct column family names.

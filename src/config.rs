@@ -1,5 +1,3 @@
-use rocksdb::Options;
-
 /// Port selected RocksDB options for tuning underlying rocksdb instance of our state db.
 /// The current default values are taken from Aptos. TODO: tune rocksdb for our workload.
 /// see <https://github.com/facebook/rocksdb/blob/master/include/rocksdb/options.h>
@@ -31,8 +29,8 @@ impl Default for RocksdbConfig {
 }
 
 /// Generate [`rocksdb::Options`] corresponding to the given [`RocksdbConfig`].
-pub fn gen_rocksdb_options(config: &RocksdbConfig, readonly: bool) -> Options {
-    let mut db_opts = Options::default();
+pub fn gen_rocksdb_options(config: &RocksdbConfig, readonly: bool) -> rocksdb::Options {
+    let mut db_opts = rocksdb::Options::default();
     db_opts.set_max_open_files(config.max_open_files);
     db_opts.set_max_total_wal_size(config.max_total_wal_size);
     db_opts.set_max_background_jobs(config.max_background_jobs);
