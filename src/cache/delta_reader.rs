@@ -56,6 +56,24 @@ impl DeltaReader {
         tokio::task::block_in_place(|| self.get(key))
     }
 
+    /// Get the value of the smallest key written value for given [`Schema`].
+    pub fn get_smallest<S: Schema>(&self) -> anyhow::Result<Option<(S::Key, S::Value)>> {
+        let mut iterator = self.iter::<S>()?;
+        if let Some((key, value)) = iterator.next() {
+            let key = S::Key::decode_key(&key)?;
+            let value = S::Value::decode_value(&value)?;
+            return Ok(Some((key, value)));
+        }
+        Ok(None)
+    }
+
+    /// Async version of [`DeltaReader::get_smallest`].
+    pub async fn get_smallest_async<S: Schema>(
+        &self,
+    ) -> anyhow::Result<Option<(S::Key, S::Value)>> {
+        tokio::task::block_in_place(|| self.get_smallest::<S>())
+    }
+
     /// Get a value of the largest key written value for given [`Schema`].
     pub fn get_largest<S: Schema>(&self) -> anyhow::Result<Option<(S::Key, S::Value)>> {
         let mut iterator = self.iter_rev::<S>()?;
