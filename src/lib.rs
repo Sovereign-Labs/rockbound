@@ -26,7 +26,7 @@ pub mod test;
 
 pub use config::{gen_rocksdb_options, RocksdbConfig};
 
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use anyhow::format_err;
 use iterator::ScanDirection;
@@ -76,8 +76,44 @@ impl DB {
         Ok(db)
     }
 
+    /// Opens a database backed by RocksDB, using the provided column family names and default
+    /// column family options.
+    pub fn open_with_ttl(
+        path: impl AsRef<Path>,
+        name: &'static str,
+        column_families: impl IntoIterator<Item = impl Into<String>>,
+        db_opts: &rocksdb::Options,
+        ttl: Duration,
+    ) -> anyhow::Result<Self> {
+        let db = DB::open_with_cfds_and_ttl(
+            db_opts,
+            path,
+            name,
+            column_families.into_iter().map(|cf_name| {
+                let mut cf_opts = rocksdb::Options::default();
+                cf_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+                rocksdb::ColumnFamilyDescriptor::new(cf_name, cf_opts)
+            }),
+            ttl,
+        )?;
+        Ok(db)
+    }
+
+    /// Open RocksDB with the provided column family descriptors and ttl.
+    /// This allows the caller to configure options for each column family.
+    pub fn open_with_cfds_and_ttl(
+        db_opts: &rocksdb::Options,
+        path: impl AsRef<Path>,
+        name: &'static str,
+        cfds: impl IntoIterator<Item = rocksdb::ColumnFamilyDescriptor>,
+        ttl: Duration,
+    ) -> anyhow::Result<DB> {
+        let inner = rocksdb::DB::open_cf_descriptors_with_ttl(db_opts, path, cfds, ttl)?;
+        Ok(Self::log_construct(name, inner))
+    }
+
     /// Open RocksDB with the provided column family descriptors.
-    /// This allows to configure options for each column family.
+    /// This allows the caller to configure options for each column family.
     pub fn open_with_cfds(
         db_opts: &rocksdb::Options,
         path: impl AsRef<Path>,
