@@ -33,7 +33,7 @@ use iterator::ScanDirection;
 pub use iterator::{SchemaIterator, SeekKeyEncoder};
 use metrics::{
     SCHEMADB_BATCH_COMMIT_BYTES, SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS, SCHEMADB_DELETES,
-    SCHEMADB_GET_BYTES, SCHEMADB_GET_LATENCY_SECONDS, SCHEMADB_PUT_BYTES,
+    SCHEMADB_DELETE_RANGE, SCHEMADB_GET_BYTES, SCHEMADB_GET_LATENCY_SECONDS, SCHEMADB_PUT_BYTES,
 };
 pub use rocksdb;
 use rocksdb::ReadOptions;
@@ -335,7 +335,9 @@ impl DB {
                     Operation::Delete => {
                         SCHEMADB_DELETES.with_label_values(&[cf_name]).inc();
                     }
-                    Operation::DeleteRange { .. } => (),
+                    Operation::DeleteRange { .. } => {
+                        SCHEMADB_DELETE_RANGE.with_label_values(&[cf_name]).inc()
+                    }
                 }
             }
         }
