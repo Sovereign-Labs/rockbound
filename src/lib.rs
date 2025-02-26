@@ -29,11 +29,10 @@ pub use config::{gen_rocksdb_options, RocksdbConfig};
 use std::{path::Path, time::Duration};
 
 use anyhow::format_err;
-use iterator::ScanDirection;
-pub use iterator::{SchemaIterator, SeekKeyEncoder};
+pub use iterator::{ScanDirection, SchemaIterator, SeekKeyEncoder};
 use metrics::{
     SCHEMADB_BATCH_COMMIT_BYTES, SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS, SCHEMADB_DELETES,
-    SCHEMADB_GET_BYTES, SCHEMADB_GET_LATENCY_SECONDS, SCHEMADB_PUT_BYTES,
+    SCHEMADB_DELETE_RANGE, SCHEMADB_GET_BYTES, SCHEMADB_GET_LATENCY_SECONDS, SCHEMADB_PUT_BYTES,
 };
 pub use rocksdb;
 use rocksdb::ReadOptions;
@@ -281,7 +280,7 @@ impl DB {
     }
 
     /// Get a [`RawDbIter`] in given range and direction.
-    pub(crate) fn raw_iter_range<S: Schema>(
+    pub fn raw_iter_range<S: Schema>(
         &self,
         range: impl std::ops::RangeBounds<SchemaKey>,
         direction: ScanDirection,
@@ -313,6 +312,9 @@ impl DB {
                 match operation {
                     Operation::Put { value } => db_batch.put_cf(cf_handle, key, value),
                     Operation::Delete => db_batch.delete_cf(cf_handle, key),
+                    Operation::DeleteRange { from, to } => {
+                        db_batch.delete_range_cf(cf_handle, from, to)
+                    }
                 }
             }
         }
@@ -331,6 +333,9 @@ impl DB {
                     }
                     Operation::Delete => {
                         SCHEMADB_DELETES.with_label_values(&[cf_name]).inc();
+                    }
+                    Operation::DeleteRange { .. } => {
+                        SCHEMADB_DELETE_RANGE.with_label_values(&[cf_name]).inc()
                     }
                 }
             }
@@ -404,6 +409,13 @@ pub enum Operation {
     },
     /// Deleting a value
     Delete,
+    /// Deleting a range of values
+    DeleteRange {
+        /// Start of the range to delete
+        from: SchemaKey,
+        /// End of the range to delete
+        to: SchemaKey,
+    },
 }
 
 impl Operation {
@@ -414,7 +426,7 @@ impl Operation {
                 let value = S::Value::decode_value(value)?;
                 Ok(Some(value))
             }
-            Operation::Delete => Ok(None),
+            Operation::Delete | Operation::DeleteRange { .. } => Ok(None),
         }
     }
 }

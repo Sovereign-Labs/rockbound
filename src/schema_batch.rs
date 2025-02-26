@@ -163,7 +163,7 @@ mod tests {
                         .unwrap()
                         .0,
                     ),
-                    Operation::Delete => None,
+                    Operation::Delete | Operation::DeleteRange { .. } => None,
                 };
                 (key, value)
             })

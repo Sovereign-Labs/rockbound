@@ -98,6 +98,15 @@ pub static SCHEMADB_DELETES: Lazy<IntCounterVec> = Lazy::new(|| {
     register_int_counter_vec!("storage_deletes", "Storage delete calls", &["cf_name"]).unwrap()
 });
 
+pub static SCHEMADB_DELETE_RANGE: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "storage_delete_range",
+        "Storage delete range calls",
+        &["cf_name"]
+    )
+    .unwrap()
+});
+
 pub static SCHEMADB_BATCH_PUT_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
     register_histogram_vec!(
         // metric name

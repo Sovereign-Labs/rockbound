@@ -32,8 +32,10 @@ pub trait SeekKeyEncoder<S: Schema + ?Sized>: Sized {
 
 /// Indicates in which direction iterator should be scanned.
 #[derive(Debug, Copy, Clone, PartialEq)]
-pub(crate) enum ScanDirection {
+pub enum ScanDirection {
+    /// todo
     Forward,
+    /// todo
     Backward,
 }
 
@@ -170,7 +172,7 @@ where
 impl<'a, S> FusedIterator for SchemaIterator<'a, S> where S: Schema {}
 
 /// Iterates over given column in [`rocksdb::DB`].
-pub(crate) struct RawDbIter<'a> {
+pub struct RawDbIter<'a> {
     db_iter: rocksdb::DBRawIterator<'a>,
     direction: ScanDirection,
     upper_bound: std::ops::Bound<SchemaKey>,
