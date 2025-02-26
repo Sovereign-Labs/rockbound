@@ -313,6 +313,9 @@ impl DB {
                 match operation {
                     Operation::Put { value } => db_batch.put_cf(cf_handle, key, value),
                     Operation::Delete => db_batch.delete_cf(cf_handle, key),
+                    Operation::DeleteRange { from, to } => {
+                        db_batch.delete_range_cf(cf_handle, from, to)
+                    }
                 }
             }
         }
@@ -332,6 +335,7 @@ impl DB {
                     Operation::Delete => {
                         SCHEMADB_DELETES.with_label_values(&[cf_name]).inc();
                     }
+                    Operation::DeleteRange { .. } => (),
                 }
             }
         }
@@ -404,6 +408,13 @@ pub enum Operation {
     },
     /// Deleting a value
     Delete,
+    /// Deleting a range of values
+    DeleteRange {
+        /// Start of the range to delete
+        from: SchemaKey,
+        /// End of the range to delete
+        to: SchemaKey,
+    },
 }
 
 impl Operation {
@@ -414,7 +425,7 @@ impl Operation {
                 let value = S::Value::decode_value(value)?;
                 Ok(Some(value))
             }
-            Operation::Delete => Ok(None),
+            Operation::Delete | Operation::DeleteRange { .. } => Ok(None),
         }
     }
 }
