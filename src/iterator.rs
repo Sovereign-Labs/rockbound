@@ -170,11 +170,7 @@ where
 impl<'a, S> FusedIterator for SchemaIterator<'a, S> where S: Schema {}
 
 /// Iterates over given column in [`rocksdb::DB`] using raw types.
-/// Prefer to use [`SchemaIterator`] except for when you need to do more complex iteration.
-///
-/// An example of when you might need to use a raw iterator is if you have a key like `(u64, u128)`
-/// and you only want to do a prefix iteration over the `u64` part of the key.
-pub struct RawDbIter<'a> {
+pub(crate) struct RawDbIter<'a> {
     db_iter: rocksdb::DBRawIterator<'a>,
     direction: ScanDirection,
     upper_bound: std::ops::Bound<SchemaKey>,
