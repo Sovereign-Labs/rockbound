@@ -272,10 +272,10 @@ impl DB {
     }
 
     /// Returns a range based [`SchemaIterator`] for the schema with the default read options.
-    pub fn iter_range<S: Schema, K: SeekKeyEncoder<S>>(
+    pub fn iter_range<S: Schema>(
         &self,
-        from: &K,
-        to: &K,
+        from: &impl SeekKeyEncoder<S>,
+        to: &impl SeekKeyEncoder<S>,
     ) -> anyhow::Result<SchemaIterator<S>> {
         let mut opts = ReadOptions::default();
         opts.set_iterate_lower_bound(from.encode_seek_key()?);
