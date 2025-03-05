@@ -2,7 +2,7 @@ use std::collections::{btree_map, BTreeMap, HashMap};
 
 use crate::metrics::SCHEMADB_BATCH_PUT_LATENCY_SECONDS;
 use crate::schema::{ColumnFamilyName, KeyCodec, ValueCodec};
-use crate::{Operation, Schema, SchemaKey, SchemaValue};
+use crate::{Operation, Schema, SchemaKey};
 
 // [`SchemaBatch`] holds a collection of updates that can be applied to a DB
 /// ([`Schema`]) atomically. The updates will be applied in the order in which
@@ -133,7 +133,7 @@ impl proptest::arbitrary::Arbitrary for SchemaBatch {
             proptest::collection::btree_map(
                 any::<SchemaKey>(),
                 prop_oneof![
-                    any::<SchemaValue>().prop_map(|v| Operation::Put { value: v }),
+                    any::<crate::SchemaValue>().prop_map(|v| Operation::Put { value: v }),
                     Just(Operation::Delete)
                 ],
                 0..10,

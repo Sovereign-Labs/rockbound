@@ -32,10 +32,8 @@ pub trait SeekKeyEncoder<S: Schema + ?Sized>: Sized {
 
 /// Indicates in which direction iterator should be scanned.
 #[derive(Debug, Copy, Clone, PartialEq)]
-pub enum ScanDirection {
-    /// Scan forward during iteration.
+pub(crate) enum ScanDirection {
     Forward,
-    /// Scan backwards during iteration.
     Backward,
 }
 

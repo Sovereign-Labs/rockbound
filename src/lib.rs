@@ -280,7 +280,7 @@ impl DB {
     }
 
     /// Get a [`RawDbIter`] in given range and direction.
-    pub fn raw_iter_range<S: Schema>(
+    pub(crate) fn raw_iter_range<S: Schema>(
         &self,
         range: impl std::ops::RangeBounds<SchemaKey>,
         direction: ScanDirection,
