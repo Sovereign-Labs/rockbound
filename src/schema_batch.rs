@@ -10,7 +10,7 @@ use crate::{Operation, Schema, SchemaKey};
 #[derive(Debug, Default, Clone)]
 pub struct SchemaBatch {
     pub(crate) last_writes: HashMap<ColumnFamilyName, BTreeMap<SchemaKey, Operation>>,
-    range_ops: HashMap<ColumnFamilyName, Vec<Operation>>,
+    pub(crate) range_ops: HashMap<ColumnFamilyName, Vec<Operation>>,
 }
 
 impl SchemaBatch {

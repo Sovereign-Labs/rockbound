@@ -29,6 +29,7 @@ pub use config::{gen_rocksdb_options, RocksdbConfig};
 use std::{path::Path, time::Duration};
 
 use anyhow::format_err;
+use iterator::ScanDirection;
 pub use iterator::{SchemaIterator, SeekKeyEncoder};
 use metrics::{
     SCHEMADB_BATCH_COMMIT_BYTES, SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS, SCHEMADB_DELETES,
@@ -38,7 +39,7 @@ pub use rocksdb;
 use rocksdb::ReadOptions;
 pub use rocksdb::DEFAULT_COLUMN_FAMILY_NAME;
 use thiserror::Error;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::iterator::RawDbIter;
 pub use crate::schema::Schema;
@@ -312,9 +313,23 @@ impl DB {
                 match operation {
                     Operation::Put { value } => db_batch.put_cf(cf_handle, key, value),
                     Operation::Delete => db_batch.delete_cf(cf_handle, key),
+                    Operation::DeleteRange { .. } => {
+                        warn!("Unexpected range operation found: {:?}", operation)
+                    }
+                }
+            }
+        }
+        for (cf_name, operations) in batch.range_ops.iter() {
+            let cf_handle = self.get_cf_handle(cf_name)?;
+            for operation in operations {
+                match operation {
                     Operation::DeleteRange { from, to } => {
                         db_batch.delete_range_cf(cf_handle, from, to)
                     }
+                    _ => warn!(
+                        "Unexpected non range based operation found: {:?}",
+                        operation
+                    ),
                 }
             }
         }
@@ -334,9 +349,14 @@ impl DB {
                     Operation::Delete => {
                         SCHEMADB_DELETES.with_label_values(&[cf_name]).inc();
                     }
-                    Operation::DeleteRange { .. } => {
-                        SCHEMADB_DELETE_RANGE.with_label_values(&[cf_name]).inc()
-                    }
+                    Operation::DeleteRange { .. } => (),
+                }
+            }
+        }
+        for (cf_name, operations) in batch.range_ops.iter() {
+            for operation in operations {
+                if let Operation::DeleteRange { .. } = operation {
+                    SCHEMADB_DELETE_RANGE.with_label_values(&[cf_name]).inc();
                 }
             }
         }
