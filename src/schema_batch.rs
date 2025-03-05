@@ -2,7 +2,7 @@ use std::collections::{btree_map, BTreeMap, HashMap};
 
 use crate::metrics::SCHEMADB_BATCH_PUT_LATENCY_SECONDS;
 use crate::schema::{ColumnFamilyName, KeyCodec, ValueCodec};
-use crate::{Operation, Schema, SchemaKey};
+use crate::{Operation, Schema, SchemaKey, SeekKeyEncoder};
 
 // [`SchemaBatch`] holds a collection of updates that can be applied to a DB
 /// ([`Schema`]) atomically. The updates will be applied in the order in which
@@ -52,13 +52,13 @@ impl SchemaBatch {
     /// which is consistent with rocksdb `WriteBatch`.
     pub fn delete_range<S: Schema>(
         &mut self,
-        from: &impl KeyCodec<S>,
-        to: &impl KeyCodec<S>,
+        from: &impl SeekKeyEncoder<S>,
+        to: &impl SeekKeyEncoder<S>,
     ) -> anyhow::Result<()> {
         let ops = self.range_ops.entry(S::COLUMN_FAMILY_NAME).or_default();
         ops.push(Operation::DeleteRange {
-            from: from.encode_key()?,
-            to: to.encode_key()?,
+            from: from.encode_seek_key()?,
+            to: to.encode_seek_key()?,
         });
         Ok(())
     }
