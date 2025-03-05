@@ -271,6 +271,18 @@ impl DB {
         self.iter_with_direction::<S>(Default::default(), ScanDirection::Forward)
     }
 
+    /// Returns a range based [`SchemaIterator`] for the schema with the default read options.
+    pub fn iter_range<S: Schema, K: SeekKeyEncoder<S>>(
+        &self,
+        from: &K,
+        to: &K,
+    ) -> anyhow::Result<SchemaIterator<S>> {
+        let mut opts = ReadOptions::default();
+        opts.set_iterate_lower_bound(from.encode_seek_key()?);
+        opts.set_iterate_upper_bound(to.encode_seek_key()?);
+        self.iter_with_direction::<S>(opts, ScanDirection::Forward)
+    }
+
     ///  Returns a [`RawDbIter`] which allows to iterate over raw values in specified [`ScanDirection`].
     pub(crate) fn raw_iter<S: Schema>(
         &self,
