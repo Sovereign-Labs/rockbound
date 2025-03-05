@@ -29,7 +29,7 @@ pub use config::{gen_rocksdb_options, RocksdbConfig};
 use std::{path::Path, time::Duration};
 
 use anyhow::format_err;
-pub use iterator::{ScanDirection, SchemaIterator, SeekKeyEncoder};
+pub use iterator::{SchemaIterator, SeekKeyEncoder};
 use metrics::{
     SCHEMADB_BATCH_COMMIT_BYTES, SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS, SCHEMADB_DELETES,
     SCHEMADB_DELETE_RANGE, SCHEMADB_GET_BYTES, SCHEMADB_GET_LATENCY_SECONDS, SCHEMADB_PUT_BYTES,
