@@ -386,7 +386,7 @@ where
                             Operation::Put { value } => {
                                 return Some((key.to_vec(), value.to_vec()))
                             }
-                            Operation::Delete => continue,
+                            Operation::Delete | Operation::DeleteRange { .. } => continue,
                         }
                     }
                 }

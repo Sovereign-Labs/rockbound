@@ -33,13 +33,13 @@ use iterator::ScanDirection;
 pub use iterator::{SchemaIterator, SeekKeyEncoder};
 use metrics::{
     SCHEMADB_BATCH_COMMIT_BYTES, SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS, SCHEMADB_DELETES,
-    SCHEMADB_GET_BYTES, SCHEMADB_GET_LATENCY_SECONDS, SCHEMADB_PUT_BYTES,
+    SCHEMADB_DELETE_RANGE, SCHEMADB_GET_BYTES, SCHEMADB_GET_LATENCY_SECONDS, SCHEMADB_PUT_BYTES,
 };
 pub use rocksdb;
 use rocksdb::ReadOptions;
 pub use rocksdb::DEFAULT_COLUMN_FAMILY_NAME;
 use thiserror::Error;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::iterator::RawDbIter;
 pub use crate::schema::Schema;
@@ -271,6 +271,18 @@ impl DB {
         self.iter_with_direction::<S>(Default::default(), ScanDirection::Forward)
     }
 
+    /// Returns a range based [`SchemaIterator`] for the schema with the default read options.
+    pub fn iter_range<S: Schema>(
+        &self,
+        from: &impl SeekKeyEncoder<S>,
+        to: &impl SeekKeyEncoder<S>,
+    ) -> anyhow::Result<SchemaIterator<S>> {
+        let mut opts = ReadOptions::default();
+        opts.set_iterate_lower_bound(from.encode_seek_key()?);
+        opts.set_iterate_upper_bound(to.encode_seek_key()?);
+        self.iter_with_direction::<S>(opts, ScanDirection::Forward)
+    }
+
     ///  Returns a [`RawDbIter`] which allows to iterate over raw values in specified [`ScanDirection`].
     pub(crate) fn raw_iter<S: Schema>(
         &self,
@@ -313,6 +325,23 @@ impl DB {
                 match operation {
                     Operation::Put { value } => db_batch.put_cf(cf_handle, key, value),
                     Operation::Delete => db_batch.delete_cf(cf_handle, key),
+                    Operation::DeleteRange { .. } => {
+                        warn!("Unexpected range operation found: {:?}", operation)
+                    }
+                }
+            }
+        }
+        for (cf_name, operations) in batch.range_ops.iter() {
+            let cf_handle = self.get_cf_handle(cf_name)?;
+            for operation in operations {
+                match operation {
+                    Operation::DeleteRange { from, to } => {
+                        db_batch.delete_range_cf(cf_handle, from, to)
+                    }
+                    _ => warn!(
+                        "Unexpected non range based operation found: {:?}",
+                        operation
+                    ),
                 }
             }
         }
@@ -332,6 +361,14 @@ impl DB {
                     Operation::Delete => {
                         SCHEMADB_DELETES.with_label_values(&[cf_name]).inc();
                     }
+                    Operation::DeleteRange { .. } => (),
+                }
+            }
+        }
+        for (cf_name, operations) in batch.range_ops.iter() {
+            for operation in operations {
+                if let Operation::DeleteRange { .. } = operation {
+                    SCHEMADB_DELETE_RANGE.with_label_values(&[cf_name]).inc();
                 }
             }
         }
@@ -404,6 +441,13 @@ pub enum Operation {
     },
     /// Deleting a value
     Delete,
+    /// Deleting a range of values
+    DeleteRange {
+        /// Start of the range to delete
+        from: SchemaKey,
+        /// End of the range to delete
+        to: SchemaKey,
+    },
 }
 
 impl Operation {
@@ -414,7 +458,7 @@ impl Operation {
                 let value = S::Value::decode_value(value)?;
                 Ok(Some(value))
             }
-            Operation::Delete => Ok(None),
+            Operation::Delete | Operation::DeleteRange { .. } => Ok(None),
         }
     }
 }

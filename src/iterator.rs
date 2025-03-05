@@ -169,7 +169,7 @@ where
 
 impl<'a, S> FusedIterator for SchemaIterator<'a, S> where S: Schema {}
 
-/// Iterates over given column in [`rocksdb::DB`].
+/// Iterates over given column in [`rocksdb::DB`] using raw types.
 pub(crate) struct RawDbIter<'a> {
     db_iter: rocksdb::DBRawIterator<'a>,
     direction: ScanDirection,

@@ -263,7 +263,7 @@ fn test_schema_batch_iteration_order() {
                 decode_key(key),
                 <TestField as ValueCodec<S>>::decode_value(value).unwrap(),
             )),
-            Operation::Delete => None,
+            Operation::Delete | Operation::DeleteRange { .. } => None,
         })
         .collect();
     assert_eq!(operations, collected);
