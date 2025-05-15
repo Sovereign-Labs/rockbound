@@ -2,7 +2,7 @@
 name = "rockbound"
 version = "1.0.0"
 edition = "2021"
-authors = ["Sovereign Labs"]
+authors = ["Sovereign Labs <info@sovereign.xyz>"]
 homepage = "https://github.com/sovereign-labs/rockbound"
 repository = "https://github.com/sovereign-labs/rockbound"
 description = "A low level interface transforming RocksDB into a type-oriented data store"
@@ -21,7 +21,7 @@ prometheus = { version = "0.13", default-features = false }
 proptest = { version = "1", default-features = false, features = ["std"], optional = true }
 proptest-derive = { version = "0.5", default-features = false, optional = true }
 rocksdb = { version = "0.22", features = ["lz4"], default-features = false }
-thiserror = "1"
+thiserror = "2"
 tracing = { version = "0.1", default-features = false }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros"] }
 
