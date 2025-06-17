@@ -399,6 +399,13 @@ impl DB {
         Ok(self.inner.flush_cf(self.get_cf_handle(cf_name)?)?)
     }
 
+    /// Trigger compaction. Primarily used for testing.
+    pub fn trigger_compaction<S: Schema>(&self) -> anyhow::Result<()> {
+        let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
+        self.inner.compact_range_cf::<&[u8], &[u8]>(&cf_handle, None, None);
+        Ok(())
+    }
+
     /// Returns the current RocksDB property value for the provided column family name
     /// and property name.
     pub fn get_property(&self, cf_name: &str, property_name: &str) -> anyhow::Result<u64> {
