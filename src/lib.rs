@@ -402,7 +402,8 @@ impl DB {
     /// Trigger compaction. Primarily used for testing.
     pub fn trigger_compaction<S: Schema>(&self) -> anyhow::Result<()> {
         let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
-        self.inner.compact_range_cf::<&[u8], &[u8]>(&cf_handle, None, None);
+        self.inner
+            .compact_range_cf::<&[u8], &[u8]>(&cf_handle, None, None);
         Ok(())
     }
 
