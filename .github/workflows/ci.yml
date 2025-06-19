@@ -31,10 +31,12 @@ jobs:
 
   check:
     name: check
-    runs-on: buildjet-4vcpu-ubuntu-2204
+    runs-on: buildjet-8vcpu-ubuntu-2404
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v3
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
       - name: Install Rust
         run: rustup show
       - uses: Swatinem/rust-cache@v2
@@ -46,10 +48,12 @@ jobs:
   # Check that every combination of features is working properly.
   features:
     name: features
-    runs-on: buildjet-8vcpu-ubuntu-2204
+    runs-on: buildjet-8vcpu-ubuntu-2404
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v3
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
       - name: Install Rust
         run: rustup show
       - name: cargo install cargo-hack
@@ -63,6 +67,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v3
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
       - uses: taiki-e/install-action@nextest
       - name: Install Rust
         run: rustup show
