@@ -22,7 +22,7 @@ proptest = { version = "1", default-features = false, features = ["std"], option
 proptest-derive = { version = "0.5", default-features = false, optional = true }
 rocksdb = { version = "0.22", features = ["lz4"], default-features = false }
 thiserror = "2"
-tracing = { version = "0.1", default-features = false }
+tracing = { version = "0.1", default-features = false, features = ["attributes"] }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros"] }
 
 [dev-dependencies]
