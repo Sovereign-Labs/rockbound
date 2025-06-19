@@ -472,7 +472,10 @@ mod tests {
                         .raw_iter_range::<S>(upper_bound.clone()..lower_bound.clone(), direction)
                         .err()
                         .unwrap();
-                    assert_eq!("[Rockbound]: error in raw_iter_range: lower_bound > upper_bound", err.to_string());
+                    assert_eq!(
+                        "[Rockbound]: error in raw_iter_range: lower_bound > upper_bound",
+                        err.to_string()
+                    );
 
                     // Empty
                     let iter = db
