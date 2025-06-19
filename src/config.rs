@@ -37,7 +37,19 @@ pub fn gen_rocksdb_options(config: &RocksdbConfig, readonly: bool) -> rocksdb::O
     if !readonly {
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
-        db_opts.set_atomic_flush(true);
+        // Do not enable db_opts.set_atomic_flush(true)! We use the WAL, so it provides no benefit and can prevent
+        // tables from ever flushing. According to o3 (weakly supported by this source: https://github.com/facebook/rocksdb/issues/13487#issuecomment-2757182047),
+        // the mechanism for the issue is that RocksDB will never *automatically* flush a MemTable until it is full. Since some of our DB columns
+        // are written very rarely and this option requires that we flush all tables at once, these slow tables prevent *any* columns from being flushed automatically.
+        // This causes the memtables of the busy columns to grow until they consume all available memory, leading to a crash.
+        //
+        // "Note that this is only useful when the WAL is disabled. When using the WAL, writes are always consistent across column families.""
+        // <https://docs.rs/rocksdb/latest/rocksdb/struct.Options.html#method.set_atomic_flush>
+        //
+        // See [`crate::default_write_options()`]. We do not explicitly set `disable_wal` and it defaults to false:
+        // Quoting from <https://docs.rs/rocksdb/latest/rocksdb/struct.WriteOptions.html#method.disable_wal>
+        // Sets whether WAL should be active or not. If true, writes will not first go to the write ahead log, and the write may got lost after a crash.
+        // Default: false
     }
 
     db_opts
