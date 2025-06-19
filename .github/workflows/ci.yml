@@ -31,7 +31,7 @@ jobs:
 
   check:
     name: check
-    runs-on: buildjet-4vcpu-ubuntu-2404
+    runs-on: buildjet-4vcpu-ubuntu-2204
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v3
@@ -48,7 +48,7 @@ jobs:
   # Check that every combination of features is working properly.
   features:
     name: features
-    runs-on: buildjet-8vcpu-ubuntu-2404
+    runs-on: buildjet-8vcpu-ubuntu-2204
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v3
