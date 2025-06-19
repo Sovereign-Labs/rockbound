@@ -57,6 +57,7 @@ pub struct DB {
 impl DB {
     /// Opens a database backed by RocksDB, using the provided column family names and default
     /// column family options.
+    #[tracing::instrument(skip_all, level = "error")]
     pub fn open(
         path: impl AsRef<Path>,
         name: &'static str,
@@ -78,6 +79,7 @@ impl DB {
 
     /// Opens a database backed by RocksDB, using the provided column family names and default
     /// column family options.
+    #[tracing::instrument(skip_all, level = "error")]
     pub fn open_with_ttl(
         path: impl AsRef<Path>,
         name: &'static str,
@@ -101,6 +103,7 @@ impl DB {
 
     /// Open RocksDB with the provided column family descriptors and ttl.
     /// This allows the caller to configure options for each column family.
+    #[tracing::instrument(skip_all, level = "error")]
     pub fn open_with_cfds_and_ttl(
         db_opts: &rocksdb::Options,
         path: impl AsRef<Path>,
@@ -114,18 +117,23 @@ impl DB {
 
     /// Open RocksDB with the provided column family descriptors.
     /// This allows the caller to configure options for each column family.
+    #[tracing::instrument(skip_all, level = "error")]
     pub fn open_with_cfds(
         db_opts: &rocksdb::Options,
         path: impl AsRef<Path>,
         name: &'static str,
         cfds: impl IntoIterator<Item = rocksdb::ColumnFamilyDescriptor>,
     ) -> anyhow::Result<DB> {
-        let inner = rocksdb::DB::open_cf_descriptors(db_opts, path, cfds)?;
+        let inner = with_error_logging(
+            || rocksdb::DB::open_cf_descriptors(db_opts, path, cfds),
+            "open_with_cfds",
+        )?;
         Ok(Self::log_construct(name, inner))
     }
 
     /// Open db in readonly mode. This db is completely static, so any writes that occur on the primary
     /// after it has been opened will not be visible to the readonly instance.
+    #[tracing::instrument(skip_all, level = "error")]
     pub fn open_cf_readonly(
         opts: &rocksdb::Options,
         path: impl AsRef<Path>,
@@ -133,7 +141,10 @@ impl DB {
         cfs: Vec<ColumnFamilyName>,
     ) -> anyhow::Result<DB> {
         let error_if_log_file_exists = false;
-        let inner = rocksdb::DB::open_cf_for_read_only(opts, path, cfs, error_if_log_file_exists)?;
+        let inner = with_error_logging(
+            || rocksdb::DB::open_cf_for_read_only(opts, path, cfs, error_if_log_file_exists),
+            "open_cf_readonly",
+        )?;
 
         Ok(Self::log_construct(name, inner))
     }
@@ -141,6 +152,7 @@ impl DB {
     /// Open db in secondary mode. A secondary db does not support writes, but can be dynamically caught up
     /// to the primary instance by a manual call. See <https://github.com/facebook/rocksdb/wiki/Read-only-and-Secondary-instances>
     /// for more details.
+    #[tracing::instrument(skip_all, level = "error")]
     pub fn open_cf_as_secondary<P: AsRef<Path>>(
         opts: &rocksdb::Options,
         primary_path: P,
@@ -148,7 +160,10 @@ impl DB {
         name: &'static str,
         cfs: Vec<ColumnFamilyName>,
     ) -> anyhow::Result<DB> {
-        let inner = rocksdb::DB::open_cf_as_secondary(opts, primary_path, secondary_path, cfs)?;
+        let inner = with_error_logging(
+            || rocksdb::DB::open_cf_as_secondary(opts, primary_path, secondary_path, cfs),
+            "open_cf_as_secondary",
+        )?;
         Ok(Self::log_construct(name, inner))
     }
 
@@ -158,28 +173,35 @@ impl DB {
     }
 
     /// Reads single record by key.
+    #[tracing::instrument(skip_all, level = "error")]
     pub fn get<S: Schema>(
         &self,
         schema_key: &impl KeyCodec<S>,
     ) -> anyhow::Result<Option<S::Value>> {
-        let _timer = SCHEMADB_GET_LATENCY_SECONDS
-            .with_label_values(&[S::COLUMN_FAMILY_NAME])
-            .start_timer();
+        with_error_logging::<_, _, anyhow::Error>(
+            || {
+                let _timer = SCHEMADB_GET_LATENCY_SECONDS
+                    .with_label_values(&[S::COLUMN_FAMILY_NAME])
+                    .start_timer();
 
-        let k = schema_key.encode_key()?;
-        let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
+                let k = schema_key.encode_key()?;
+                let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
 
-        let result = self.inner.get_pinned_cf(cf_handle, k)?;
-        SCHEMADB_GET_BYTES
-            .with_label_values(&[S::COLUMN_FAMILY_NAME])
-            .observe(result.as_ref().map_or(0.0, |v| v.len() as f64));
+                let result = self.inner.get_pinned_cf(cf_handle, k)?;
+                SCHEMADB_GET_BYTES
+                    .with_label_values(&[S::COLUMN_FAMILY_NAME])
+                    .observe(result.as_ref().map_or(0.0, |v| v.len() as f64));
 
-        result
-            .map(|raw_value| <S::Value as ValueCodec<S>>::decode_value(&raw_value))
-            .transpose()
-            .map_err(|err| err.into())
+                result
+                    .map(|raw_value| <S::Value as ValueCodec<S>>::decode_value(&raw_value))
+                    .transpose()
+                    .map_err(|err| err.into())
+            },
+            "get",
+        )
     }
 
+    #[tracing::instrument(skip_all, level = "error")]
     /// Reads a single record by key asynchronously.
     pub async fn get_async<S: Schema>(
         &self,
@@ -189,6 +211,7 @@ impl DB {
     }
 
     /// Writes single record.
+    #[tracing::instrument(skip_all, level = "error")]
     pub fn put<S: Schema>(
         &self,
         key: &impl KeyCodec<S>,
@@ -196,12 +219,18 @@ impl DB {
     ) -> anyhow::Result<()> {
         // Not necessary to use a batch, but we'd like a central place to bump counters.
         // Used in tests only anyway.
-        let mut batch = SchemaBatch::new();
-        batch.put::<S>(key, value)?;
-        self.write_schemas(&batch)
+        with_error_logging(
+            || {
+                let mut batch = SchemaBatch::new();
+                batch.put::<S>(key, value)?;
+                self.write_schemas_inner(&batch)
+            },
+            "put",
+        )
     }
 
     /// Writes a single record asynchronously.
+    #[tracing::instrument(skip_all, level = "error")]
     pub async fn put_async<S: Schema>(
         &self,
         key: &impl KeyCodec<S>,
@@ -211,15 +240,22 @@ impl DB {
     }
 
     /// Delete a single key from the database.
+    #[tracing::instrument(skip_all, level = "error")]
     pub fn delete<S: Schema>(&self, key: &impl KeyCodec<S>) -> anyhow::Result<()> {
         // Not necessary to use a batch, but we'd like a central place to bump counters.
         // Used in tests only anyway.
-        let mut batch = SchemaBatch::new();
-        batch.delete::<S>(key)?;
-        self.write_schemas(&batch)
+        with_error_logging(
+            || {
+                let mut batch = SchemaBatch::new();
+                batch.delete::<S>(key)?;
+                self.write_schemas_inner(&batch)
+            },
+            "delete",
+        )
     }
 
     /// Delete a single key from the database asynchronously.
+    #[tracing::instrument(skip_all, level = "error")]
     pub async fn delete_async<S: Schema>(&self, key: &impl KeyCodec<S>) -> anyhow::Result<()> {
         tokio::task::block_in_place(|| self.delete(key))
     }
@@ -229,16 +265,22 @@ impl DB {
     /// Note that this operation will be done lexicographic on the *encoding* of the seek keys. It is
     /// up to the table creator to ensure that the lexicographic ordering of the encoded seek keys matches the
     /// logical ordering of the type.
+    #[tracing::instrument(skip_all, level = "error")]
     pub fn delete_range<S: Schema>(
         &self,
         from: &impl SeekKeyEncoder<S>,
         to: &impl SeekKeyEncoder<S>,
     ) -> anyhow::Result<()> {
         let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
-        let from = from.encode_seek_key()?;
-        let to = to.encode_seek_key()?;
-        self.inner.delete_range_cf(cf_handle, from, to)?;
-        Ok(())
+        with_error_logging::<_, _, anyhow::Error>(
+            || {
+                let from = from.encode_seek_key()?;
+                let to = to.encode_seek_key()?;
+                self.inner.delete_range_cf(cf_handle, from, to)?;
+                Ok(())
+            },
+            "delete_range",
+        )
     }
 
     /// Removes the database entries in the range `["from", "to")` using default write options asynchronously.
@@ -246,6 +288,7 @@ impl DB {
     /// Note that this operation will be done lexicographic on the *encoding* of the seek keys. It is
     /// up to the table creator to ensure that the lexicographic ordering of the encoded seek keys matches the
     /// logical ordering of the type.
+    #[tracing::instrument(skip_all, level = "error")]
     pub async fn delete_range_async<S: Schema>(
         &self,
         from: &impl SeekKeyEncoder<S>,
@@ -267,6 +310,7 @@ impl DB {
     }
 
     /// Returns a forward [`SchemaIterator`] on a certain schema with the default read options.
+    #[tracing::instrument(skip_all, level = "error")]
     pub fn iter<S: Schema>(&self) -> anyhow::Result<SchemaIterator<S>> {
         self.iter_with_direction::<S>(Default::default(), ScanDirection::Forward)
     }
@@ -277,10 +321,15 @@ impl DB {
         from: &impl SeekKeyEncoder<S>,
         to: &impl SeekKeyEncoder<S>,
     ) -> anyhow::Result<SchemaIterator<S>> {
-        let mut opts = ReadOptions::default();
-        opts.set_iterate_lower_bound(from.encode_seek_key()?);
-        opts.set_iterate_upper_bound(to.encode_seek_key()?);
-        self.iter_with_direction::<S>(opts, ScanDirection::Forward)
+        with_error_logging(
+            || {
+                let mut opts = ReadOptions::default();
+                opts.set_iterate_lower_bound(from.encode_seek_key()?);
+                opts.set_iterate_upper_bound(to.encode_seek_key()?);
+                self.iter_with_direction::<S>(opts, ScanDirection::Forward)
+            },
+            "iter_range",
+        )
     }
 
     ///  Returns a [`RawDbIter`] which allows to iterate over raw values in specified [`ScanDirection`].
@@ -299,7 +348,8 @@ impl DB {
         direction: ScanDirection,
     ) -> anyhow::Result<RawDbIter> {
         if is_range_bounds_inverse(&range) {
-            anyhow::bail!("lower_bound > upper_bound");
+            tracing::error!("[Rockbound]: error in raw_iter_range: lower_bound > upper_bound");
+            anyhow::bail!("[Rockbound]: error in raw_iter_range: lower_bound > upper_bound");
         }
         let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
         Ok(RawDbIter::new(&self.inner, cf_handle, range, direction))
@@ -313,8 +363,7 @@ impl DB {
         self.iter_with_direction::<S>(opts, ScanDirection::Forward)
     }
 
-    /// Writes a group of records wrapped in a [`SchemaBatch`].
-    pub fn write_schemas(&self, batch: &SchemaBatch) -> anyhow::Result<()> {
+    fn write_schemas_inner(&self, batch: &SchemaBatch) -> anyhow::Result<()> {
         let _timer = SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS
             .with_label_values(&[self.name])
             .start_timer();
@@ -347,7 +396,10 @@ impl DB {
         }
         let serialized_size = db_batch.size_in_bytes();
 
-        self.inner.write_opt(db_batch, &default_write_options())?;
+        with_error_logging(
+            || self.inner.write_opt(db_batch, &default_write_options()),
+            "write_schemas::write_opt",
+        )?;
 
         // Bump counters only after DB write succeeds.
         for (cf_name, rows) in batch.last_writes.iter() {
@@ -379,27 +431,44 @@ impl DB {
         Ok(())
     }
 
+    #[tracing::instrument(skip_all, level = "error")]
+    /// Writes a group of records wrapped in a [`SchemaBatch`].
+    pub fn write_schemas(&self, batch: &SchemaBatch) -> anyhow::Result<()> {
+        with_error_logging(|| self.write_schemas_inner(batch), "write_schemas")
+    }
+
+    #[tracing::instrument(skip_all, level = "error")]
     /// Writes a group of records wrapped in a [`SchemaBatch`] asynchronously.
     pub async fn write_schemas_async(&self, batch: &SchemaBatch) -> anyhow::Result<()> {
-        tokio::task::block_in_place(|| self.write_schemas(batch))
+        tokio::task::block_in_place(|| {
+            with_error_logging(|| self.write_schemas_inner(batch), "write_schemas_async")
+        })
     }
 
     fn get_cf_handle(&self, cf_name: &str) -> anyhow::Result<&rocksdb::ColumnFamily> {
-        self.inner.cf_handle(cf_name).ok_or_else(|| {
-            format_err!(
-                "DB::cf_handle not found for column family name: {}",
-                cf_name
-            )
-        })
+        with_error_logging(
+            || {
+                self.inner.cf_handle(cf_name).ok_or_else(|| {
+                    format_err!(
+                        "DB::cf_handle not found for column family name: {}",
+                        cf_name
+                    )
+                })
+            },
+            "get_cf_handle",
+        )
     }
 
     /// Flushes [MemTable](https://github.com/facebook/rocksdb/wiki/MemTable) data.
     /// This is only used for testing `get_approximate_sizes_cf` in unit tests.
+    #[tracing::instrument(skip_all, level = "error")]
     pub fn flush_cf(&self, cf_name: &str) -> anyhow::Result<()> {
-        Ok(self.inner.flush_cf(self.get_cf_handle(cf_name)?)?)
+        let handle = self.get_cf_handle(cf_name)?;
+        with_error_logging(|| self.inner.flush_cf(handle), "flush_cf")
     }
 
     /// Trigger compaction. Primarily used for testing.
+    #[tracing::instrument(skip_all, level = "error")]
     pub fn trigger_compaction<S: Schema>(&self) -> anyhow::Result<()> {
         let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
         self.inner
@@ -409,28 +478,49 @@ impl DB {
 
     /// Returns the current RocksDB property value for the provided column family name
     /// and property name.
+    #[tracing::instrument(skip_all, level = "error")]
     pub fn get_property(&self, cf_name: &str, property_name: &str) -> anyhow::Result<u64> {
-        self.inner
-            .property_int_value_cf(self.get_cf_handle(cf_name)?, property_name)?
-            .ok_or_else(|| {
-                format_err!(
-                    "Unable to get property \"{}\" of  column family \"{}\".",
-                    property_name,
-                    cf_name,
-                )
-            })
+        with_error_logging(
+            || {
+                self.inner
+                    .property_int_value_cf(self.get_cf_handle(cf_name)?, property_name)?
+                    .ok_or_else(|| {
+                        format_err!(
+                            "Unable to get property \"{}\" of  column family \"{}\".",
+                            property_name,
+                            cf_name,
+                        )
+                    })
+            },
+            "get_property",
+        )
     }
 
     /// Creates new physical DB checkpoint in directory specified by `path`.
+    #[tracing::instrument(skip_all, level = "error")]
     pub fn create_checkpoint<P: AsRef<Path>>(&self, path: P) -> anyhow::Result<()> {
-        rocksdb::checkpoint::Checkpoint::new(&self.inner)?.create_checkpoint(path)?;
-        Ok(())
+        with_error_logging(
+            || rocksdb::checkpoint::Checkpoint::new(&self.inner)?.create_checkpoint(path),
+            "create_checkpoint",
+        )
     }
 
     /// Creates new physical DB checkpoint in directory specified by `path` asynchronously.
+    #[tracing::instrument(skip_all, level = "error")]
     pub async fn create_checkpoint_async<P: AsRef<Path>>(&self, path: P) -> anyhow::Result<()> {
         tokio::task::block_in_place(|| self.create_checkpoint(path))
     }
+}
+
+fn with_error_logging<F, T, E: Into<anyhow::Error>>(f: F, name: &str) -> anyhow::Result<T>
+where
+    F: FnOnce() -> Result<T, E>,
+{
+    let result = f().map_err(|e| e.into());
+    if let Err(e) = &result {
+        tracing::error!("[Rockbound] error during {}: {}", name, e);
+    }
+    result
 }
 
 /// Readability alias for a key in the DB.
