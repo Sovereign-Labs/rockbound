@@ -172,6 +172,12 @@ impl DB {
         DB { name, inner }
     }
 
+    /// Name of the database that can be used for logging or metrics or tracing.
+    #[inline]
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
     /// Reads single record by key.
     #[tracing::instrument(skip_all, level = "error")]
     pub fn get<S: Schema>(
