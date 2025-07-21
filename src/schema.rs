@@ -16,7 +16,7 @@ pub type ColumnFamilyName = &'static str;
 
 /// A [`Schema`] is a type-safe interface over a specific column family in a
 /// [`DB`](crate::DB). It is always a key type ([`KeyCodec`]) and a value type ([`ValueCodec`]).
-pub trait Schema: Debug + Send + Sync + 'static + Sized {
+pub trait Schema: Debug + Send + Sync + 'static + Sized + Default {
     /// The column family name associated with this struct.
     /// Note: all schemas within the same SchemaDB must have distinct column family names.
     const COLUMN_FAMILY_NAME: ColumnFamilyName;
@@ -86,7 +86,7 @@ pub trait KeyCodec<S: Schema + ?Sized>: KeyEncoder<S> + KeyDecoder<S> {}
 impl<T, S: Schema + ?Sized> KeyCodec<S> for T where T: KeyEncoder<S> + KeyDecoder<S> {}
 
 /// Implementors of this trait can be used to encode keys in the given [`Schema`].
-pub trait KeyEncoder<S: Schema + ?Sized>: Sized + PartialEq + Debug {
+pub trait KeyEncoder<S: Schema + ?Sized>: Sized + Debug {
     /// Converts `self` to bytes to be stored in RocksDB.
     fn encode_key(&self) -> Result<Vec<u8>>;
 }

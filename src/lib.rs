@@ -19,6 +19,7 @@ mod iterator;
 mod metrics;
 pub mod schema;
 mod schema_batch;
+mod versioned_db;
 
 mod config;
 #[cfg(feature = "test-utils")]
