@@ -91,14 +91,20 @@ pub trait KeyEncoder<S: Schema + ?Sized>: Sized + Debug {
     fn encode_key(&self) -> Result<Vec<u8>>;
 }
 
+impl<S: Schema, T: KeyEncoder<S>> KeyEncoder<S> for &T {
+	fn encode_key(&self) -> Result<Vec<u8>> {
+		(*self).encode_key()
+	}
+}
+
 /// Implementors of this trait can be used to decode keys in the given [`Schema`].
-pub trait KeyDecoder<S: Schema + ?Sized>: Sized + PartialEq + Debug {
+pub trait KeyDecoder<S: Schema + ?Sized>: Sized + Debug {
     /// Converts bytes fetched from RocksDB to `Self`.
     fn decode_key(data: &[u8]) -> Result<Self>;
 }
 
 /// This trait defines a type that can serve as a [`Schema::Value`].
-pub trait ValueCodec<S: Schema + ?Sized>: Sized + PartialEq + Debug {
+pub trait ValueCodec<S: Schema + ?Sized>: Sized + Debug {
     /// Converts `self` to bytes to be stored in DB.
     fn encode_value(&self) -> Result<Vec<u8>>;
     /// Converts bytes fetched from DB to `Self`.
@@ -148,7 +154,7 @@ pub trait ValueCodec<S: Schema + ?Sized>: Sized + PartialEq + Debug {
 #[macro_export]
 macro_rules! define_schema {
     ($schema_type:ident, $key_type:ty, $value_type:ty, $cf_name:expr) => {
-        #[derive(Debug)]
+        #[derive(Debug, Default)]
         pub(crate) struct $schema_type;
 
         impl $crate::schema::Schema for $schema_type {
