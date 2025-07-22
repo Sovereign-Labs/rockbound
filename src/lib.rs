@@ -19,7 +19,8 @@ mod iterator;
 mod metrics;
 pub mod schema;
 mod schema_batch;
-mod versioned_db;
+/// Provides a database for versioned key-value pairs with one live value and N historical values.
+pub mod versioned_db;
 
 mod config;
 #[cfg(feature = "test-utils")]
@@ -42,7 +43,7 @@ pub use rocksdb::DEFAULT_COLUMN_FAMILY_NAME;
 use thiserror::Error;
 use tracing::{info, warn};
 
-use crate::iterator::RawDbIter;
+use crate::{iterator::RawDbIter, schema::KeyEncoder};
 pub use crate::schema::Schema;
 use crate::schema::{ColumnFamilyName, KeyCodec, ValueCodec};
 pub use crate::schema_batch::SchemaBatch;
@@ -183,7 +184,7 @@ impl DB {
     #[tracing::instrument(skip_all, level = "error")]
     pub fn get<S: Schema>(
         &self,
-        schema_key: &impl KeyCodec<S>,
+        schema_key: &impl KeyEncoder<S>,
     ) -> anyhow::Result<Option<S::Value>> {
         with_error_logging::<_, _, anyhow::Error>(
             || {

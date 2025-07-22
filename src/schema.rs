@@ -5,7 +5,7 @@
 
 //! A type-safe interface over [`DB`](crate::DB) column families.
 
-use std::fmt::Debug;
+use std::{fmt::Debug, sync::Arc};
 
 use crate::CodecError;
 
@@ -96,6 +96,14 @@ impl<S: Schema, T: KeyEncoder<S>> KeyEncoder<S> for &T {
 		(*self).encode_key()
 	}
 }
+
+
+impl<S: Schema, T: KeyEncoder<S>> KeyEncoder<S> for Arc<T> {
+	fn encode_key(&self) -> Result<Vec<u8>> {
+		self.as_ref().encode_key()
+	}
+}
+
 
 /// Implementors of this trait can be used to decode keys in the given [`Schema`].
 pub trait KeyDecoder<S: Schema + ?Sized>: Sized + Debug {

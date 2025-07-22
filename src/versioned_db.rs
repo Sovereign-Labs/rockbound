@@ -1,9 +1,11 @@
-use std::{collections::HashMap, marker::PhantomData, path::Path, sync::{atomic::{AtomicU64, Ordering}, Arc}};
+#![allow(missing_docs)]
+use std::{borrow::Borrow, collections::HashMap, marker::PhantomData, path::Path, sync::{atomic::{AtomicU64, Ordering}, Arc}};
 
 use anyhow::bail;
 
 use crate::{iterator::ScanDirection, schema::{ColumnFamilyName, KeyCodec, KeyDecoder, KeyEncoder, ValueCodec}, CodecError, Schema, SchemaBatch, DB};
 
+#[derive(Debug)]
 struct Cache;
 
 #[derive(Debug, Default)]
@@ -77,6 +79,7 @@ impl ValueCodec<CommittedVersion> for u64 {
 /// 
 /// On each read, the implementation will:
 /// - Read from the live column family
+#[derive(Clone, Debug)]
 pub struct VersionedDB<S: SchemaWithVersion> {
 	db: Arc<DB>,
 	// TODO: Consider using a Mutex instead of an atomic since we need to synchronize this with the DB.
@@ -156,9 +159,9 @@ impl<S: SchemaWithVersion> KeyDecoder<S::PruningColumnFamily> for PrunableKey<S,
 // 	}
 // }
 
+#[derive(Debug, Clone, Default)]
 pub struct VersionedSchemaBatch<S: Schema> {
 	versioned_table_writes: HashMap<S::Key, Option<S::Value>>,
-	// other_changes: SchemaBatch,
 }
 
 impl<S: Schema, T: IntoIterator<Item = (S::Key, Option<S::Value>)>> From<T> for VersionedSchemaBatch<S>
@@ -209,6 +212,7 @@ where EmptyKey: KeyCodec<V::CommittedVersionColumn>,
 	V::Value: ValueCodec<V::HistoricalColumnFamily>,
 	u64: ValueCodec<V::CommittedVersionColumn>
 	{
+		// TODO: Optimize for point lookup on the live version 
 	pub fn add_column_families(
 		existing_column_families: &mut Vec<ColumnFamilyName>,
     ) -> anyhow::Result<()> {
@@ -241,11 +245,11 @@ where EmptyKey: KeyCodec<V::CommittedVersionColumn>,
         self.db.name()
     }
 
-	pub fn get_live_value(&self, key: &impl KeyCodec<V>) -> anyhow::Result<Option<V::Value>> {
+	pub fn get_live_value(&self, key: &impl KeyEncoder<V>) -> anyhow::Result<Option<V::Value>> {
 		self.db.get::<V>(key)
 	}
 
-	pub fn materialize(&self, batch: VersionedSchemaBatch<V>, output_batch: &mut SchemaBatch) -> anyhow::Result<()> {
+	pub fn materialize(&self, batch: &VersionedSchemaBatch<V>, output_batch: &mut SchemaBatch) -> anyhow::Result<()> {
 		let version = self.committed_version.fetch_add(1, Ordering::SeqCst);
 		for (key, value) in batch.versioned_table_writes.iter() {
 			// TODO: Update cache here;
@@ -283,4 +287,80 @@ where EmptyKey: KeyCodec<V::CommittedVersionColumn>,
 		Ok(None)
 	}
 	
+}
+
+#[derive(Debug, Clone)]
+pub struct VersionedDeltaReader<V: SchemaWithVersion> {
+	db: VersionedDB<V>,
+	base_version: Option<u64>,
+	snapshots: Vec<Arc<VersionedSchemaBatch<V>>>,
+}
+
+impl<V: SchemaWithVersion> VersionedDeltaReader<V> 
+where V::Key: Eq + std::hash::Hash,
+EmptyKey: KeyCodec<V::CommittedVersionColumn>,
+	V::Value: Clone,
+	(): ValueCodec<V::PruningColumnFamily>,
+	V::Value: ValueCodec<V::HistoricalColumnFamily>,
+	u64: ValueCodec<V::CommittedVersionColumn>
+{
+	pub fn new(db: VersionedDB<V>, base_version: Option<u64>, snapshots: Vec<Arc<VersionedSchemaBatch<V>>>) -> Self {
+        Self { snapshots, db, base_version }
+    }
+
+	pub fn get_latest(&self, key: impl Borrow<V::Key>) -> anyhow::Result<Option<V::Value>> {
+		for snapshot in self.snapshots.iter().rev() {
+			if let Some(value) = snapshot.versioned_table_writes.get(key.borrow()) {
+				return Ok(value.as_ref().map(|value| value.clone()));
+			}
+		}
+		self.db.get_live_value(key.borrow())
+	}
+
+	pub fn get_historical(&self, key: &V::Key, version: u64) -> anyhow::Result<Option<V::Value>> {
+		let Some(newest_version) = self.latest_version() else {
+			return Err(anyhow::anyhow!("Cannot query for historical values against an empty database"));
+		};
+		if version > newest_version {
+			return Err(anyhow::anyhow!("Requested version {} is greater than the newest version {}", version, newest_version));
+		}
+		let mut version_of_current_snapshot = newest_version;
+		for snapshot in self.snapshots.iter().rev() {
+			if version_of_current_snapshot > version {
+				version_of_current_snapshot -= 1;
+				continue;
+			}
+			if let Some(value) = snapshot.versioned_table_writes.get(key) {
+				return Ok(value.as_ref().map(|value| value.clone()));
+			}
+			version_of_current_snapshot -= 1;
+		}
+		self.db.get_historical_value(key, version)
+	}
+
+	pub fn latest_version(&self) -> Option<u64> {
+		match self.base_version {
+			Some(base_version) => Some(base_version + self.snapshots.len() as u64),
+			None => self.snapshots.len().checked_sub(1).map(|len| len as u64),
+		}
+	}
+}
+
+
+impl<V: SchemaWithVersion<Key = Arc<K>>, K> VersionedDeltaReader<V> 
+where K: Eq + std::hash::Hash + KeyEncoder<V>,
+EmptyKey: KeyCodec<V::CommittedVersionColumn>,
+	V::Value: Clone,
+	(): ValueCodec<V::PruningColumnFamily>,
+	V::Value: ValueCodec<V::HistoricalColumnFamily>,
+	u64: ValueCodec<V::CommittedVersionColumn>
+{
+	pub fn get_latest_borrowed(&self, key: impl Borrow<K>) -> anyhow::Result<Option<V::Value>> {
+		for snapshot in self.snapshots.iter().rev() {
+			if let Some(value) = snapshot.versioned_table_writes.get(key.borrow()) {
+				return Ok(value.as_ref().map(|value| value.clone()));
+			}
+		}
+		self.db.get_live_value(key.borrow())
+	}
 }
