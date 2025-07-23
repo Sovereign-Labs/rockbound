@@ -28,7 +28,14 @@ pub mod test;
 
 pub use config::{gen_rocksdb_options, RocksdbConfig};
 
-use std::{path::Path, time::Duration};
+use std::{
+    path::Path,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use anyhow::format_err;
 use iterator::ScanDirection;
@@ -43,16 +50,17 @@ pub use rocksdb::DEFAULT_COLUMN_FAMILY_NAME;
 use thiserror::Error;
 use tracing::{info, warn};
 
-use crate::{iterator::RawDbIter, schema::KeyEncoder};
 pub use crate::schema::Schema;
 use crate::schema::{ColumnFamilyName, KeyCodec, ValueCodec};
 pub use crate::schema_batch::SchemaBatch;
+use crate::{iterator::RawDbIter, schema::KeyEncoder};
 
 /// This DB is a schematized RocksDB wrapper where all data passed in and out are typed according to
 /// [`Schema`]s.
 #[derive(Debug)]
 pub struct DB {
     name: &'static str, // for logging
+    next_version_to_commit: Option<Arc<AtomicU64>>,
     inner: rocksdb::DB,
 }
 
@@ -171,7 +179,32 @@ impl DB {
 
     fn log_construct(name: &'static str, inner: rocksdb::DB) -> DB {
         info!(rocksdb_name = name, path = %inner.path().display(), "Opened RocksDB");
-        DB { name, inner }
+        DB {
+            name,
+            inner,
+            next_version_to_commit: None,
+        }
+    }
+
+    /// Returns the committed version of the DB. Panics if the DB is not initialized with versioning support.
+    pub(crate) fn get_committed_version(&self, ordering: Ordering) -> Option<u64> {
+        self.next_version_to_commit
+            .as_ref()
+            .expect(
+                "Loading the committed version from a DB which is not versioned. This is a bug.",
+            )
+            .load(ordering)
+            .checked_sub(1)
+    }
+
+    /// Returns true if the DB supports versioning. If enabled, the DB will auto-increment its version number on each call to `write_schemas`.
+    pub fn supports_versioning(&self) -> bool {
+        self.next_version_to_commit.is_some()
+    }
+
+    /// Initialize the next version to commit
+    pub fn initialize_next_version_to_commit(&mut self, next_version: u64) {
+        self.next_version_to_commit = Some(Arc::new(AtomicU64::new(next_version)));
     }
 
     /// Name of the database that can be used for logging or metrics or tracing.
@@ -375,6 +408,11 @@ impl DB {
         let _timer = SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS
             .with_label_values(&[self.name])
             .start_timer();
+        // Update the next version to commit if relevant.
+        self.next_version_to_commit
+            .as_ref()
+            .map(|v| v.fetch_add(1, Ordering::AcqRel));
+
         let mut db_batch = rocksdb::WriteBatch::default();
         for (cf_name, rows) in batch.last_writes.iter() {
             let cf_handle = self.get_cf_handle(cf_name)?;

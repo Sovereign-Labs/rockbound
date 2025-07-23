@@ -82,10 +82,18 @@ impl ValueCodec<CommittedVersion> for u64 {
 #[derive(Clone, Debug)]
 pub struct VersionedDB<S: SchemaWithVersion> {
 	db: Arc<DB>,
-	// TODO: Consider using a Mutex instead of an atomic since we need to synchronize this with the DB.
-	committed_version: Arc<AtomicU64>,
+	oldest_available_version: Arc<AtomicU64>,
 	cache: Arc<Cache>,
 	schema: S,
+}
+
+impl<S: SchemaWithVersion> VersionedDB<S> {
+	pub fn get_oldest_available_version(&self, ordering: Ordering) -> u64 {
+		self.oldest_available_version.load(ordering)
+	}
+	pub fn get_committed_version(&self, ordering: Ordering) -> Option<u64> {
+		self.db.get_committed_version(ordering)
+	}
 }
 
 #[derive(Debug )]
@@ -235,8 +243,16 @@ where EmptyKey: KeyCodec<V::CommittedVersionColumn>,
 	pub fn from_db(
 		db: Arc<DB>,
 	) -> anyhow::Result<Self> {
-		let committed_version = db.get::<V::CommittedVersionColumn>(&EmptyKey)?.unwrap_or(0);
-		Ok(Self { db, committed_version: Arc::new(AtomicU64::new(committed_version)), cache: Arc::new(Cache), schema: Default::default() })
+		let oldest_available_version = Self::get_next_version_to_prune_from_db(db.as_ref())?;
+		Ok(Self { db, cache: Arc::new(Cache), schema: Default::default(), oldest_available_version: Arc::new(AtomicU64::new(oldest_available_version)) })
+	}
+
+
+	pub fn get_next_version_to_prune_from_db(db: &DB) -> anyhow::Result<u64> {
+		// TODO: Ensure that each version to prune is non-empty. Otherwise, this check may return a newer version 
+		let mut iterator = db.raw_iter_range::<V::CommittedVersionColumn>(0u64.to_be_bytes().to_vec().., ScanDirection::Forward)?;
+		let next_version_to_prune = iterator.next().map(|(key, _value)| u64::from_be_bytes(key[..8].try_into().expect("version bytes were 8 bytes but no longer are. This is a bug."))).unwrap_or(0);
+		Ok(next_version_to_prune)
 	}
 
 	/// Name of the database that can be used for logging or metrics or tracing.
@@ -249,8 +265,12 @@ where EmptyKey: KeyCodec<V::CommittedVersionColumn>,
 		self.db.get::<V>(key)
 	}
 
+	pub fn load_latest_committed_version(&self) -> anyhow::Result<Option<u64>> {
+		self.db.get::<V::CommittedVersionColumn>(&EmptyKey)
+	}
+
 	pub fn materialize(&self, batch: &VersionedSchemaBatch<V>, output_batch: &mut SchemaBatch) -> anyhow::Result<()> {
-		let version = self.committed_version.fetch_add(1, Ordering::SeqCst);
+		let version = self.db.get_committed_version(Ordering::Acquire).and_then(|v| v.checked_add(1)).unwrap_or(0);
 		for (key, value) in batch.versioned_table_writes.iter() {
 			// TODO: Update cache here;
 			// Write to the Live keys table
@@ -294,6 +314,7 @@ pub struct VersionedDeltaReader<V: SchemaWithVersion> {
 	db: VersionedDB<V>,
 	base_version: Option<u64>,
 	snapshots: Vec<Arc<VersionedSchemaBatch<V>>>,
+	is_out_of_date: bool,
 }
 
 impl<V: SchemaWithVersion> VersionedDeltaReader<V> 
@@ -305,16 +326,37 @@ EmptyKey: KeyCodec<V::CommittedVersionColumn>,
 	u64: ValueCodec<V::CommittedVersionColumn>
 {
 	pub fn new(db: VersionedDB<V>, base_version: Option<u64>, snapshots: Vec<Arc<VersionedSchemaBatch<V>>>) -> Self {
-        Self { snapshots, db, base_version }
+        Self { snapshots, db, base_version, is_out_of_date: false }
     }
 
+	/// Gets the latest value for a key, according to this storage. Note that this call guarantees coherency even if the underlying DB
+	/// is mutated while this call is in progress.
 	pub fn get_latest(&self, key: impl Borrow<V::Key>) -> anyhow::Result<Option<V::Value>> {
 		for snapshot in self.snapshots.iter().rev() {
 			if let Some(value) = snapshot.versioned_table_writes.get(key.borrow()) {
 				return Ok(value.as_ref().map(|value| value.clone()));
 			}
 		}
-		self.db.get_live_value(key.borrow())
+		// The live value for any key is None if the DB is empty.
+		let Some(latest_version) = self.latest_version() else  {
+			return Ok(None)	
+		};
+		// If the DB mutated underneath us such that the live version is now newer than this snapshot's versino, we need to fetch from the historical table. This is much slower than fetching from the live table, but it should be a very rare case.
+		if self.db.get_committed_version(Ordering::Acquire).unwrap_or(0) > latest_version{
+			tracing::debug!("DB is out of date, fetching 'live' values from historical table");
+			return self.get_historical(key.borrow(), latest_version);
+		}
+		
+		let live_value = self.db.get_live_value(key.borrow())?;
+		// If the DB has no committed version or if its latest version is less than the latest version we know about, then it hasn't changed underneath us in a way that would invalidate the read. 
+		if self.db.get_committed_version(Ordering::Acquire).unwrap_or(0) <= latest_version {
+			return Ok(live_value);
+		} else {
+			// Coherency - check that the DB is still in date before returning the value. If not, we need to retry from the historical table. 
+			tracing::debug!("DB became out of date during a read. Fetching 'live' values from historical table");
+			return self.get_historical(key.borrow(), latest_version);
+		}
+
 	}
 
 	pub fn get_historical(&self, key: &V::Key, version: u64) -> anyhow::Result<Option<V::Value>> {
@@ -324,6 +366,7 @@ EmptyKey: KeyCodec<V::CommittedVersionColumn>,
 		if version > newest_version {
 			return Err(anyhow::anyhow!("Requested version {} is greater than the newest version {}", version, newest_version));
 		}
+		
 		let mut version_of_current_snapshot = newest_version;
 		for snapshot in self.snapshots.iter().rev() {
 			if version_of_current_snapshot > version {
@@ -335,7 +378,13 @@ EmptyKey: KeyCodec<V::CommittedVersionColumn>,
 			}
 			version_of_current_snapshot -= 1;
 		}
-		self.db.get_historical_value(key, version)
+		let historical_value = self.db.get_historical_value(key, version)?;
+		let oldest_available_version = self.db.get_oldest_available_version(Ordering::Acquire);
+		if version < oldest_available_version {
+			return Err(anyhow::anyhow!("Requested version {} is older than the oldest available version {}", version, oldest_available_version));
+		} else {
+			return Ok(historical_value);
+		}
 	}
 
 	pub fn latest_version(&self) -> Option<u64> {
