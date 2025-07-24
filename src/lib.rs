@@ -187,7 +187,7 @@ impl DB {
     }
 
     /// Returns the committed version of the DB. Panics if the DB is not initialized with versioning support.
-    pub(crate) fn get_committed_version(&self, ordering: Ordering) -> Option<u64> {
+    pub fn get_committed_version(&self, ordering: Ordering) -> Option<u64> {
         self.next_version_to_commit
             .as_ref()
             .expect(
