@@ -330,7 +330,7 @@ where
         &self,
         batch: &VersionedSchemaBatch<V>,
         output_batch: &mut SchemaBatch,
-    ) -> anyhow::Result<u64> {
+    ) -> anyhow::Result<()> {
         let version = self
             .db
             .get_committed_version(Ordering::Acquire)
@@ -359,7 +359,7 @@ where
         }
         // Write to the historical table
         output_batch.put::<V::CommittedVersionColumn>(&EmptyKey, &version)?;
-        Ok(version)
+        Ok(())
     }
 
     pub fn get_historical_value(
@@ -496,11 +496,8 @@ where
     // }
 
     pub fn latest_version(&self) -> Option<u64> {
-        tracing::debug!(
-            "base_version: {:?}. Num_snapshots: {}",
-            self.base_version,
-            self.snapshots.len()
-        );
+        tracing::debug!("base_version: {:?}", self.base_version);
+        tracing::debug!("snapshots.len(): {:?}", self.snapshots.len());
         match self.base_version {
             Some(base_version) => Some(base_version + self.snapshots.len() as u64),
             None => self.snapshots.len().checked_sub(1).map(|len| len as u64),
@@ -531,31 +528,29 @@ where
         let Some(latest_version) = self.latest_version() else {
             return Ok(None);
         };
-        // // If the DB mutated underneath us such that the live version is now newer than this snapshot's versino, we need to fetch from the historical table. This is much slower than fetching from the live table, but it should be a rare case.
-        // // Note that the data that was committed could come from a different fork even if it's at the same height as our snapshot, so we always need to fall back to the historical table starting
-        // // at our base version.
-        // // TODO: Consider adding a fork ID so that we can tell if the new commit is from a different fork.
-        // let loaded_version = self.db.get_committed_version(Ordering::Acquire);
-        // if loaded_version.is_some_and(|v| v > latest_version) {
-        //     tracing::debug!(?loaded_version, "DB is out of date, fetching 'live' values from historical table. Using latest version {:?}", latest_version);
-        //     // The data from the base version is guaranteed to match our data - but data from the latest version could be from a different fork that was committed
-        //     return self.get_historical_borrowed(key, latest_version);
-        // }
+        // If the DB mutated underneath us such that the live version is now newer than this snapshot's versino, we need to fetch from the historical table. This is much slower than fetching from the live table, but it should be a rare case.
+        // Note that the data that was committed could come from a different fork even if it's at the same height as our snapshot. This is intentionally allowed for compatibiltiy with pre-existing
+        // behavior of the system.
+        let loaded_version = self.db.get_committed_version(Ordering::Acquire);
+        if loaded_version.is_some_and(|v| v > latest_version) {
+            tracing::debug!(?loaded_version, "DB is out of date, fetching 'live' values from historical table. Using latest version {:?}", latest_version + 1);
+            // The data from the base version is guaranteed to match our data - but data from the latest version could be from a different fork that was committed
+            return self.get_historical_borrowed(key, latest_version + 1);
+        }
 
         let live_value = self.db.get_live_value(key.borrow())?;
-        // // If the DB has no committed version or if its latest version is less than the latest version we know about, then it hasn't changed underneath us in a way that would invalidate the read.
-        // let loaded_version = self.db.get_committed_version(Ordering::Acquire);
-        // if loaded_version.is_some_and(|v| v > latest_version) {
-        //      // Coherency - check that the DB is still in date before returning the value. If not, we need to retry from the historical table.
-        //      tracing::debug!(
-        //         ?loaded_version, "DB became out of date during a read. Fetching 'live' values from historical table. Using latest version {:?}",
-        //         latest_version
-        //     );
-        //     return self.get_historical_borrowed(key, latest_version);
-        // } else {
-        //     return Ok(live_value);
-        // }
-        return Ok(live_value);
+        // If the DB has no committed version or if its latest version is less than the latest version we know about, then it hasn't changed underneath us in a way that would invalidate the read.
+        let loaded_version = self.db.get_committed_version(Ordering::Acquire);
+        if loaded_version.is_some_and(|v| v > latest_version) {
+            // Coherency - check that the DB is still in date before returning the value. If not, we need to retry from the historical table.
+            tracing::debug!(
+                ?loaded_version, "DB became out of date during a read. Fetching 'live' values from historical table. Using latest version {:?}",
+                latest_version + 1,
+            );
+            return self.get_historical_borrowed(key, latest_version + 1);
+        } else {
+            return Ok(live_value);
+        }
     }
 
     pub fn get_historical_borrowed(
@@ -563,7 +558,7 @@ where
         key: impl Borrow<K>,
         version: u64,
     ) -> anyhow::Result<Option<V::Value>> {
-        let Some(newest_version) = self.latest_version() else {
+        let Some(newest_version) = self.latest_version().map(|v| v + 1) else {
             return Err(anyhow::anyhow!(
                 "Cannot query for historical values against an empty database"
             ));
