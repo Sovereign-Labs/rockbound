@@ -10,8 +10,10 @@ use std::{
 };
 
 use anyhow::bail;
+use rocksdb::ColumnFamilyDescriptor;
 
 use crate::{
+    default_cf_descriptor,
     iterator::ScanDirection,
     schema::{ColumnFamilyName, KeyCodec, KeyDecoder, KeyEncoder, ValueCodec},
     CodecError, Schema, SchemaBatch, DB,
@@ -182,24 +184,6 @@ impl<S: SchemaWithVersion> KeyDecoder<S::PruningColumnFamily> for PrunableKey<S,
     }
 }
 
-// #[derive(Debug, Default)]
-// pub struct VersionedSchema<S: Schema>(PhantomData<S>);
-// impl<S: Schema> Schema for VersionedSchema<S> {
-// 	const COLUMN_FAMILY_NAME: ColumnFamilyName = "historical_data";
-// 	type Key = VersionedKey<S, S::Key>;
-// 	type Value = S::Value;
-// }
-
-// impl<S: Schema> ValueCodec<VersionedSchema<S>> for S::Value {
-// 	fn encode_value(&self) -> Result<Vec<u8>, CodecError> {
-// 		S::Value::encode_value(self)
-// 	}
-
-// 	fn decode_value(data: &[u8]) -> Result<Self, CodecError> {
-// 		S::Value::decode_value(data)
-// 	}
-// }
-
 #[derive(Debug, Clone, Default)]
 pub struct VersionedSchemaBatch<S: Schema> {
     versioned_table_writes: HashMap<S::Key, Option<S::Value>>,
@@ -230,19 +214,13 @@ where
     }
 }
 
-// impl<S: Schema> VersionedSchemaBatch<S> {
-// 	pub fn put_non_versioned<S2: Schema>(&mut self, key: &impl KeyCodec<S2>, value: &impl ValueCodec<S2>) {
-// 		assert_ne!(S::COLUMN_FAMILY_NAME, VersionedSchema::<S>::COLUMN_FAMILY_NAME);
-// 		assert_ne!(S::COLUMN_FAMILY_NAME, S2::COLUMN_FAMILY_NAME);
-// 		self.other_changes.put::<S2>(key, value);
-// 	}
-
-// 	pub fn delete_non_versioned<S2: Schema>(&mut self, key: &impl KeyCodec<S2>) {
-// 		assert_ne!(S::COLUMN_FAMILY_NAME, VersionedSchema::<S>::COLUMN_FAMILY_NAME);
-// 		assert_ne!(S::COLUMN_FAMILY_NAME, S2::COLUMN_FAMILY_NAME);
-// 		self.other_changes.delete::<S2>(key);
-// 	}
-// }
+fn live_versioned_column_family_descriptor(name: &str) -> ColumnFamilyDescriptor {
+    let mut cf_opts: rocksdb::Options = rocksdb::Options::default();
+    cf_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+    // Use a 1GB block cache. TODO: Tune this value
+    cf_opts.optimize_for_point_lookup(1024);
+    rocksdb::ColumnFamilyDescriptor::new(name, cf_opts)
+}
 
 /// A specialized schema for values which have one "live" version and wish to automatically store a
 /// (possibly truncated) history of all versions over time.
@@ -261,25 +239,25 @@ where
 {
     // TODO: Optimize for point lookup on the live version
     pub fn add_column_families(
-        existing_column_families: &mut Vec<ColumnFamilyName>,
+        existing_column_families: &mut Vec<ColumnFamilyDescriptor>,
     ) -> anyhow::Result<()> {
         let historical_versioned_column_family = V::HistoricalColumnFamily::COLUMN_FAMILY_NAME;
         let pruning_column_family = V::PruningColumnFamily::COLUMN_FAMILY_NAME;
         let live_column_family = V::COLUMN_FAMILY_NAME;
         let committed_version_column_family = V::CommittedVersionColumn::COLUMN_FAMILY_NAME;
         for column in existing_column_families.iter() {
-            if column == &committed_version_column_family
-                || column == &historical_versioned_column_family
-                || column == &live_column_family
-                || column == &pruning_column_family
+            if column.name() == committed_version_column_family
+                || column.name() == historical_versioned_column_family
+                || column.name() == live_column_family
+                || column.name() == pruning_column_family
             {
-                bail!("{} column name is reserved for internal use", column);
+                bail!("{} column name is reserved for internal use", column.name());
             }
         }
-        existing_column_families.push(historical_versioned_column_family);
-        existing_column_families.push(live_column_family);
-        existing_column_families.push(pruning_column_family);
-        existing_column_families.push(committed_version_column_family);
+        existing_column_families.push(default_cf_descriptor(historical_versioned_column_family));
+        existing_column_families.push(live_versioned_column_family_descriptor(live_column_family));
+        existing_column_families.push(default_cf_descriptor(pruning_column_family));
+        existing_column_families.push(default_cf_descriptor(committed_version_column_family));
         Ok(())
     }
 
@@ -450,7 +428,7 @@ where
         };
         // If the DB mutated underneath us such that the live version is now newer than this snapshot's versino, we need to fetch from the historical table. This is much slower than fetching from the live table, but it should be a rare case.
         // Note that the data that was committed could come from a different fork even if it's at the same height as our snapshot. This is intentionally allowed for compatibiltiy with pre-existing
-        // behavior of the system. 
+        // behavior of the system.
         let loaded_version = self.db.get_committed_version(Ordering::Acquire);
         if loaded_version.is_some_and(|v| v > latest_version) {
             tracing::debug!(?loaded_version, "DB is out of date, fetching 'live' values from historical table. Using latest version {:?}", latest_version);
@@ -462,8 +440,8 @@ where
         // If the DB has no committed version or if its latest version is less than the latest version we know about, then it hasn't changed underneath us in a way that would invalidate the read.
         let loaded_version = self.db.get_committed_version(Ordering::Acquire);
         if loaded_version.is_some_and(|v| v > latest_version) {
-             // Coherency - check that the DB is still in date before returning the value. If not, we need to retry from the historical table.
-             tracing::debug!(
+            // Coherency - check that the DB is still in date before returning the value. If not, we need to retry from the historical table.
+            tracing::debug!(
                 ?loaded_version, "DB became out of date during a read. Fetching 'live' values from historical table. Using latest version {:?}",
                 latest_version
             );

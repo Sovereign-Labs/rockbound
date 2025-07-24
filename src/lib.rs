@@ -64,6 +64,13 @@ pub struct DB {
     inner: rocksdb::DB,
 }
 
+/// Returns the default column family descriptor. Includes LZ4 compression.
+pub fn default_cf_descriptor(cf_name: impl Into<String>) -> rocksdb::ColumnFamilyDescriptor {
+    let mut cf_opts = rocksdb::Options::default();
+    cf_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+    rocksdb::ColumnFamilyDescriptor::new(cf_name, cf_opts)
+}
+
 impl DB {
     /// Opens a database backed by RocksDB, using the provided column family names and default
     /// column family options.
@@ -78,11 +85,7 @@ impl DB {
             db_opts,
             path,
             name,
-            column_families.into_iter().map(|cf_name| {
-                let mut cf_opts = rocksdb::Options::default();
-                cf_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-                rocksdb::ColumnFamilyDescriptor::new(cf_name, cf_opts)
-            }),
+            column_families.into_iter().map(default_cf_descriptor),
         )?;
         Ok(db)
     }
