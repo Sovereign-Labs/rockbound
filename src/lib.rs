@@ -264,7 +264,7 @@ impl DB {
             || {
                 let mut batch = SchemaBatch::new();
                 batch.put::<S>(key, value)?;
-                self.write_schemas_inner(&batch)
+                self.write_schemas_inner(&batch, true)
             },
             "put",
         )
@@ -289,7 +289,7 @@ impl DB {
             || {
                 let mut batch = SchemaBatch::new();
                 batch.delete::<S>(key)?;
-                self.write_schemas_inner(&batch)
+                self.write_schemas_inner(&batch, true)
             },
             "delete",
         )
@@ -404,14 +404,18 @@ impl DB {
         self.iter_with_direction::<S>(opts, ScanDirection::Forward)
     }
 
-    fn write_schemas_inner(&self, batch: &SchemaBatch) -> anyhow::Result<()> {
+    fn write_schemas_inner(&self, batch: &SchemaBatch, bump_version: bool) -> anyhow::Result<()> {
         let _timer = SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS
             .with_label_values(&[self.name])
             .start_timer();
         // Update the next version to commit if relevant.
-        self.next_version_to_commit
-            .as_ref()
-            .map(|v| v.fetch_add(1, Ordering::AcqRel));
+        if bump_version {
+            let version = self
+                .next_version_to_commit
+                .as_ref()
+                .map(|v| v.fetch_add(1, Ordering::AcqRel));
+            tracing::debug!("writing schemas. committing version: {:?}", version);
+        }
 
         let mut db_batch = rocksdb::WriteBatch::default();
         for (cf_name, rows) in batch.last_writes.iter() {
@@ -480,14 +484,26 @@ impl DB {
     #[tracing::instrument(skip_all, level = "error")]
     /// Writes a group of records wrapped in a [`SchemaBatch`].
     pub fn write_schemas(&self, batch: &SchemaBatch) -> anyhow::Result<()> {
-        with_error_logging(|| self.write_schemas_inner(batch), "write_schemas")
+        with_error_logging(|| self.write_schemas_inner(batch, true), "write_schemas")
+    }
+
+    #[tracing::instrument(skip_all, level = "error")]
+    /// Writes a group of records wrapped in a [`SchemaBatch`].
+    pub fn write_schemas_without_version_bump(&self, batch: &SchemaBatch) -> anyhow::Result<()> {
+        with_error_logging(
+            || self.write_schemas_inner(batch, false),
+            "write_schemas_without_versioning",
+        )
     }
 
     #[tracing::instrument(skip_all, level = "error")]
     /// Writes a group of records wrapped in a [`SchemaBatch`] asynchronously.
     pub async fn write_schemas_async(&self, batch: &SchemaBatch) -> anyhow::Result<()> {
         tokio::task::block_in_place(|| {
-            with_error_logging(|| self.write_schemas_inner(batch), "write_schemas_async")
+            with_error_logging(
+                || self.write_schemas_inner(batch, true),
+                "write_schemas_async",
+            )
         })
     }
 
