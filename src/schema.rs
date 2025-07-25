@@ -20,6 +20,8 @@ pub trait Schema: Debug + Send + Sync + 'static + Sized + Default {
     /// The column family name associated with this struct.
     /// Note: all schemas within the same SchemaDB must have distinct column family names.
     const COLUMN_FAMILY_NAME: ColumnFamilyName;
+    /// Whether this table should be cached at the application layer (i.e. above RocksDB).
+    const SHOULD_CACHE: bool;
 
     /// Type of the key.
     type Key: KeyCodec<Self>;
@@ -168,6 +170,7 @@ macro_rules! define_schema {
             type Value = $value_type;
 
             const COLUMN_FAMILY_NAME: $crate::schema::ColumnFamilyName = $cf_name;
+            const SHOULD_CACHE: bool = false;
         }
     };
 }
