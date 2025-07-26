@@ -18,12 +18,15 @@ use crate::{
     schema::{ColumnFamilyName, KeyCodec, KeyDecoder, KeyEncoder, ValueCodec},
     CodecError, Schema, SchemaBatch, DB,
 };
+
+#[derive(Debug)]
+struct Cache;
+
 #[derive(Debug, Default)]
 pub(crate) struct CommittedVersion;
 
 impl Schema for CommittedVersion {
     const COLUMN_FAMILY_NAME: ColumnFamilyName = "committed_version";
-    const SHOULD_CACHE: bool = false;
 
     type Key = EmptyKey;
     type Value = u64;
@@ -100,15 +103,16 @@ impl ValueCodec<CommittedVersion> for u64 {
 pub struct VersionedDB<S: SchemaWithVersion> {
     db: Arc<DB>,
     oldest_available_version: Arc<AtomicU64>,
-    _schema: S,
+    cache: Arc<Cache>,
+    schema: S,
 }
 
 impl<S: SchemaWithVersion> VersionedDB<S> {
     pub fn get_oldest_available_version(&self, ordering: Ordering) -> u64 {
         self.oldest_available_version.load(ordering)
     }
-    pub fn get_committed_version(&self) -> Option<u64> {
-        self.db.get_committed_version()
+    pub fn get_committed_version(&self, ordering: Ordering) -> Option<u64> {
+        self.db.get_committed_version(ordering)
     }
 }
 
@@ -261,7 +265,8 @@ where
         let oldest_available_version = Self::get_next_version_to_prune_from_db(db.as_ref())?;
         Ok(Self {
             db,
-            _schema: Default::default(),
+            cache: Arc::new(Cache),
+            schema: Default::default(),
             oldest_available_version: Arc::new(AtomicU64::new(oldest_available_version)),
         })
     }
@@ -304,8 +309,9 @@ where
         batch: &VersionedSchemaBatch<V>,
         output_batch: &mut SchemaBatch,
     ) -> anyhow::Result<()> {
-        let version = self.db
-            .get_committed_version()
+        let version = self
+            .db
+            .get_committed_version(Ordering::Acquire)
             .and_then(|v| v.checked_add(1))
             .unwrap_or(0);
         for (key, value) in batch.versioned_table_writes.iter() {
@@ -423,7 +429,7 @@ where
         // If the DB mutated underneath us such that the live version is now newer than this snapshot's versino, we need to fetch from the historical table. This is much slower than fetching from the live table, but it should be a rare case.
         // Note that the data that was committed could come from a different fork even if it's at the same height as our snapshot. This is intentionally allowed for compatibiltiy with pre-existing
         // behavior of the system.
-        let loaded_version = self.db.get_committed_version();
+        let loaded_version = self.db.get_committed_version(Ordering::Acquire);
         if loaded_version.is_some_and(|v| v > latest_version) {
             tracing::debug!(?loaded_version, "DB is out of date, fetching 'live' values from historical table. Using latest version {:?}", latest_version);
             // The data from the base version is guaranteed to match our data - but data from the latest version could be from a different fork that was committed
@@ -432,7 +438,7 @@ where
 
         let live_value = self.db.get_live_value(key.borrow())?;
         // If the DB has no committed version or if its latest version is less than the latest version we know about, then it hasn't changed underneath us in a way that would invalidate the read.
-        let loaded_version = self.db.get_committed_version();
+        let loaded_version = self.db.get_committed_version(Ordering::Acquire);
         if loaded_version.is_some_and(|v| v > latest_version) {
             // Coherency - check that the DB is still in date before returning the value. If not, we need to retry from the historical table.
             tracing::debug!(
