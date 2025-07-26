@@ -54,6 +54,10 @@ pub use crate::schema::Schema;
 use crate::schema::{ColumnFamilyName, KeyCodec, ValueCodec};
 pub use crate::schema_batch::SchemaBatch;
 use crate::{iterator::RawDbIter, schema::KeyEncoder};
+use std::sync::atomic::AtomicBool;
+
+/// foo
+pub static LOG_ACCESS_DURATIONS: AtomicBool = AtomicBool::new(false);
 
 /// This DB is a schematized RocksDB wrapper where all data passed in and out are typed according to
 /// [`Schema`]s.
@@ -228,18 +232,27 @@ impl DB {
                     .with_label_values(&[S::COLUMN_FAMILY_NAME])
                     .start_timer();
 
+                let start = std::time::Instant::now();
+               
                 let k = schema_key.encode_key()?;
                 let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
 
-                let result = self.inner.get_pinned_cf(cf_handle, k)?;
+                let result = self.inner.get_pinned_cf(cf_handle, &k)?;
                 SCHEMADB_GET_BYTES
                     .with_label_values(&[S::COLUMN_FAMILY_NAME])
                     .observe(result.as_ref().map_or(0.0, |v| v.len() as f64));
 
-                result
+                let result = result
                     .map(|raw_value| <S::Value as ValueCodec<S>>::decode_value(&raw_value))
                     .transpose()
-                    .map_err(|err| err.into())
+                    .map_err(|err| err.into());
+
+                let elapsed = start.elapsed();
+                if LOG_ACCESS_DURATIONS.load(Ordering::Relaxed) {
+                    tracing::debug!("time to get from cf: {}, key:{}: {:?}", S::COLUMN_FAMILY_NAME, String::from_utf8_lossy(&k), elapsed);
+                }
+
+                result
             },
             "get",
         )
