@@ -103,12 +103,14 @@ pub struct VersionedDB<S: SchemaWithVersion> {
     _schema: S,
 }
 
-impl<S: SchemaWithVersion> VersionedDB<S> {
+impl<S: SchemaWithVersion> VersionedDB<S>
+// This where clause shouldn't be needed since it's implied by the Schema trait, but Rust intentionally doesn't elaborate these bounds.
+where EmptyKey: KeyEncoder<S::CommittedVersionColumn> {
     pub fn get_oldest_available_version(&self, ordering: Ordering) -> u64 {
         self.oldest_available_version.load(ordering)
     }
-    pub fn get_committed_version(&self) -> Option<u64> {
-        self.db.get_committed_version()
+    pub fn get_committed_version(&self) -> anyhow::Result<Option<u64>> {
+        self.db.get::<S::CommittedVersionColumn>(&EmptyKey)
     }
 }
 
@@ -302,12 +304,8 @@ where
         &self,
         batch: &VersionedSchemaBatch<V>,
         output_batch: &mut SchemaBatch,
+        version: u64,
     ) -> anyhow::Result<()> {
-        let version = self
-            .db
-            .get_committed_version()
-            .and_then(|v| v.checked_add(1))
-            .unwrap_or(0);
         for (key, value) in batch.versioned_table_writes.iter() {
             // Write to the Live keys table
             if let Some(value) = value {
@@ -422,7 +420,7 @@ where
         // If the DB mutated underneath us such that the live version is now newer than this snapshot's versino, we need to fetch from the historical table. This is much slower than fetching from the live table, but it should be a rare case.
         // Note that the data that was committed could come from a different fork even if it's at the same height as our snapshot. This is intentionally allowed for compatibiltiy with pre-existing
         // behavior of the system.
-        let loaded_version = self.db.get_committed_version();
+        let loaded_version = self.db.get_committed_version()?;
         if loaded_version.is_some_and(|v| v > latest_version) {
             tracing::debug!(?loaded_version, "DB is out of date, fetching 'live' values from historical table. Using latest version {:?}", latest_version);
             // The data from the base version is guaranteed to match our data - but data from the latest version could be from a different fork that was committed
@@ -431,7 +429,7 @@ where
 
         let live_value = self.db.get_live_value(key.borrow())?;
         // If the DB has no committed version or if its latest version is less than the latest version we know about, then it hasn't changed underneath us in a way that would invalidate the read.
-        let loaded_version = self.db.get_committed_version();
+        let loaded_version = self.db.get_committed_version()?;
         if loaded_version.is_some_and(|v| v > latest_version) {
             // Coherency - check that the DB is still in date before returning the value. If not, we need to retry from the historical table.
             tracing::debug!(

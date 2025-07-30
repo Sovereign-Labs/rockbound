@@ -80,19 +80,9 @@ pub struct DB {
     name: &'static str, // for logging
     // We use an RwLock to ensure consistency between the cache and the DB. Writes to the DB also grab the write lock.
     // on the cache.
-    inner: RwLock<DbInner>,
+    cache: RwLock<Cache<(ColumnFamilyName, SchemaKey), Option<SchemaValue>, BasicWeighter>>,
     // All iteration circumvents the lock on the DB. This is fine, since we enforce that iterable column families are not cachable.
-    db_for_iteration: Arc<rocksdb::DB>,
-}
-
-#[derive(Debug)]
-struct DbInner {
-    next_version_to_commit: Option<u64>,
-    inner: Arc<rocksdb::DB>,
-    // On write-schemas, soft replace each cache key.
-    // On read, with cache miss (from cached cf), read
-    // We use the `sync` cache even though it's inside an `RwLock` because we want to insert into the cache on "read" operations
-    cache: Cache<(ColumnFamilyName, SchemaKey), Option<SchemaValue>, BasicWeighter>,
+    db: Arc<rocksdb::DB>,
 }
 
 /// Returns the default column family descriptor. Includes LZ4 compression.
@@ -216,38 +206,11 @@ impl DB {
     // That gives estimated item capacity of 1GB / (80 + 400 + 56) * 1.5 ~= 1.2M.
     fn log_construct(name: &'static str, inner: rocksdb::DB) -> DB {
         info!(rocksdb_name = name, path = %inner.path().display(), "Opened RocksDB");
-        let inner = Arc::new(inner);
         DB {
             name,
-            inner: RwLock::new(DbInner {
-                next_version_to_commit: None,
-                inner: inner.clone(),
-                cache: Cache::with_weighter(1_200_000, 1_000_000_000, BasicWeighter),
-            }),
-            db_for_iteration: inner.clone(),
-            // cached_column_families: vec![],
+            cache: RwLock::new(Cache::with_weighter(1_200_000, 1_000_000_000, BasicWeighter)),
+            db: Arc::new(inner)
         }
-    }
-
-    /// Returns the committed version of the DB. Panics if the DB is not initialized with versioning support.
-    pub fn get_committed_version(&self) -> Option<u64> {
-        self.inner
-            .read()
-            .next_version_to_commit
-            .expect(
-                "Loading the committed version from a DB which is not versioned. This is a bug.",
-            )
-            .checked_sub(1)
-    }
-
-    /// Returns true if the DB supports versioning. If enabled, the DB will auto-increment its version number on each call to `write_schemas`.
-    pub fn supports_versioning(&self) -> bool {
-        self.inner.read().next_version_to_commit.is_some()
-    }
-
-    /// Initialize the next version to commit
-    pub fn initialize_next_version_to_commit(&mut self, next_version: u64) {
-        self.inner.get_mut().next_version_to_commit = Some(next_version);
     }
 
     /// Name of the database that can be used for logging or metrics or tracing.
@@ -271,31 +234,45 @@ impl DB {
                 let k = schema_key.encode_key()?;
                 let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
 
-                let inner = self.inner.read();
+                // Only grab the read lock if we're accessing a cached column family.
                 if S::SHOULD_CACHE {
-                    let cache_result = inner.cache.get(&Pair(S::COLUMN_FAMILY_NAME, &k));
-                    if let Some(result) = cache_result {
-                        return result
-                            .map(|v| <S::Value as ValueCodec<S>>::decode_value(&v))
-                            .transpose()
-                            .map_err(|err| err.into());
+                    // If the cache is locked for writing, just fall back to the DB. It provides consistency without locking
+                    if let Some(cache) = self.cache.try_read() {
+                        let cache_result = cache.get(&Pair(S::COLUMN_FAMILY_NAME, &k));
+                        if let Some(result) = cache_result {
+                            return result
+                                .map(|v| <S::Value as ValueCodec<S>>::decode_value(&v))
+                                .transpose()
+                                .map_err(|err| err.into());
+                        }
                     }
-                }
-                let result = inner.inner.get_pinned_cf(cf_handle, &k)?;
-                if S::SHOULD_CACHE {
-                    inner.cache.insert(
-                        (S::COLUMN_FAMILY_NAME, k),
-                        result.as_ref().map(|v| v.to_vec()),
-                    );
-                }
+
+                    let result = self.db.get_pinned_cf(cf_handle, &k)?;
+                    // If the cache is locked for writing, don't try to put the value, just return
+                    if let Some(cache) = self.cache.try_read() {
+                        // Note: We have to deserialize the value while holding the read lock because the lifetime of the borrow is tied to `inner`. 
+                        // This prevents us from unifying the two branches.
+                        // Note: We don't count bytes read from the cache
+                        cache.insert(
+                            (S::COLUMN_FAMILY_NAME, k),
+                            result.as_ref().map(|v| v.to_vec()),
+                        );
+                    }
+                    return result
+                        .map(|raw_value| <S::Value as ValueCodec<S>>::decode_value(&raw_value))
+                        .transpose()
+                        .map_err(|err| err.into())
+                } 
+                
+                let result = self.db.get_pinned_cf(cf_handle, &k)?;
                 SCHEMADB_GET_BYTES
                     .with_label_values(&[S::COLUMN_FAMILY_NAME])
                     .observe(result.as_ref().map_or(0.0, |v| v.len() as f64));
-
                 result
                     .map(|raw_value| <S::Value as ValueCodec<S>>::decode_value(&raw_value))
                     .transpose()
                     .map_err(|err| err.into())
+                
             },
             "get",
         )
@@ -323,7 +300,7 @@ impl DB {
             || {
                 let mut batch = SchemaBatch::new();
                 batch.put::<S>(key, value)?;
-                self.write_schemas_inner(batch, true)
+                self.write_schemas_inner(batch)
             },
             "put",
         )
@@ -348,7 +325,7 @@ impl DB {
             || {
                 let mut batch = SchemaBatch::new();
                 batch.delete::<S>(key)?;
-                self.write_schemas_inner(batch, true)
+                self.write_schemas_inner(batch)
             },
             "delete",
         )
@@ -380,9 +357,7 @@ impl DB {
                     !S::SHOULD_CACHE,
                     "Range deletes are incompatible with caching!"
                 );
-                self.inner
-                    .write()
-                    .inner
+                self.db
                     .delete_range_cf(cf_handle, from, to)?;
                 Ok(())
             },
@@ -412,7 +387,7 @@ impl DB {
         assert!(!S::SHOULD_CACHE, "Caching is incompatible with iterators!");
         let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
         Ok(SchemaIterator::new(
-            self.db_for_iteration.raw_iterator_cf_opt(cf_handle, opts),
+            self.db.raw_iterator_cf_opt(cf_handle, opts),
             direction,
         ))
     }
@@ -448,7 +423,7 @@ impl DB {
         assert!(!S::SHOULD_CACHE, "Caching is incompatible with iterators!");
         let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
         Ok(RawDbIter::new(
-            &self.db_for_iteration,
+            &self.db,
             cf_handle,
             ..,
             direction,
@@ -468,7 +443,7 @@ impl DB {
         }
         let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
         Ok(RawDbIter::new(
-            &self.db_for_iteration,
+            &self.db,
             cf_handle,
             range,
             direction,
@@ -483,16 +458,13 @@ impl DB {
         self.iter_with_direction::<S>(opts, ScanDirection::Forward)
     }
 
-    fn write_schemas_inner(&self, batch: SchemaBatch, bump_version: bool) -> anyhow::Result<()> {
+    fn write_schemas_inner(&self, batch: SchemaBatch) -> anyhow::Result<()> {
         let _timer = SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS
             .with_label_values(&[self.name])
             .start_timer();
         // Update the next version to commit if relevant.
         // Block any readers while the DB isn't fully consistent
-        let mut inner = self.inner.write();
-        if bump_version {
-            inner.next_version_to_commit = inner.next_version_to_commit.map(|v| v + 1);
-        }
+        let cache = self.cache.write();
 
         let mut db_batch = rocksdb::WriteBatch::default();
         let mut columns_written = Vec::with_capacity(batch.last_writes.len());
@@ -505,12 +477,12 @@ impl DB {
                     Operation::Put { value } => {
                         write_sizes.push(key.len() + value.len());
                         db_batch.put_cf(cf_handle, &key, &value);
-                        let _ = inner.cache.replace((cf_name, key), Some(value), true);
+                        let _ = cache.replace((cf_name, key), Some(value), true);
                         // uses "soft=true" to avoid changing heat of the key
                     }
                     Operation::Delete => {
                         db_batch.delete_cf(cf_handle, &key);
-                        let _ = inner.cache.replace((cf_name, key), None, true); // uses "soft=true" to avoid changing heat of the key
+                        let _ = cache.replace((cf_name, key), None, true); // uses "soft=true" to avoid changing heat of the key
                         deletes_for_cf += 1;
                     }
                     Operation::DeleteRange { .. } => {
@@ -537,10 +509,11 @@ impl DB {
         let serialized_size = db_batch.size_in_bytes();
 
         with_error_logging(
-            || inner.inner.write_opt(db_batch, &default_write_options()),
+            || self.db.write_opt(db_batch, &default_write_options()),
             "write_schemas::write_opt",
         )?;
-        drop(inner);
+        // Drop the write lock on the cache.
+        drop(cache);
 
         // Bump counters only after DB write succeeds.
         for (cf_name, bytes, deletes) in columns_written {
@@ -570,16 +543,7 @@ impl DB {
     #[tracing::instrument(skip_all, level = "error")]
     /// Writes a group of records wrapped in a [`SchemaBatch`].
     pub fn write_schemas(&self, batch: SchemaBatch) -> anyhow::Result<()> {
-        with_error_logging(|| self.write_schemas_inner(batch, true), "write_schemas")
-    }
-
-    #[tracing::instrument(skip_all, level = "error")]
-    /// Writes a group of records wrapped in a [`SchemaBatch`].
-    pub fn write_schemas_without_version_bump(&self, batch: SchemaBatch) -> anyhow::Result<()> {
-        with_error_logging(
-            || self.write_schemas_inner(batch, false),
-            "write_schemas_without_versioning",
-        )
+        with_error_logging(|| self.write_schemas_inner(batch), "write_schemas")
     }
 
     #[tracing::instrument(skip_all, level = "error")]
@@ -587,7 +551,7 @@ impl DB {
     pub async fn write_schemas_async(&self, batch: SchemaBatch) -> anyhow::Result<()> {
         tokio::task::block_in_place(|| {
             with_error_logging(
-                || self.write_schemas_inner(batch, true),
+                || self.write_schemas_inner(batch),
                 "write_schemas_async",
             )
         })
@@ -596,7 +560,7 @@ impl DB {
     fn get_cf_handle(&self, cf_name: &str) -> anyhow::Result<&rocksdb::ColumnFamily> {
         with_error_logging(
             || {
-                self.db_for_iteration.cf_handle(cf_name).ok_or_else(|| {
+                self.db.cf_handle(cf_name).ok_or_else(|| {
                     format_err!(
                         "DB::cf_handle not found for column family name: {}",
                         cf_name
@@ -613,7 +577,7 @@ impl DB {
     pub fn flush_cf(&self, cf_name: &str) -> anyhow::Result<()> {
         let handle = self.get_cf_handle(cf_name)?;
         // This has no effect on cache state, so it's safe to call without the lock.
-        with_error_logging(|| self.db_for_iteration.flush_cf(handle), "flush_cf")
+        with_error_logging(|| self.db.flush_cf(handle), "flush_cf")
     }
 
     /// Trigger compaction. Primarily used for testing.
@@ -621,7 +585,7 @@ impl DB {
     pub fn trigger_compaction<S: Schema>(&self) -> anyhow::Result<()> {
         let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
         // This has no effect on cache state, so it's safe to call without the lock.
-        self.db_for_iteration
+        self.db
             .compact_range_cf::<&[u8], &[u8]>(&cf_handle, None, None);
         Ok(())
     }
@@ -633,7 +597,7 @@ impl DB {
         with_error_logging(
             || {
                 // This has no effect on cache state, so it's safe to call without the lock.
-                self.db_for_iteration
+                self.db
                     .property_int_value_cf(self.get_cf_handle(cf_name)?, property_name)?
                     .ok_or_else(|| {
                         format_err!(
@@ -653,7 +617,7 @@ impl DB {
         // This has no effect on cache state, so it's safe to call without the lock.
         with_error_logging(
             || {
-                rocksdb::checkpoint::Checkpoint::new(&self.db_for_iteration)?
+                rocksdb::checkpoint::Checkpoint::new(&self.db)?
                     .create_checkpoint(path)
             },
             "create_checkpoint",
@@ -669,20 +633,20 @@ impl DB {
     /// Sets the cache size for the DB.
     #[cfg(feature = "test-utils")]
     pub fn set_cache_size(&self, estimated_size: usize, weight_capacity: u64) {
-        self.inner.write().cache =
+        *self.cache.write() =
             Cache::with_weighter(estimated_size, weight_capacity, BasicWeighter);
     }
 
     /// Returns the number of cache hits.
     #[cfg(feature = "test-utils")]
     pub fn cache_hits(&self) -> u64 {
-        self.inner.read().cache.hits()
+        self.cache.read().hits()
     }
 
     /// Returns the number of cache misses.
     #[cfg(feature = "test-utils")]
     pub fn cache_misses(&self) -> u64 {
-        self.inner.read().cache.misses()
+        self.cache.read().misses()
     }
 }
 
