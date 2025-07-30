@@ -671,7 +671,7 @@ impl DB {
     #[cfg(feature = "test-utils")]
     pub fn set_cache_size(&self, estimated_size: usize, weight_capacity: u64) {
         self.inner.write().cache =
-            Cache::with_weighter(estimated_size, weight_capacity as u64, BasicWeighter);
+            Cache::with_weighter(estimated_size, weight_capacity, BasicWeighter);
     }
 
     /// Returns the number of cache hits.
