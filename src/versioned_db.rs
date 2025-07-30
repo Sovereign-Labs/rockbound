@@ -120,7 +120,7 @@ where
 
 #[derive(Debug)]
 /// A key suffixed with a version number
-pub struct VersionedKey<S: SchemaWithVersion, T>(T, pub u64, PhantomData<S>);
+pub struct VersionedKey<S: SchemaWithVersion, T>(pub T, pub u64, PhantomData<S>);
 impl<S: SchemaWithVersion, T> VersionedKey<S, T> {
     /// Creates a new versioned key.
     pub fn new(key: T, version: u64) -> Self {
