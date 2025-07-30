@@ -307,8 +307,7 @@ where
 
     /// Returns the next version to prune from the database.
     pub fn get_next_version_to_prune_from_db(db: &DB) -> anyhow::Result<u64> {
-        // TODO: Ensure that each version to prune is non-empty. Otherwise, this check may return a newer version
-        let mut iterator = db.raw_iter_range::<V::CommittedVersionColumn>(
+        let mut iterator = db.raw_iter_range::<V::PruningColumnFamily>(
             0u64.to_be_bytes().to_vec()..,
             ScanDirection::Forward,
         )?;
