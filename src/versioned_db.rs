@@ -1,4 +1,3 @@
-#![allow(missing_docs)]
 use std::{
     borrow::Borrow,
     collections::HashMap,
@@ -29,6 +28,7 @@ impl Schema for CommittedVersion {
     type Value = u64;
 }
 
+/// A singleton key. Encodes to the empty vec.
 #[derive(Debug, PartialEq)]
 pub struct EmptyKey;
 
@@ -106,17 +106,21 @@ pub struct VersionedDB<S: SchemaWithVersion> {
 impl<S: SchemaWithVersion> VersionedDB<S>
 // This where clause shouldn't be needed since it's implied by the Schema trait, but Rust intentionally doesn't elaborate these bounds.
 where EmptyKey: KeyEncoder<S::CommittedVersionColumn> {
+    /// Returns the oldest version that is available in the database.
     pub fn get_oldest_available_version(&self, ordering: Ordering) -> u64 {
         self.oldest_available_version.load(ordering)
     }
+    /// Returns the latest committed version in the database.
     pub fn get_committed_version(&self) -> anyhow::Result<Option<u64>> {
         self.db.get::<S::CommittedVersionColumn>(&EmptyKey)
     }
 }
 
 #[derive(Debug)]
+/// A key suffixed with a version number
 pub struct VersionedKey<S: SchemaWithVersion, T>(T, u64, PhantomData<S>);
 impl<S: SchemaWithVersion, T> VersionedKey<S, T> {
+    /// Creates a new versioned key.
     pub fn new(key: T, version: u64) -> Self {
         Self(key, version, PhantomData)
     }
@@ -148,9 +152,11 @@ impl<S: SchemaWithVersion> KeyDecoder<S::HistoricalColumnFamily> for VersionedKe
     }
 }
 
+/// A key *prefixed* with a version number for easy iteration by version.
 #[derive(Debug)]
 pub struct PrunableKey<S: SchemaWithVersion, T>(u64, T, PhantomData<S>);
 impl<S: SchemaWithVersion, T> PrunableKey<S, T> {
+    /// Creates a new prunable key.
     pub fn new(version: u64, key: T) -> Self {
         Self(version, key, PhantomData)
     }
@@ -181,8 +187,15 @@ impl<S: SchemaWithVersion> KeyDecoder<S::PruningColumnFamily> for PrunableKey<S,
         Ok(Self::new(version, key))
     }
 }
+impl<S: SchemaWithVersion, T> PrunableKey<S, T> {
+    /// Converts a prunable key into a versioned key.
+    pub fn into_versioned_key(self) -> VersionedKey<S, T> {
+        VersionedKey::new(self.1, self.0)
+    }
+}
 
 #[derive(Debug, Clone, Default)]
+/// A batch of writes to a versioned schema.
 pub struct VersionedSchemaBatch<S: Schema> {
     versioned_table_writes: HashMap<S::Key, Option<S::Value>>,
 }
@@ -203,10 +216,12 @@ impl<S: Schema> VersionedSchemaBatch<S>
 where
     S::Key: Eq + std::hash::Hash,
 {
+    /// Puts a key-value pair into the batch.
     pub fn put_versioned(&mut self, key: S::Key, value: S::Value) {
         self.versioned_table_writes.insert(key, Some(value));
     }
 
+    /// Deletes a key from the batch.
     pub fn delete_versioned(&mut self, key: S::Key) {
         self.versioned_table_writes.insert(key, None);
     }
@@ -223,8 +238,11 @@ fn live_versioned_column_family_descriptor(name: &str) -> ColumnFamilyDescriptor
 /// A specialized schema for values which have one "live" version and wish to automatically store a
 /// (possibly truncated) history of all versions over time.
 pub trait SchemaWithVersion: Schema {
+    /// A column family for storing the historical values of the schema.
     type HistoricalColumnFamily: Schema<Key = VersionedKey<Self, Self::Key>, Value = Self::Value>;
+    /// A column family for storing the pruning keys of the schema.
     type PruningColumnFamily: Schema<Key = PrunableKey<Self, Self::Key>, Value = ()>;
+    /// A column family for storing the committed version of the schema.
     type CommittedVersionColumn: Schema<Key = EmptyKey, Value = u64>;
 }
 
@@ -235,6 +253,7 @@ where
     V::Value: ValueCodec<V::HistoricalColumnFamily>,
     u64: ValueCodec<V::CommittedVersionColumn>,
 {
+    /// Adds the column families for the versioned schema to the existing column families.
     pub fn add_column_families(
         existing_column_families: &mut Vec<ColumnFamilyDescriptor>,
     ) -> anyhow::Result<()> {
@@ -258,6 +277,7 @@ where
         Ok(())
     }
 
+    /// Creates a new versioned DB from an existing DB.
     pub fn from_db(db: Arc<DB>) -> anyhow::Result<Self> {
         let oldest_available_version = Self::get_next_version_to_prune_from_db(db.as_ref())?;
         Ok(Self {
@@ -267,6 +287,16 @@ where
         })
     }
 
+    /// Returns an iterator over the pruning keys up to a given version.
+    pub fn iter_pruning_keys_up_to_version(&self, version: u64) -> anyhow::Result<impl Iterator<Item = Result<<V::PruningColumnFamily as Schema>::Key, CodecError>>  + use<'_, V>> {
+        // Because some keys are longer than 8 bytes, we use an exclusive range 
+        let first_version_to_keep = version.saturating_add(1);
+        let range = 0u64.to_be_bytes().to_vec()..first_version_to_keep.to_be_bytes().to_vec();
+        let iterator = self.db.raw_iter_range::<V::PruningColumnFamily>(range, ScanDirection::Forward)?;
+        Ok(iterator.map(|(key, _value)| <V::PruningColumnFamily as Schema>::Key::decode_key(&key)))
+    }
+
+    /// Returns the next version to prune from the database.
     pub fn get_next_version_to_prune_from_db(db: &DB) -> anyhow::Result<u64> {
         // TODO: Ensure that each version to prune is non-empty. Otherwise, this check may return a newer version
         let mut iterator = db.raw_iter_range::<V::CommittedVersionColumn>(
@@ -292,14 +322,17 @@ where
         self.db.name()
     }
 
+    /// Returns the value of a key in the live column family.
     pub fn get_live_value(&self, key: &impl KeyEncoder<V>) -> anyhow::Result<Option<V::Value>> {
         self.db.get::<V>(key)
     }
 
+    /// Returns the latest committed version in the database.
     pub fn load_latest_committed_version(&self) -> anyhow::Result<Option<u64>> {
         self.db.get::<V::CommittedVersionColumn>(&EmptyKey)
     }
 
+    /// Materializes a batch of writes to the database.
     pub fn materialize(
         &self,
         batch: &VersionedSchemaBatch<V>,
@@ -331,6 +364,7 @@ where
         Ok(())
     }
 
+    /// Returns the value of a key in the historical column family as of the given version.
     pub fn get_historical_value(
         &self,
         key_to_get: &impl KeyEncoder<V>,
@@ -358,6 +392,7 @@ where
 }
 
 #[derive(Debug, Clone)]
+/// A reader for a versioned schema. 
 pub struct VersionedDeltaReader<V: SchemaWithVersion> {
     db: VersionedDB<V>,
     // The version of the underlying DB at the time this snapshot was taken.
@@ -374,6 +409,7 @@ where
     V::Value: ValueCodec<V::HistoricalColumnFamily>,
     u64: ValueCodec<V::CommittedVersionColumn>,
 {
+    /// Creates a new versioned delta reader.
     pub fn new(
         db: VersionedDB<V>,
         base_version: Option<u64>,
@@ -386,6 +422,7 @@ where
         }
     }
 
+    /// Returns the latest version that is available in the reader.
     pub fn latest_version(&self) -> Option<u64> {
         match self.base_version {
             Some(base_version) => Some(base_version + self.snapshots.len() as u64),
@@ -393,6 +430,7 @@ where
         }
     }
 
+    /// Returns the version of the DB at the time this reader was created.
     pub fn base_version(&self) -> Option<u64> {
         self.base_version
     }
@@ -407,6 +445,7 @@ where
     V::Value: ValueCodec<V::HistoricalColumnFamily>,
     u64: ValueCodec<V::CommittedVersionColumn>,
 {
+    /// Returns the latest value of a key in the reader.
     pub fn get_latest_borrowed(&self, key: impl Borrow<K>) -> anyhow::Result<Option<V::Value>> {
         for snapshot in self.snapshots.iter().rev() {
             if let Some(value) = snapshot.versioned_table_writes.get(key.borrow()) {
@@ -441,7 +480,7 @@ where
             Ok(live_value)
         }
     }
-
+    /// Returns the value of a key in the historical column family as of the given version.
     pub fn get_historical_borrowed(
         &self,
         key: impl Borrow<K>,
