@@ -46,7 +46,7 @@ impl KeyEncoder<CommittedVersion> for EmptyKey {
 
 impl KeyDecoder<CommittedVersion> for EmptyKey {
     fn decode_key(_data: &[u8]) -> Result<Self, CodecError> {
-        if _data.len() != 0 {
+        if !_data.is_empty() {
             return Err(CodecError::InvalidKeyLength {
                 expected: 0,
                 got: _data.len(),
@@ -304,7 +304,8 @@ where
         batch: &VersionedSchemaBatch<V>,
         output_batch: &mut SchemaBatch,
     ) -> anyhow::Result<()> {
-        let version = self.db
+        let version = self
+            .db
             .get_committed_version()
             .and_then(|v| v.checked_add(1))
             .unwrap_or(0);
@@ -413,7 +414,7 @@ where
     pub fn get_latest_borrowed(&self, key: impl Borrow<K>) -> anyhow::Result<Option<V::Value>> {
         for snapshot in self.snapshots.iter().rev() {
             if let Some(value) = snapshot.versioned_table_writes.get(key.borrow()) {
-                return Ok(value.as_ref().map(|value| value.clone()));
+                return Ok(value.clone());
             }
         }
         // The live value for any key is None if the DB is empty.
@@ -439,9 +440,9 @@ where
                 ?loaded_version, "DB became out of date during a read. Fetching 'live' values from historical table. Using latest version {:?}",
                 latest_version
             );
-            return self.get_historical_borrowed(key, latest_version);
+            self.get_historical_borrowed(key, latest_version)
         } else {
-            return Ok(live_value);
+            Ok(live_value)
         }
     }
 
@@ -470,20 +471,20 @@ where
                 continue;
             }
             if let Some(value) = snapshot.versioned_table_writes.get(key.borrow()) {
-                return Ok(value.as_ref().map(|value| value.clone()));
+                return Ok(value.clone());
             }
             version_of_current_snapshot -= 1;
         }
         let historical_value = self.db.get_historical_value(key.borrow(), version)?;
         let oldest_available_version = self.db.get_oldest_available_version(Ordering::Acquire);
         if version < oldest_available_version {
-            return Err(anyhow::anyhow!(
+            Err(anyhow::anyhow!(
                 "Requested version {} is older than the oldest available version {}",
                 version,
                 oldest_available_version
-            ));
+            ))
         } else {
-            return Ok(historical_value);
+            Ok(historical_value)
         }
     }
 }
