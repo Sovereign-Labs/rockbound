@@ -206,9 +206,9 @@ fn test_batch_operations_cache_consistency() {
     );
 }
 
-/// This test ensures two things: 
-/// 1. When a write happens, no stale entry is left behind in the cache. 
-/// 2. Batches are applied atomically regardless of whether the keys are in the cache or not. 
+/// This test ensures two things:
+/// 1. When a write happens, no stale entry is left behind in the cache.
+/// 2. Batches are applied atomically regardless of whether the keys are in the cache or not.
 ///
 /// We test this by setting a very small cache (so that some of the working set is in cache and some is not),
 /// and spinning up one writer and several readers. The writer repeatedly performs an atomic increment of all keys, while the readers
@@ -219,7 +219,6 @@ fn test_cache_behavior_under_concurrency() {
     let num_generations = 20;
     let num_keys = 10000;
     let num_readers = 10;
-
 
     let barrier = Arc::new(Barrier::new(num_readers + 1));
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -261,7 +260,10 @@ fn test_cache_behavior_under_concurrency() {
                     }
                 }
             }
-            assert!(hit_nones > 1000, "Very deleted keys were encountered. This means the test logic is probably buggy");
+            assert!(
+                hit_nones > 1000,
+                "Very deleted keys were encountered. This means the test logic is probably buggy"
+            );
         });
         handles.push(handle);
     }
@@ -271,11 +273,11 @@ fn test_cache_behavior_under_concurrency() {
     let writer = thread::spawn(move || {
         // Pre-populate the db before starting the readers
         let mut batch = SchemaBatch::new();
-            for key in 0..num_keys {
-                let key = TestField(key as u32);
-                let value = TestField(0);
-                batch.put::<CachedTestSchema>(&key, &value).unwrap();
-            }
+        for key in 0..num_keys {
+            let key = TestField(key as u32);
+            let value = TestField(0);
+            batch.put::<CachedTestSchema>(&key, &value).unwrap();
+        }
         db.write_schemas(batch).unwrap();
         barrier.wait();
         for generation in 1..num_generations {
@@ -309,6 +311,14 @@ fn test_cache_behavior_under_concurrency() {
     }
 
     //  Sanity check that the cache was used and that we didn't set it so large that misses were very rare
-    assert!(db_clone.cache_hits() > num_keys, "Cache was not used. Hits: {}, Misses: {}", db_clone.cache_hits(), db_clone.cache_misses());
-    assert!(db_clone.cache_misses() > db_clone.cache_hits(), "Cache misses should be greater than cache hits. Cache size is too large");
+    assert!(
+        db_clone.cache_hits() > num_keys,
+        "Cache was not used. Hits: {}, Misses: {}",
+        db_clone.cache_hits(),
+        db_clone.cache_misses()
+    );
+    assert!(
+        db_clone.cache_misses() > db_clone.cache_hits(),
+        "Cache misses should be greater than cache hits. Cache size is too large"
+    );
 }

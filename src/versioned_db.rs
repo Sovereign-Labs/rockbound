@@ -233,7 +233,6 @@ where
     V::Value: ValueCodec<V::HistoricalColumnFamily>,
     u64: ValueCodec<V::CommittedVersionColumn>,
 {
-    // TODO: Optimize for point lookup on the live version
     pub fn add_column_families(
         existing_column_families: &mut Vec<ColumnFamilyDescriptor>,
     ) -> anyhow::Result<()> {
@@ -310,7 +309,6 @@ where
             .and_then(|v| v.checked_add(1))
             .unwrap_or(0);
         for (key, value) in batch.versioned_table_writes.iter() {
-            // TODO: Update cache here;
             // Write to the Live keys table
             if let Some(value) = value {
                 output_batch.put::<V>(key, value)?;
