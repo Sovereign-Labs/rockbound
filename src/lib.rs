@@ -83,7 +83,6 @@ pub struct DB {
     inner: RwLock<DbInner>,
     // All iteration circumvents the lock on the DB. This is fine, since we enforce that iterable column families are not cachable.
     db_for_iteration: Arc<rocksdb::DB>,
-    // cached_column_families: Vec<ColumnFamilyName>,
 }
 
 #[derive(Debug)]
