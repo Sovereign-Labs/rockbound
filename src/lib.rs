@@ -384,7 +384,7 @@ impl DB {
         opts: ReadOptions,
         direction: ScanDirection,
     ) -> anyhow::Result<SchemaIterator<S>> {
-        assert!(!S::SHOULD_CACHE, "Caching is incompatible with iterators!");
+        assert!(!S::SHOULD_CACHE, "Caching is incompatible with iterators! Cannot iterate over {}", S::COLUMN_FAMILY_NAME);
         let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
         Ok(SchemaIterator::new(
             self.db.raw_iterator_cf_opt(cf_handle, opts),
@@ -420,7 +420,7 @@ impl DB {
         &self,
         direction: ScanDirection,
     ) -> anyhow::Result<RawDbIter> {
-        assert!(!S::SHOULD_CACHE, "Caching is incompatible with iterators!");
+        assert!(!S::SHOULD_CACHE, "Caching is incompatible with iterators! Cannot iterate over {}", S::COLUMN_FAMILY_NAME);
         let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
         Ok(RawDbIter::new(
             &self.db,
@@ -436,7 +436,7 @@ impl DB {
         range: impl std::ops::RangeBounds<SchemaKey>,
         direction: ScanDirection,
     ) -> anyhow::Result<RawDbIter> {
-        assert!(!S::SHOULD_CACHE, "Caching is incompatible with iterators!");
+        assert!(!S::SHOULD_CACHE, "Caching is incompatible with iterators! Cannot iterate over {}", S::COLUMN_FAMILY_NAME);
         if is_range_bounds_inverse(&range) {
             tracing::error!("[Rockbound]: error in raw_iter_range: lower_bound > upper_bound");
             anyhow::bail!("[Rockbound]: error in raw_iter_range: lower_bound > upper_bound");
