@@ -74,6 +74,24 @@ impl std::ops::Deref for TestDB {
     }
 }
 
+#[cfg(feature = "test-utils")]
+impl TestDB {
+    /// Sets the cache size for the DB.
+    pub fn set_cache_size(&self, estimated_size: usize, weight_capacity: u64) {
+        self.db.set_cache_size(estimated_size, weight_capacity);
+    }
+
+    /// Returns the number of cache hits.
+    pub fn cache_hits(&self) -> u64 {
+        self.db.cache_hits()
+    }
+
+    /// Returns the number of cache misses.
+    pub fn cache_misses(&self) -> u64 {
+        self.db.cache_misses()
+    }
+}
+
 #[test]
 fn test_basic_cache_consistency() {
     let db = TestDB::new();
