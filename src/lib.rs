@@ -208,8 +208,12 @@ impl DB {
         info!(rocksdb_name = name, path = %inner.path().display(), "Opened RocksDB");
         DB {
             name,
-            cache: RwLock::new(Cache::with_weighter(1_200_000, 1_000_000_000, BasicWeighter)),
-            db: Arc::new(inner)
+            cache: RwLock::new(Cache::with_weighter(
+                1_200_000,
+                1_000_000_000,
+                BasicWeighter,
+            )),
+            db: Arc::new(inner),
         }
     }
 
@@ -250,7 +254,7 @@ impl DB {
                     let result = self.db.get_pinned_cf(cf_handle, &k)?;
                     // If the cache is locked for writing, don't try to put the value, just return
                     if let Some(cache) = self.cache.try_read() {
-                        // Note: We have to deserialize the value while holding the read lock because the lifetime of the borrow is tied to `inner`. 
+                        // Note: We have to deserialize the value while holding the read lock because the lifetime of the borrow is tied to `inner`.
                         // This prevents us from unifying the two branches.
                         // Note: We don't count bytes read from the cache
                         cache.insert(
@@ -261,9 +265,9 @@ impl DB {
                     return result
                         .map(|raw_value| <S::Value as ValueCodec<S>>::decode_value(&raw_value))
                         .transpose()
-                        .map_err(|err| err.into())
-                } 
-                
+                        .map_err(|err| err.into());
+                }
+
                 let result = self.db.get_pinned_cf(cf_handle, &k)?;
                 SCHEMADB_GET_BYTES
                     .with_label_values(&[S::COLUMN_FAMILY_NAME])
@@ -272,7 +276,6 @@ impl DB {
                     .map(|raw_value| <S::Value as ValueCodec<S>>::decode_value(&raw_value))
                     .transpose()
                     .map_err(|err| err.into())
-                
             },
             "get",
         )
@@ -357,8 +360,7 @@ impl DB {
                     !S::SHOULD_CACHE,
                     "Range deletes are incompatible with caching!"
                 );
-                self.db
-                    .delete_range_cf(cf_handle, from, to)?;
+                self.db.delete_range_cf(cf_handle, from, to)?;
                 Ok(())
             },
             "delete_range",
@@ -384,7 +386,11 @@ impl DB {
         opts: ReadOptions,
         direction: ScanDirection,
     ) -> anyhow::Result<SchemaIterator<S>> {
-        assert!(!S::SHOULD_CACHE, "Caching is incompatible with iterators! Cannot iterate over {}", S::COLUMN_FAMILY_NAME);
+        assert!(
+            !S::SHOULD_CACHE,
+            "Caching is incompatible with iterators! Cannot iterate over {}",
+            S::COLUMN_FAMILY_NAME
+        );
         let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
         Ok(SchemaIterator::new(
             self.db.raw_iterator_cf_opt(cf_handle, opts),
@@ -420,14 +426,13 @@ impl DB {
         &self,
         direction: ScanDirection,
     ) -> anyhow::Result<RawDbIter> {
-        assert!(!S::SHOULD_CACHE, "Caching is incompatible with iterators! Cannot iterate over {}", S::COLUMN_FAMILY_NAME);
+        assert!(
+            !S::SHOULD_CACHE,
+            "Caching is incompatible with iterators! Cannot iterate over {}",
+            S::COLUMN_FAMILY_NAME
+        );
         let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
-        Ok(RawDbIter::new(
-            &self.db,
-            cf_handle,
-            ..,
-            direction,
-        ))
+        Ok(RawDbIter::new(&self.db, cf_handle, .., direction))
     }
 
     /// Get a [`RawDbIter`] in given range and direction.
@@ -436,18 +441,17 @@ impl DB {
         range: impl std::ops::RangeBounds<SchemaKey>,
         direction: ScanDirection,
     ) -> anyhow::Result<RawDbIter> {
-        assert!(!S::SHOULD_CACHE, "Caching is incompatible with iterators! Cannot iterate over {}", S::COLUMN_FAMILY_NAME);
+        assert!(
+            !S::SHOULD_CACHE,
+            "Caching is incompatible with iterators! Cannot iterate over {}",
+            S::COLUMN_FAMILY_NAME
+        );
         if is_range_bounds_inverse(&range) {
             tracing::error!("[Rockbound]: error in raw_iter_range: lower_bound > upper_bound");
             anyhow::bail!("[Rockbound]: error in raw_iter_range: lower_bound > upper_bound");
         }
         let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
-        Ok(RawDbIter::new(
-            &self.db,
-            cf_handle,
-            range,
-            direction,
-        ))
+        Ok(RawDbIter::new(&self.db, cf_handle, range, direction))
     }
 
     /// Returns a forward [`SchemaIterator`] on a certain schema with the provided read options.
@@ -550,10 +554,7 @@ impl DB {
     /// Writes a group of records wrapped in a [`SchemaBatch`] asynchronously.
     pub async fn write_schemas_async(&self, batch: SchemaBatch) -> anyhow::Result<()> {
         tokio::task::block_in_place(|| {
-            with_error_logging(
-                || self.write_schemas_inner(batch),
-                "write_schemas_async",
-            )
+            with_error_logging(|| self.write_schemas_inner(batch), "write_schemas_async")
         })
     }
 
@@ -616,10 +617,7 @@ impl DB {
     pub fn create_checkpoint<P: AsRef<Path>>(&self, path: P) -> anyhow::Result<()> {
         // This has no effect on cache state, so it's safe to call without the lock.
         with_error_logging(
-            || {
-                rocksdb::checkpoint::Checkpoint::new(&self.db)?
-                    .create_checkpoint(path)
-            },
+            || rocksdb::checkpoint::Checkpoint::new(&self.db)?.create_checkpoint(path),
             "create_checkpoint",
         )
     }
@@ -633,8 +631,7 @@ impl DB {
     /// Sets the cache size for the DB.
     #[cfg(feature = "test-utils")]
     pub fn set_cache_size(&self, estimated_size: usize, weight_capacity: u64) {
-        *self.cache.write() =
-            Cache::with_weighter(estimated_size, weight_capacity, BasicWeighter);
+        *self.cache.write() = Cache::with_weighter(estimated_size, weight_capacity, BasicWeighter);
     }
 
     /// Returns the number of cache hits.

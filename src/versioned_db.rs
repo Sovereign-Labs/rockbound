@@ -105,7 +105,9 @@ pub struct VersionedDB<S: SchemaWithVersion> {
 
 impl<S: SchemaWithVersion> VersionedDB<S>
 // This where clause shouldn't be needed since it's implied by the Schema trait, but Rust intentionally doesn't elaborate these bounds.
-where EmptyKey: KeyEncoder<S::CommittedVersionColumn> {
+where
+    EmptyKey: KeyEncoder<S::CommittedVersionColumn>,
+{
     /// Returns the oldest version that is available in the database.
     pub fn get_oldest_available_version(&self, ordering: Ordering) -> u64 {
         self.oldest_available_version.load(ordering)
@@ -288,11 +290,18 @@ where
     }
 
     /// Returns an iterator over the pruning keys up to a given version.
-    pub fn iter_pruning_keys_up_to_version(&self, version: u64) -> anyhow::Result<impl Iterator<Item = Result<<V::PruningColumnFamily as Schema>::Key, CodecError>>  + use<'_, V>> {
-        // Because some keys are longer than 8 bytes, we use an exclusive range 
+    pub fn iter_pruning_keys_up_to_version(
+        &self,
+        version: u64,
+    ) -> anyhow::Result<
+        impl Iterator<Item = Result<<V::PruningColumnFamily as Schema>::Key, CodecError>> + use<'_, V>,
+    > {
+        // Because some keys are longer than 8 bytes, we use an exclusive range
         let first_version_to_keep = version.saturating_add(1);
         let range = 0u64.to_be_bytes().to_vec()..first_version_to_keep.to_be_bytes().to_vec();
-        let iterator = self.db.raw_iter_range::<V::PruningColumnFamily>(range, ScanDirection::Forward)?;
+        let iterator = self
+            .db
+            .raw_iter_range::<V::PruningColumnFamily>(range, ScanDirection::Forward)?;
         Ok(iterator.map(|(key, _value)| <V::PruningColumnFamily as Schema>::Key::decode_key(&key)))
     }
 
@@ -392,7 +401,7 @@ where
 }
 
 #[derive(Debug, Clone)]
-/// A reader for a versioned schema. 
+/// A reader for a versioned schema.
 pub struct VersionedDeltaReader<V: SchemaWithVersion> {
     db: VersionedDB<V>,
     // The version of the underlying DB at the time this snapshot was taken.
