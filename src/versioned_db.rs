@@ -1,12 +1,4 @@
-use std::{
-    borrow::Borrow,
-    collections::HashMap,
-    marker::PhantomData,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-};
+use std::{borrow::Borrow, collections::HashMap, marker::PhantomData, sync::Arc};
 
 use anyhow::bail;
 use rocksdb::ColumnFamilyDescriptor;
@@ -24,35 +16,52 @@ impl Schema for CommittedVersion {
     const COLUMN_FAMILY_NAME: ColumnFamilyName = "committed_version";
     const SHOULD_CACHE: bool = false;
 
-    type Key = EmptyKey;
+    type Key = VersionedTableMetadataKey;
     type Value = u64;
 }
 
 /// A singleton key. Encodes to the empty vec.
 #[derive(Debug, PartialEq)]
-pub struct EmptyKey;
+pub enum VersionedTableMetadataKey {
+    /// The latest version that has been committed.
+    CommittedVersion,
+    /// The newest version that has been pruned.
+    PrunedVersion,
+}
 
-impl AsRef<EmptyKey> for EmptyKey {
-    fn as_ref(&self) -> &EmptyKey {
+impl AsRef<VersionedTableMetadataKey> for VersionedTableMetadataKey {
+    fn as_ref(&self) -> &VersionedTableMetadataKey {
         self
     }
 }
 
-impl KeyEncoder<CommittedVersion> for EmptyKey {
+impl KeyEncoder<CommittedVersion> for VersionedTableMetadataKey {
     fn encode_key(&self) -> Result<Vec<u8>, CodecError> {
-        Ok(vec![])
+        Ok(match self {
+            VersionedTableMetadataKey::CommittedVersion => vec![0],
+            VersionedTableMetadataKey::PrunedVersion => vec![1],
+        })
     }
 }
 
-impl KeyDecoder<CommittedVersion> for EmptyKey {
-    fn decode_key(_data: &[u8]) -> Result<Self, CodecError> {
-        if !_data.is_empty() {
+impl KeyDecoder<CommittedVersion> for VersionedTableMetadataKey {
+    fn decode_key(data: &[u8]) -> Result<Self, CodecError> {
+        if data.len() != 1 {
             return Err(CodecError::InvalidKeyLength {
-                expected: 0,
-                got: _data.len(),
+                expected: 1,
+                got: data.len(),
             });
         }
-        Ok(EmptyKey)
+        Ok(match data[0] {
+            0 => VersionedTableMetadataKey::CommittedVersion,
+            1 => VersionedTableMetadataKey::PrunedVersion,
+            _ => {
+                return Err(CodecError::Wrapped(anyhow::anyhow!(
+                    "Invalid versioned table metadata key: {}",
+                    data[0]
+                )))
+            }
+        })
     }
 }
 
@@ -99,22 +108,23 @@ impl ValueCodec<CommittedVersion> for u64 {
 #[derive(Clone, Debug)]
 pub struct VersionedDB<S: SchemaWithVersion> {
     db: Arc<DB>,
-    oldest_available_version: Arc<AtomicU64>,
     _schema: S,
 }
 
 impl<S: SchemaWithVersion> VersionedDB<S>
 // This where clause shouldn't be needed since it's implied by the Schema trait, but Rust intentionally doesn't elaborate these bounds.
 where
-    EmptyKey: KeyEncoder<S::CommittedVersionColumn>,
+    VersionedTableMetadataKey: KeyEncoder<S::CommittedVersionColumn>,
 {
     /// Returns the oldest version that is available in the database.
-    pub fn get_oldest_available_version(&self, ordering: Ordering) -> u64 {
-        self.oldest_available_version.load(ordering)
+    pub fn get_pruned_version(&self) -> anyhow::Result<Option<u64>> {
+        self.db
+            .get::<S::CommittedVersionColumn>(&VersionedTableMetadataKey::PrunedVersion)
     }
     /// Returns the latest committed version in the database.
     pub fn get_committed_version(&self) -> anyhow::Result<Option<u64>> {
-        self.db.get::<S::CommittedVersionColumn>(&EmptyKey)
+        self.db
+            .get::<S::CommittedVersionColumn>(&VersionedTableMetadataKey::CommittedVersion)
     }
 }
 
@@ -245,12 +255,12 @@ pub trait SchemaWithVersion: Schema {
     /// A column family for storing the pruning keys of the schema.
     type PruningColumnFamily: Schema<Key = PrunableKey<Self, Self::Key>, Value = ()>;
     /// A column family for storing the committed version of the schema.
-    type CommittedVersionColumn: Schema<Key = EmptyKey, Value = u64>;
+    type CommittedVersionColumn: Schema<Key = VersionedTableMetadataKey, Value = u64>;
 }
 
 impl<V: SchemaWithVersion> VersionedDB<V>
 where
-    EmptyKey: KeyCodec<V::CommittedVersionColumn>,
+    VersionedTableMetadataKey: KeyCodec<V::CommittedVersionColumn>,
     (): ValueCodec<V::PruningColumnFamily>,
     V::Value: ValueCodec<V::HistoricalColumnFamily>,
     u64: ValueCodec<V::CommittedVersionColumn>,
@@ -281,11 +291,9 @@ where
 
     /// Creates a new versioned DB from an existing DB.
     pub fn from_db(db: Arc<DB>) -> anyhow::Result<Self> {
-        let oldest_available_version = Self::get_next_version_to_prune_from_db(db.as_ref())?;
         Ok(Self {
             db,
             _schema: Default::default(),
-            oldest_available_version: Arc::new(AtomicU64::new(oldest_available_version)),
         })
     }
 
@@ -305,25 +313,6 @@ where
         Ok(iterator.map(|(key, _value)| <V::PruningColumnFamily as Schema>::Key::decode_key(&key)))
     }
 
-    /// Returns the next version to prune from the database.
-    pub fn get_next_version_to_prune_from_db(db: &DB) -> anyhow::Result<u64> {
-        let mut iterator = db.raw_iter_range::<V::PruningColumnFamily>(
-            0u64.to_be_bytes().to_vec()..,
-            ScanDirection::Forward,
-        )?;
-        let next_version_to_prune = iterator
-            .next()
-            .map(|(key, _value)| {
-                u64::from_be_bytes(
-                    key[..8]
-                        .try_into()
-                        .expect("version bytes were 8 bytes but no longer are. This is a bug."),
-                )
-            })
-            .unwrap_or(0);
-        Ok(next_version_to_prune)
-    }
-
     /// Name of the database that can be used for logging or metrics or tracing.
     #[inline]
     pub fn name(&self) -> &'static str {
@@ -337,7 +326,8 @@ where
 
     /// Returns the latest committed version in the database.
     pub fn load_latest_committed_version(&self) -> anyhow::Result<Option<u64>> {
-        self.db.get::<V::CommittedVersionColumn>(&EmptyKey)
+        self.db
+            .get::<V::CommittedVersionColumn>(&VersionedTableMetadataKey::CommittedVersion)
     }
 
     /// Materializes a batch of writes to the database.
@@ -368,7 +358,10 @@ where
             )?;
         }
         // Write to the historical table
-        output_batch.put::<V::CommittedVersionColumn>(&EmptyKey, &version)?;
+        output_batch.put::<V::CommittedVersionColumn>(
+            &VersionedTableMetadataKey::CommittedVersion,
+            &version,
+        )?;
         Ok(())
     }
 
@@ -440,7 +433,7 @@ pub struct VersionedDeltaReader<V: SchemaWithVersion> {
 impl<V: SchemaWithVersion> VersionedDeltaReader<V>
 where
     V::Key: Eq + std::hash::Hash,
-    EmptyKey: KeyCodec<V::CommittedVersionColumn>,
+    VersionedTableMetadataKey: KeyCodec<V::CommittedVersionColumn>,
     V::Value: Clone,
     (): ValueCodec<V::PruningColumnFamily>,
     V::Value: ValueCodec<V::HistoricalColumnFamily>,
@@ -476,7 +469,7 @@ where
 impl<V: SchemaWithVersion<Key = Arc<K>>, K> VersionedDeltaReader<V>
 where
     K: Eq + std::hash::Hash + KeyEncoder<V>,
-    EmptyKey: KeyCodec<V::CommittedVersionColumn>,
+    VersionedTableMetadataKey: KeyCodec<V::CommittedVersionColumn>,
     V::Value: Clone,
     (): ValueCodec<V::PruningColumnFamily>,
     V::Value: ValueCodec<V::HistoricalColumnFamily>,
@@ -549,7 +542,11 @@ where
             version_of_current_snapshot -= 1;
         }
         let historical_value = self.db.get_historical_value(key.borrow(), version)?;
-        let oldest_available_version = self.db.get_oldest_available_version(Ordering::Acquire);
+        let oldest_available_version = self
+            .db
+            .get_pruned_version()?
+            .and_then(|v| v.checked_add(1))
+            .unwrap_or(0);
         if version < oldest_available_version {
             Err(anyhow::anyhow!(
                 "Requested version {} is older than the oldest available version {}",
