@@ -378,7 +378,32 @@ where
         key_to_get: &impl KeyEncoder<V>,
         version: u64,
     ) -> anyhow::Result<Option<V::Value>> {
-        let key_with_version = VersionedKey::<V, _>::new(key_to_get, version).encode_key()?;
+        let Some((value_bytes, _version)) = self.get_versioned_internal(key_to_get, version)?
+        else {
+            return Ok(None);
+        };
+        let value = V::Value::decode_value(&value_bytes)?;
+        Ok(Some(value))
+    }
+
+    /// Returns the latest version at which the given key was written.
+    pub fn get_version_for_key(
+        &self,
+        key_to_get: &impl KeyEncoder<V>,
+        max_version: u64,
+    ) -> anyhow::Result<Option<u64>> {
+        let Some((_, version)) = self.get_versioned_internal(key_to_get, max_version)? else {
+            return Ok(None);
+        };
+        Ok(Some(version))
+    }
+
+    fn get_versioned_internal(
+        &self,
+        key_to_get: &impl KeyEncoder<V>,
+        max_version: u64,
+    ) -> anyhow::Result<Option<(Vec<u8>, u64)>> {
+        let key_with_version = VersionedKey::<V, _>::new(key_to_get, max_version).encode_key()?;
         let range = ..=&key_with_version;
         let mut iterator = self
             .db
@@ -391,9 +416,13 @@ where
             {
                 return Ok(None);
             }
-            debug_assert!(u64::from_be_bytes(version_bytes.try_into().expect("version bytes were 8 bytes but no longer are. This is a bug.")) <= version, "Unexpected version. Queried for less than or equal to version {} but got version {}", version, u64::from_be_bytes(version_bytes.try_into().unwrap()));
-            let value = V::Value::decode_value(&value_bytes)?;
-            return Ok(Some(value));
+            let version = u64::from_be_bytes(
+                version_bytes
+                    .try_into()
+                    .expect("version bytes were 8 bytes but no longer are. This is a bug."),
+            );
+            debug_assert!( version <= max_version, "Unexpected version. Queried for less than or equal to version {} but got version {}", max_version, version);
+            return Ok(Some((value_bytes, version)));
         }
         Ok(None)
     }
@@ -488,6 +517,7 @@ where
             Ok(live_value)
         }
     }
+
     /// Returns the value of a key in the historical column family as of the given version.
     pub fn get_historical_borrowed(
         &self,
