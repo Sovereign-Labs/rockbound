@@ -244,6 +244,8 @@ impl DB {
                     if let Some(cache) = self.cache.try_read() {
                         let cache_result = cache.get(&Pair(S::COLUMN_FAMILY_NAME, &k));
                         if let Some(result) = cache_result {
+                            // TODO: Remove
+                            println!("cache hit. Key: {:?}. Value: {:?}", k, result);
                             return result
                                 .map(|v| <S::Value as ValueCodec<S>>::decode_value(&v))
                                 .transpose()
@@ -252,6 +254,8 @@ impl DB {
                     }
 
                     let result = self.db.get_pinned_cf(cf_handle, &k)?;
+                    // TODO: Remove
+                    // println!("cache miss. Value: {:?}", result.as_ref().map(|v| &v[..]));
                     // If the cache is locked for writing, don't try to put the value, just return
                     if let Some(cache) = self.cache.try_read() {
                         // Note: We have to deserialize the value while holding the read lock because the lifetime of the borrow is tied to `inner`.
@@ -481,11 +485,13 @@ impl DB {
                     Operation::Put { value } => {
                         write_sizes.push(key.len() + value.len());
                         db_batch.put_cf(cf_handle, &key, &value);
+                        println!("Replaced key: {:?}. Setting value: {:?}", key, value);
                         let _ = cache.replace((cf_name, key), Some(value), true);
                         // uses "soft=true" to avoid changing heat of the key
                     }
                     Operation::Delete => {
                         db_batch.delete_cf(cf_handle, &key);
+                        println!("Replacing key: {:?}. Setting value: None", key);
                         let _ = cache.replace((cf_name, key), None, true); // uses "soft=true" to avoid changing heat of the key
                         deletes_for_cf += 1;
                     }
