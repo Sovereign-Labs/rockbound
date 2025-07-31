@@ -851,12 +851,8 @@ mod tests {
         values
     }
 
-    fn generate_db_entries_and_snapshots() -> impl Strategy<
-        Value = (
-            Vec<TestItem>,
-            Vec<Vec<TestItem>>,
-        ),
-    > {
+    fn generate_db_entries_and_snapshots(
+    ) -> impl Strategy<Value = (Vec<TestItem>, Vec<Vec<TestItem>>)> {
         let entries = prop::collection::vec((any::<TestCompositeField>(), any::<TestField>()), 50);
         let snapshots = prop::collection::vec(
             prop::collection::vec((any::<TestCompositeField>(), any::<TestField>()), 10),
