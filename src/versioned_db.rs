@@ -76,7 +76,7 @@ impl ValueCodec<CommittedVersion> for u64 {
 /// Suppose the caller wants a versioned map from SlotKey to SlotValue. The implementation will generate several tables:
 /// - A plain column family mapping SlotKey to SlotValue (the "live" column family). This can be cached.
 /// - A historical column family mapping (SlotKey, Version) to SlotValue (the "historical" column family). Queries with an associated version retrieve the latest entry for that key whose value is less than or equal to the version.
-///     Note that: pruning must leave at least one entry for each live key indicating at which version it was written.
+///   Note that: pruning must leave at least one entry for each live key indicating at which version it was written.
 /// - A pruning column family mapping Version => Vec<Key> telling us which entries were updated at each version
 ///
 ///
@@ -421,7 +421,7 @@ where
                     .try_into()
                     .expect("version bytes were 8 bytes but no longer are. This is a bug."),
             );
-            debug_assert!( version <= max_version, "Unexpected version. Queried for less than or equal to version {} but got version {}", max_version, version);
+            debug_assert!(version <= max_version, "Unexpected version. Queried for less than or equal to version {max_version} but got version {version}");
             return Ok(Some((value_bytes, version)));
         }
         Ok(None)

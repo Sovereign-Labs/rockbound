@@ -258,9 +258,7 @@ impl Iterator for RawDbIter<'_> {
                 assert_eq!(
                     &ScanDirection::Forward,
                     &self.direction,
-                    "Upper bound exceeded, while moving backward: {:?} {:?} ",
-                    next_item,
-                    upper
+                    "Upper bound exceeded, while moving backward: {next_item:?} {upper:?}",
                 );
                 return None;
             }
