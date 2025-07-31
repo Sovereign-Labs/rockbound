@@ -199,13 +199,15 @@ impl<S: SchemaWithVersion, T: KeyEncoder<S>> KeyEncoder<S::PruningColumnFamily>
 impl<S: SchemaWithVersion> KeyDecoder<S::PruningColumnFamily> for PrunableKey<S, S::Key> {
     fn decode_key(data: &[u8]) -> Result<Self, CodecError> {
         let len = data.len();
-        let key_len = len.checked_sub(8).ok_or(CodecError::InvalidKeyLength {
-            expected: 8,
-            got: len,
-        })?;
-        let key = S::Key::decode_key(&data[..key_len])?;
+        if len < 8 {
+            return Err(CodecError::InvalidKeyLength {
+                expected: 8,
+                got: len,
+            });
+        }
+        let key = S::Key::decode_key(&data[8..])?;
         let version =
-            u64::from_be_bytes(data[key_len..].try_into().expect(
+            u64::from_be_bytes(data[0..8].try_into().expect(
                 "key length was just checked to be 8 bytes but no longer is. This is a bug.",
             ));
         Ok(Self::new(version, key))
