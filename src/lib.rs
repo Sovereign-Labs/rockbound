@@ -254,7 +254,7 @@ impl DB {
                                 .transpose()
                                 .map_err(|err| err.into());
                         }
-                    } 
+                    }
 
                     let result = self.db.get_pinned_cf(cf_handle, &k)?;
                     // If the cache is locked for writing, don't try to put the value, just return
