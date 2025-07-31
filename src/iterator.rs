@@ -343,13 +343,13 @@ mod tests {
                 .unwrap();
             let actual_values = collect_actual_values(iter_range_forward);
 
-            assert_eq!(expected_values, actual_values, "{} forward", prefix,);
+            assert_eq!(expected_values, actual_values, "{prefix} forward",);
             let iter_range_backward = db
                 .raw_iter_range::<S>(range, ScanDirection::Backward)
                 .unwrap();
             let actual_values = collect_actual_values(iter_range_backward);
             expected_values.reverse();
-            assert_eq!(expected_values, actual_values, "{} backward", prefix);
+            assert_eq!(expected_values, actual_values, "{prefix} backward");
         }
 
         #[test]
