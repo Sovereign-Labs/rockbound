@@ -29,23 +29,17 @@ pub enum VersionedTableMetadataKey {
     PrunedVersion,
 }
 
-impl AsRef<VersionedTableMetadataKey> for VersionedTableMetadataKey {
-    fn as_ref(&self) -> &VersionedTableMetadataKey {
-        self
-    }
-}
-
-impl KeyEncoder<VersionMetadata> for VersionedTableMetadataKey {
-    fn encode_key(&self) -> Result<Vec<u8>, CodecError> {
+impl VersionedTableMetadataKey {
+    /// Encodes the key into a byte vector.
+    pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
         Ok(match self {
             VersionedTableMetadataKey::CommittedVersion => vec![0],
             VersionedTableMetadataKey::PrunedVersion => vec![1],
         })
     }
-}
 
-impl KeyDecoder<VersionMetadata> for VersionedTableMetadataKey {
-    fn decode_key(data: &[u8]) -> Result<Self, CodecError> {
+    /// Decodes the key from a byte vector.
+    pub fn decode(data: &[u8]) -> Result<Self, CodecError> {
         if data.len() != 1 {
             return Err(CodecError::InvalidKeyLength {
                 expected: 1,
@@ -62,6 +56,24 @@ impl KeyDecoder<VersionMetadata> for VersionedTableMetadataKey {
                 )))
             }
         })
+    }
+}
+
+impl AsRef<VersionedTableMetadataKey> for VersionedTableMetadataKey {
+    fn as_ref(&self) -> &VersionedTableMetadataKey {
+        self
+    }
+}
+
+impl KeyEncoder<VersionMetadata> for VersionedTableMetadataKey {
+    fn encode_key(&self) -> Result<Vec<u8>, CodecError> {
+        self.encode()
+    }
+}
+
+impl KeyDecoder<VersionMetadata> for VersionedTableMetadataKey {
+    fn decode_key(data: &[u8]) -> Result<Self, CodecError> {
+        Self::decode(data)
     }
 }
 
