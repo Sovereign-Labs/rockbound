@@ -240,24 +240,25 @@ impl DB {
 
                 // Only grab the read lock if we're accessing a cached column family.
                 if S::SHOULD_CACHE {
+                    let lock = self.cache.try_read();
                     // If the cache is locked for writing, just fall back to the DB. It provides consistency without locking
-                    if let Some(cache) = self.cache.try_read() {
+                    // Otherwise, we'll hold the lock until we've finished reading and (if necessary) modifying the cache.
+                    // This will block any commits to the DB during this critical section, which is what we need; otherwise,
+                    // a bad thread interleaving could cause us to read from the DB, get pre-empted while another thread writes, and then write
+                    // the stale value to the cache
+                    if let Some(cache) = lock.as_ref() {
                         let cache_result = cache.get(&Pair(S::COLUMN_FAMILY_NAME, &k));
                         if let Some(result) = cache_result {
-                            // TODO: Remove
-                            println!("cache hit. Key: {:?}. Value: {:?}", k, result);
                             return result
                                 .map(|v| <S::Value as ValueCodec<S>>::decode_value(&v))
                                 .transpose()
                                 .map_err(|err| err.into());
                         }
-                    }
+                    } 
 
                     let result = self.db.get_pinned_cf(cf_handle, &k)?;
-                    // TODO: Remove
-                    // println!("cache miss. Value: {:?}", result.as_ref().map(|v| &v[..]));
                     // If the cache is locked for writing, don't try to put the value, just return
-                    if let Some(cache) = self.cache.try_read() {
+                    if let Some(cache) = lock {
                         // Note: We have to deserialize the value while holding the read lock because the lifetime of the borrow is tied to `inner`.
                         // This prevents us from unifying the two branches.
                         // Note: We don't count bytes read from the cache
@@ -485,13 +486,11 @@ impl DB {
                     Operation::Put { value } => {
                         write_sizes.push(key.len() + value.len());
                         db_batch.put_cf(cf_handle, &key, &value);
-                        println!("Replaced key: {:?}. Setting value: {:?}", key, value);
                         let _ = cache.replace((cf_name, key), Some(value), true);
                         // uses "soft=true" to avoid changing heat of the key
                     }
                     Operation::Delete => {
                         db_batch.delete_cf(cf_handle, &key);
-                        println!("Replacing key: {:?}. Setting value: None", key);
                         let _ = cache.replace((cf_name, key), None, true); // uses "soft=true" to avoid changing heat of the key
                         deletes_for_cf += 1;
                     }

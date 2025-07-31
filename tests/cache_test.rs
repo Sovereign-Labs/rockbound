@@ -280,7 +280,7 @@ fn test_cache_behavior_under_concurrency() {
             }
             assert!(
                 hit_nones > 1000,
-                "Very deleted keys were encountered. This means the test logic is probably buggy"
+                "Very few deleted keys were encountered. This means the test logic is probably buggy"
             );
         });
         handles.push(handle);
