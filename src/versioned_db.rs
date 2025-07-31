@@ -10,10 +10,10 @@ use crate::{
     CodecError, Schema, SchemaBatch, DB,
 };
 #[derive(Debug, Default)]
-pub(crate) struct CommittedVersion;
+pub(crate) struct VersionMetadata;
 
-impl Schema for CommittedVersion {
-    const COLUMN_FAMILY_NAME: ColumnFamilyName = "committed_version";
+impl Schema for VersionMetadata {
+    const COLUMN_FAMILY_NAME: ColumnFamilyName = "version_metadata";
     const SHOULD_CACHE: bool = false;
 
     type Key = VersionedTableMetadataKey;
@@ -35,7 +35,7 @@ impl AsRef<VersionedTableMetadataKey> for VersionedTableMetadataKey {
     }
 }
 
-impl KeyEncoder<CommittedVersion> for VersionedTableMetadataKey {
+impl KeyEncoder<VersionMetadata> for VersionedTableMetadataKey {
     fn encode_key(&self) -> Result<Vec<u8>, CodecError> {
         Ok(match self {
             VersionedTableMetadataKey::CommittedVersion => vec![0],
@@ -44,7 +44,7 @@ impl KeyEncoder<CommittedVersion> for VersionedTableMetadataKey {
     }
 }
 
-impl KeyDecoder<CommittedVersion> for VersionedTableMetadataKey {
+impl KeyDecoder<VersionMetadata> for VersionedTableMetadataKey {
     fn decode_key(data: &[u8]) -> Result<Self, CodecError> {
         if data.len() != 1 {
             return Err(CodecError::InvalidKeyLength {
@@ -65,7 +65,7 @@ impl KeyDecoder<CommittedVersion> for VersionedTableMetadataKey {
     }
 }
 
-impl ValueCodec<CommittedVersion> for u64 {
+impl ValueCodec<VersionMetadata> for u64 {
     fn encode_value(&self) -> Result<Vec<u8>, CodecError> {
         Ok(self.to_be_bytes().to_vec())
     }
@@ -114,17 +114,17 @@ pub struct VersionedDB<S: SchemaWithVersion> {
 impl<S: SchemaWithVersion> VersionedDB<S>
 // This where clause shouldn't be needed since it's implied by the Schema trait, but Rust intentionally doesn't elaborate these bounds.
 where
-    VersionedTableMetadataKey: KeyEncoder<S::CommittedVersionColumn>,
+    VersionedTableMetadataKey: KeyEncoder<S::VersionMetadatacolumn>,
 {
     /// Returns the oldest version that is available in the database.
     pub fn get_pruned_version(&self) -> anyhow::Result<Option<u64>> {
         self.db
-            .get::<S::CommittedVersionColumn>(&VersionedTableMetadataKey::PrunedVersion)
+            .get::<S::VersionMetadatacolumn>(&VersionedTableMetadataKey::PrunedVersion)
     }
     /// Returns the latest committed version in the database.
     pub fn get_committed_version(&self) -> anyhow::Result<Option<u64>> {
         self.db
-            .get::<S::CommittedVersionColumn>(&VersionedTableMetadataKey::CommittedVersion)
+            .get::<S::VersionMetadatacolumn>(&VersionedTableMetadataKey::CommittedVersion)
     }
 }
 
@@ -255,15 +255,15 @@ pub trait SchemaWithVersion: Schema {
     /// A column family for storing the pruning keys of the schema.
     type PruningColumnFamily: Schema<Key = PrunableKey<Self, Self::Key>, Value = ()>;
     /// A column family for storing the committed version of the schema.
-    type CommittedVersionColumn: Schema<Key = VersionedTableMetadataKey, Value = u64>;
+    type VersionMetadatacolumn: Schema<Key = VersionedTableMetadataKey, Value = u64>;
 }
 
 impl<V: SchemaWithVersion> VersionedDB<V>
 where
-    VersionedTableMetadataKey: KeyCodec<V::CommittedVersionColumn>,
+    VersionedTableMetadataKey: KeyCodec<V::VersionMetadatacolumn>,
     (): ValueCodec<V::PruningColumnFamily>,
     V::Value: ValueCodec<V::HistoricalColumnFamily>,
-    u64: ValueCodec<V::CommittedVersionColumn>,
+    u64: ValueCodec<V::VersionMetadatacolumn>,
 {
     /// Adds the column families for the versioned schema to the existing column families.
     pub fn add_column_families(
@@ -272,7 +272,7 @@ where
         let historical_versioned_column_family = V::HistoricalColumnFamily::COLUMN_FAMILY_NAME;
         let pruning_column_family = V::PruningColumnFamily::COLUMN_FAMILY_NAME;
         let live_column_family = V::COLUMN_FAMILY_NAME;
-        let committed_version_column_family = V::CommittedVersionColumn::COLUMN_FAMILY_NAME;
+        let committed_version_column_family = V::VersionMetadatacolumn::COLUMN_FAMILY_NAME;
         for column in existing_column_families.iter() {
             if column.name() == committed_version_column_family
                 || column.name() == historical_versioned_column_family
@@ -327,7 +327,7 @@ where
     /// Returns the latest committed version in the database.
     pub fn load_latest_committed_version(&self) -> anyhow::Result<Option<u64>> {
         self.db
-            .get::<V::CommittedVersionColumn>(&VersionedTableMetadataKey::CommittedVersion)
+            .get::<V::VersionMetadatacolumn>(&VersionedTableMetadataKey::CommittedVersion)
     }
 
     /// Materializes a batch of writes to the database.
@@ -358,7 +358,7 @@ where
             )?;
         }
         // Write to the historical table
-        output_batch.put::<V::CommittedVersionColumn>(
+        output_batch.put::<V::VersionMetadatacolumn>(
             &VersionedTableMetadataKey::CommittedVersion,
             &version,
         )?;
@@ -433,11 +433,11 @@ pub struct VersionedDeltaReader<V: SchemaWithVersion> {
 impl<V: SchemaWithVersion> VersionedDeltaReader<V>
 where
     V::Key: Eq + std::hash::Hash,
-    VersionedTableMetadataKey: KeyCodec<V::CommittedVersionColumn>,
+    VersionedTableMetadataKey: KeyCodec<V::VersionMetadatacolumn>,
     V::Value: Clone,
     (): ValueCodec<V::PruningColumnFamily>,
     V::Value: ValueCodec<V::HistoricalColumnFamily>,
-    u64: ValueCodec<V::CommittedVersionColumn>,
+    u64: ValueCodec<V::VersionMetadatacolumn>,
 {
     /// Creates a new versioned delta reader.
     pub fn new(
@@ -469,11 +469,11 @@ where
 impl<V: SchemaWithVersion<Key = Arc<K>>, K> VersionedDeltaReader<V>
 where
     K: Eq + std::hash::Hash + KeyEncoder<V>,
-    VersionedTableMetadataKey: KeyCodec<V::CommittedVersionColumn>,
+    VersionedTableMetadataKey: KeyCodec<V::VersionMetadatacolumn>,
     V::Value: Clone,
     (): ValueCodec<V::PruningColumnFamily>,
     V::Value: ValueCodec<V::HistoricalColumnFamily>,
-    u64: ValueCodec<V::CommittedVersionColumn>,
+    u64: ValueCodec<V::VersionMetadatacolumn>,
 {
     /// Returns the latest value of a key in the reader.
     pub fn get_latest_borrowed(&self, key: impl Borrow<K>) -> anyhow::Result<Option<V::Value>> {
