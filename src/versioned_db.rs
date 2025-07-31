@@ -318,7 +318,7 @@ where
     > {
         // Because some keys are longer than 8 bytes, we use an exclusive range
         let first_version_to_keep = version.saturating_add(1);
-        let range = 0u64.to_be_bytes().to_vec()..first_version_to_keep.to_be_bytes().to_vec();
+        let range = ..first_version_to_keep.to_be_bytes().to_vec();
         let iterator = self
             .db
             .raw_iter_range::<V::PruningColumnFamily>(range, ScanDirection::Forward)?;
