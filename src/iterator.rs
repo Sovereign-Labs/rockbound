@@ -14,13 +14,13 @@ use crate::{SchemaKey, SchemaValue};
 /// vice versa. E.g.:
 ///
 /// - Some key types don't use an encoding that results in sensible
-/// seeking behavior under lexicographic ordering (what RocksDB uses by
-/// default), which means you shouldn't implement [`SeekKeyEncoder`] at all.
+///   seeking behavior under lexicographic ordering (what RocksDB uses by
+///   default), which means you shouldn't implement [`SeekKeyEncoder`] at all.
 /// - Other key types might maintain full lexicographic order, which means the
-/// original key type can also be [`SeekKeyEncoder`].
+///   original key type can also be [`SeekKeyEncoder`].
 /// - Other key types may be composite, and the first field alone may be
-/// a good candidate for [`SeekKeyEncoder`].
-pub trait SeekKeyEncoder<S: Schema + ?Sized>: Sized {
+///   a good candidate for [`SeekKeyEncoder`].
+pub trait SeekKeyEncoder<S: Schema>: Sized {
     /// Converts `self` to bytes which is used to seek the underlying raw
     /// iterator.
     ///
@@ -156,7 +156,7 @@ impl<K, V> IteratorOutput<K, V> {
     }
 }
 
-impl<'a, S> Iterator for SchemaIterator<'a, S>
+impl<S> Iterator for SchemaIterator<'_, S>
 where
     S: Schema,
 {
@@ -167,7 +167,7 @@ where
     }
 }
 
-impl<'a, S> FusedIterator for SchemaIterator<'a, S> where S: Schema {}
+impl<S> FusedIterator for SchemaIterator<'_, S> where S: Schema {}
 
 /// Iterates over given column in [`rocksdb::DB`] using raw types.
 pub(crate) struct RawDbIter<'a> {
@@ -238,7 +238,7 @@ impl<'a> RawDbIter<'a> {
     }
 }
 
-impl<'a> Iterator for RawDbIter<'a> {
+impl Iterator for RawDbIter<'_> {
     type Item = (SchemaKey, SchemaValue);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -258,9 +258,7 @@ impl<'a> Iterator for RawDbIter<'a> {
                 assert_eq!(
                     &ScanDirection::Forward,
                     &self.direction,
-                    "Upper bound exceeded, while moving backward: {:?} {:?} ",
-                    next_item,
-                    upper
+                    "Upper bound exceeded, while moving backward: {next_item:?} {upper:?}",
                 );
                 return None;
             }
@@ -345,13 +343,13 @@ mod tests {
                 .unwrap();
             let actual_values = collect_actual_values(iter_range_forward);
 
-            assert_eq!(expected_values, actual_values, "{} forward", prefix,);
+            assert_eq!(expected_values, actual_values, "{prefix} forward",);
             let iter_range_backward = db
                 .raw_iter_range::<S>(range, ScanDirection::Backward)
                 .unwrap();
             let actual_values = collect_actual_values(iter_range_backward);
             expected_values.reverse();
-            assert_eq!(expected_values, actual_values, "{} backward", prefix);
+            assert_eq!(expected_values, actual_values, "{prefix} backward");
         }
 
         #[test]

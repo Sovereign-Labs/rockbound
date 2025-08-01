@@ -415,6 +415,7 @@ mod tests {
     define_schema!(TestSchema, TestCompositeField, TestField, "TestCF");
 
     type S = TestSchema;
+    type TestItem = (TestCompositeField, TestField);
 
     // Minimal fields
     const FIELD_1: TestCompositeField = TestCompositeField(0, 1, 0);
@@ -470,7 +471,7 @@ mod tests {
         schema_batch_0.put::<S>(&FIELD_4, &TestField(4)).unwrap();
         schema_batch_0.put::<S>(&FIELD_5, &TestField(5)).unwrap();
         schema_batch_0.put::<S>(&FIELD_7, &TestField(7)).unwrap();
-        db.write_schemas(&schema_batch_0).unwrap();
+        db.write_schemas(schema_batch_0).unwrap();
 
         let mut snapshot_1 = SchemaBatch::new();
         snapshot_1.put::<S>(&FIELD_6, &TestField(60)).unwrap();
@@ -604,13 +605,11 @@ mod tests {
         assert_eq!(
             expected_len,
             values.len(),
-            "length do no match for iter_range: {:?} ",
-            range
+            "length do no match for iter_range: {range:?} "
         );
         assert!(
             values.windows(2).all(|w| w[0].0 <= w[1].0),
-            "iter should be sorted for range: {:?}",
-            range
+            "iter should be sorted for range: {range:?}"
         );
         let values_rev: Vec<_> = delta_reader
             .iter_rev_range::<S>(range.clone())
@@ -619,13 +618,11 @@ mod tests {
         assert_eq!(
             expected_len,
             values_rev.len(),
-            "length do no match for iter_rev_range:{:?}",
-            range
+            "length do no match for iter_rev_range:{range:?}"
         );
         assert!(
             values_rev.windows(2).all(|w| w[0].0 >= w[1].0),
-            "iter_rev should be sorted in reversed order for range: {:?}",
-            range
+            "iter_rev should be sorted in reversed order for range: {range:?}"
         );
     }
 
@@ -784,8 +781,7 @@ mod tests {
             assert_eq!(
                 all_values[expected_range].to_vec(),
                 range_values,
-                "failed for range {:?}",
-                field_range
+                "failed for range {field_range:?}"
             )
         }
     }
@@ -804,7 +800,7 @@ mod tests {
             db_batch.put::<S>(key, value).unwrap();
             all_kv.insert(key.clone(), *value);
         }
-        db.write_schemas(&db_batch).unwrap();
+        db.write_schemas(db_batch).unwrap();
 
         let mut schema_batches = Vec::new();
         for snapshot in snapshots {
@@ -835,7 +831,7 @@ mod tests {
             db_batch.put::<S>(&key, &value).unwrap();
             latest_schema_batch.delete::<S>(&key).unwrap();
         }
-        db.write_schemas(&db_batch).unwrap();
+        db.write_schemas(db_batch).unwrap();
 
         let mut schema_batches = Vec::new();
         for snapshot in snapshots {
@@ -855,12 +851,8 @@ mod tests {
         values
     }
 
-    fn generate_db_entries_and_snapshots() -> impl Strategy<
-        Value = (
-            Vec<(TestCompositeField, TestField)>,
-            Vec<Vec<(TestCompositeField, TestField)>>,
-        ),
-    > {
+    fn generate_db_entries_and_snapshots(
+    ) -> impl Strategy<Value = (Vec<TestItem>, Vec<Vec<TestItem>>)> {
         let entries = prop::collection::vec((any::<TestCompositeField>(), any::<TestField>()), 50);
         let snapshots = prop::collection::vec(
             prop::collection::vec((any::<TestCompositeField>(), any::<TestField>()), 10),

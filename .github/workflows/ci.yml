@@ -36,7 +36,7 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       - name: Install Rust
-        run: rustup show
+        run: rustup toolchain install stable
       - uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --all --check
@@ -49,9 +49,9 @@ jobs:
     runs-on: buildjet-8vcpu-ubuntu-2204
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install Rust
-        run: rustup show
+        run: rustup toolchain install stable
       - name: cargo install cargo-hack
         uses: taiki-e/install-action@cargo-hack
       - uses: Swatinem/rust-cache@v2
@@ -65,7 +65,7 @@ jobs:
       - uses: actions/checkout@v3
       - uses: taiki-e/install-action@nextest
       - name: Install Rust
-        run: rustup show
+        run: rustup toolchain install stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo nextest run --workspace --all-features
       # `cargo-nextest` does not support doctests (yet?), so we have to run them
