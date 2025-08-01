@@ -480,7 +480,6 @@ where
     }
 }
 
-
 impl<V: SchemaWithVersion<Key = Arc<K>>, K> VersionedDeltaReader<V>
 where
     K: Eq + std::hash::Hash + KeyEncoder<V>,
@@ -533,13 +532,13 @@ where
         version: u64,
     ) -> Result<Option<V::Value>, HistoricalValueError> {
         let Some(newest_version) = self.latest_version() else {
-            return Err(HistoricalValueError::FutureVersion{
+            return Err(HistoricalValueError::FutureVersion {
                 requested_version: version,
                 latest_version: None,
             });
         };
         if version > newest_version {
-            return Err(HistoricalValueError::FutureVersion{
+            return Err(HistoricalValueError::FutureVersion {
                 requested_version: version,
                 latest_version: Some(newest_version),
             });
@@ -563,7 +562,7 @@ where
             .and_then(|v| v.checked_add(1))
             .unwrap_or(0);
         if version < oldest_available_version {
-            Err(HistoricalValueError::PrunedVersion{
+            Err(HistoricalValueError::PrunedVersion {
                 requested_version: version,
                 oldest_available_version: Some(oldest_available_version),
             })
@@ -578,7 +577,7 @@ where
 pub enum HistoricalValueError {
     #[error("The requested version {requested_version} is newer than the newest version in the reader {latest_version:?}")]
     /// The requested version is newer than the latest version in the reader.
-    FutureVersion{
+    FutureVersion {
         /// The requested version.
         requested_version: u64,
         /// The latest version in the reader.
@@ -586,7 +585,7 @@ pub enum HistoricalValueError {
     },
     #[error("The requested version {requested_version} has been pruned. The oldest available version is {oldest_available_version:?}")]
     /// The requested version is older than the oldest available version.
-    PrunedVersion{
+    PrunedVersion {
         /// The requested version.
         requested_version: u64,
         /// The oldest available version.
@@ -594,5 +593,5 @@ pub enum HistoricalValueError {
     },
     /// Any other error
     #[error(transparent)]
-    Other(#[from]anyhow::Error),
+    Other(#[from] anyhow::Error),
 }
