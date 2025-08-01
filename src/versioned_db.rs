@@ -507,7 +507,7 @@ where
         if loaded_version.is_some_and(|v| v > latest_version) {
             tracing::debug!(?loaded_version, "DB is out of date, fetching 'live' values from historical table. Using latest version {:?}", latest_version);
             // The data from the base version is guaranteed to match our data - but data from the latest version could be from a different fork that was committed
-            return self.get_historical_borrowed(key, latest_version);
+            return Ok(self.get_historical_borrowed(key, latest_version)?);
         }
 
         let live_value = self.db.get_live_value(key.borrow())?;
@@ -519,7 +519,7 @@ where
                 ?loaded_version, "DB became out of date during a read. Fetching 'live' values from historical table. Using latest version {:?}",
                 latest_version
             );
-            self.get_historical_borrowed(key, latest_version)
+            Ok(self.get_historical_borrowed(key, latest_version)?)
         } else {
             Ok(live_value)
         }
@@ -530,18 +530,18 @@ where
         &self,
         key: impl Borrow<K>,
         version: u64,
-    ) -> anyhow::Result<Option<V::Value>> {
+    ) -> Result<Option<V::Value>, HistoricalValueError> {
         let Some(newest_version) = self.latest_version() else {
-            return Err(anyhow::anyhow!(
-                "Cannot query for historical values against an empty database"
-            ));
+            return Err(HistoricalValueError::FutureVersion {
+                requested_version: version,
+                latest_version: None,
+            });
         };
         if version > newest_version {
-            return Err(anyhow::anyhow!(
-                "Requested version {} is greater than the newest version {}",
-                version,
-                newest_version
-            ));
+            return Err(HistoricalValueError::FutureVersion {
+                requested_version: version,
+                latest_version: Some(newest_version),
+            });
         }
 
         let mut version_of_current_snapshot = newest_version;
@@ -562,13 +562,36 @@ where
             .and_then(|v| v.checked_add(1))
             .unwrap_or(0);
         if version < oldest_available_version {
-            Err(anyhow::anyhow!(
-                "Requested version {} is older than the oldest available version {}",
-                version,
-                oldest_available_version
-            ))
+            Err(HistoricalValueError::PrunedVersion {
+                requested_version: version,
+                oldest_available_version: Some(oldest_available_version),
+            })
         } else {
             Ok(historical_value)
         }
     }
+}
+
+/// An error that occurs when querying for a historical value.
+#[derive(Debug, thiserror::Error)]
+pub enum HistoricalValueError {
+    #[error("The requested version {requested_version} is newer than the newest version in the reader {latest_version:?}")]
+    /// The requested version is newer than the latest version in the reader.
+    FutureVersion {
+        /// The requested version.
+        requested_version: u64,
+        /// The latest version in the reader.
+        latest_version: Option<u64>,
+    },
+    #[error("The requested version {requested_version} has been pruned. The oldest available version is {oldest_available_version:?}")]
+    /// The requested version is older than the oldest available version.
+    PrunedVersion {
+        /// The requested version.
+        requested_version: u64,
+        /// The oldest available version.
+        oldest_available_version: Option<u64>,
+    },
+    /// Any other error
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
 }
