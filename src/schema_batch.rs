@@ -1,7 +1,7 @@
 use std::collections::{btree_map, BTreeMap, HashMap};
 
 use crate::metrics::SCHEMADB_BATCH_PUT_LATENCY_SECONDS;
-use crate::schema::{ColumnFamilyName, KeyCodec, ValueCodec};
+use crate::schema::{ColumnFamilyName, KeyCodec, KeyEncoder, ValueCodec};
 use crate::{Operation, Schema, SchemaKey, SeekKeyEncoder};
 
 // [`SchemaBatch`] holds a collection of updates that can be applied to a DB
@@ -22,7 +22,7 @@ impl SchemaBatch {
     /// Adds an insert/update operation to the batch.
     pub fn put<S: Schema>(
         &mut self,
-        key: &impl KeyCodec<S>,
+        key: &impl KeyEncoder<S>,
         value: &impl ValueCodec<S>,
     ) -> anyhow::Result<()> {
         let _timer = SCHEMADB_BATCH_PUT_LATENCY_SECONDS
@@ -39,7 +39,7 @@ impl SchemaBatch {
     }
 
     /// Adds a delete operation to the batch.
-    pub fn delete<S: Schema>(&mut self, key: &impl KeyCodec<S>) -> anyhow::Result<()> {
+    pub fn delete<S: Schema>(&mut self, key: &impl KeyEncoder<S>) -> anyhow::Result<()> {
         let key = key.encode_key()?;
         self.insert_operation::<S>(key, Operation::Delete);
 
