@@ -390,7 +390,7 @@ impl DB {
         &self,
         opts: ReadOptions,
         direction: ScanDirection,
-    ) -> anyhow::Result<SchemaIterator<S>> {
+    ) -> anyhow::Result<SchemaIterator<'_, S>> {
         assert!(
             !S::SHOULD_CACHE,
             "Caching is incompatible with iterators! Cannot iterate over {}",
@@ -405,7 +405,7 @@ impl DB {
 
     /// Returns a forward [`SchemaIterator`] on a certain schema with the default read options.
     #[tracing::instrument(skip_all, level = "error")]
-    pub fn iter<S: Schema>(&self) -> anyhow::Result<SchemaIterator<S>> {
+    pub fn iter<S: Schema>(&self) -> anyhow::Result<SchemaIterator<'_, S>> {
         self.iter_with_direction::<S>(Default::default(), ScanDirection::Forward)
     }
 
@@ -414,7 +414,7 @@ impl DB {
         &self,
         from: &impl SeekKeyEncoder<S>,
         to: &impl SeekKeyEncoder<S>,
-    ) -> anyhow::Result<SchemaIterator<S>> {
+    ) -> anyhow::Result<SchemaIterator<'_, S>> {
         with_error_logging(
             || {
                 let mut opts = ReadOptions::default();
@@ -430,7 +430,7 @@ impl DB {
     pub(crate) fn raw_iter<S: Schema>(
         &self,
         direction: ScanDirection,
-    ) -> anyhow::Result<RawDbIter> {
+    ) -> anyhow::Result<RawDbIter<'_>> {
         assert!(
             !S::SHOULD_CACHE,
             "Caching is incompatible with iterators! Cannot iterate over {}",
@@ -445,7 +445,7 @@ impl DB {
         &self,
         range: impl std::ops::RangeBounds<SchemaKey>,
         direction: ScanDirection,
-    ) -> anyhow::Result<RawDbIter> {
+    ) -> anyhow::Result<RawDbIter<'_>> {
         assert!(
             !S::SHOULD_CACHE,
             "Caching is incompatible with iterators! Cannot iterate over {}",
@@ -463,7 +463,7 @@ impl DB {
     pub fn iter_with_opts<S: Schema>(
         &self,
         opts: ReadOptions,
-    ) -> anyhow::Result<SchemaIterator<S>> {
+    ) -> anyhow::Result<SchemaIterator<'_, S>> {
         self.iter_with_direction::<S>(opts, ScanDirection::Forward)
     }
 

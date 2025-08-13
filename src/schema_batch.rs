@@ -94,7 +94,7 @@ impl SchemaBatch {
     }
 
     /// Iterator over all values in lexicographic order.
-    pub fn iter<S: Schema>(&self) -> btree_map::Iter<SchemaKey, Operation> {
+    pub fn iter<S: Schema>(&self) -> btree_map::Iter<'_, SchemaKey, Operation> {
         self.last_writes
             .get(&S::COLUMN_FAMILY_NAME)
             .map(BTreeMap::iter)
@@ -105,7 +105,7 @@ impl SchemaBatch {
     pub fn iter_range<S: Schema>(
         &self,
         range: impl std::ops::RangeBounds<SchemaKey>,
-    ) -> btree_map::Range<SchemaKey, Operation> {
+    ) -> btree_map::Range<'_, SchemaKey, Operation> {
         self.last_writes
             .get(&S::COLUMN_FAMILY_NAME)
             .map(|column_writes| column_writes.range(range))
