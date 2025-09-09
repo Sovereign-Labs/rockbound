@@ -39,7 +39,14 @@ fn open_inner_db(path: &std::path::Path) -> DB {
     let mut db_opts = rocksdb::Options::default();
     db_opts.create_if_missing(true);
     db_opts.create_missing_column_families(true);
-    DB::open(path, "test-iterator-db", column_families, &db_opts).unwrap()
+    DB::open(
+        path,
+        "test-iterator-db",
+        column_families,
+        &db_opts,
+        1_000_000,
+    )
+    .unwrap()
 }
 
 impl TestDB {

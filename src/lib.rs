@@ -101,12 +101,14 @@ impl DB {
         name: &'static str,
         column_families: impl IntoIterator<Item = impl Into<String>>,
         db_opts: &rocksdb::Options,
+        cache_size: usize,
     ) -> anyhow::Result<Self> {
         let db = DB::open_with_cfds(
             db_opts,
             path,
             name,
             column_families.into_iter().map(default_cf_descriptor),
+            cache_size,
         )?;
         Ok(db)
     }
@@ -120,6 +122,7 @@ impl DB {
         column_families: impl IntoIterator<Item = impl Into<String>>,
         db_opts: &rocksdb::Options,
         ttl: Duration,
+        cache_size: usize,
     ) -> anyhow::Result<Self> {
         let db = DB::open_with_cfds_and_ttl(
             db_opts,
@@ -131,6 +134,7 @@ impl DB {
                 rocksdb::ColumnFamilyDescriptor::new(cf_name, cf_opts)
             }),
             ttl,
+            cache_size,
         )?;
         Ok(db)
     }
@@ -144,9 +148,10 @@ impl DB {
         name: &'static str,
         cfds: impl IntoIterator<Item = rocksdb::ColumnFamilyDescriptor>,
         ttl: Duration,
+        cache_size: usize,
     ) -> anyhow::Result<DB> {
         let inner = rocksdb::DB::open_cf_descriptors_with_ttl(db_opts, path, cfds, ttl)?;
-        Ok(Self::log_construct(name, inner))
+        Ok(Self::log_construct(name, inner, cache_size))
     }
 
     /// Open RocksDB with the provided column family descriptors.
@@ -157,12 +162,13 @@ impl DB {
         path: impl AsRef<Path>,
         name: &'static str,
         cfds: impl IntoIterator<Item = rocksdb::ColumnFamilyDescriptor>,
+        cache_size: usize,
     ) -> anyhow::Result<DB> {
         let inner = with_error_logging(
             || rocksdb::DB::open_cf_descriptors(db_opts, path, cfds),
             "open_with_cfds",
         )?;
-        Ok(Self::log_construct(name, inner))
+        Ok(Self::log_construct(name, inner, cache_size))
     }
 
     /// Open db in readonly mode. This db is completely static, so any writes that occur on the primary
@@ -173,6 +179,7 @@ impl DB {
         path: impl AsRef<Path>,
         name: &'static str,
         cfs: Vec<ColumnFamilyName>,
+        cache_size: usize,
     ) -> anyhow::Result<DB> {
         let error_if_log_file_exists = false;
         let inner = with_error_logging(
@@ -180,7 +187,7 @@ impl DB {
             "open_cf_readonly",
         )?;
 
-        Ok(Self::log_construct(name, inner))
+        Ok(Self::log_construct(name, inner, cache_size))
     }
 
     /// Open db in secondary mode. A secondary db does not support writes, but can be dynamically caught up
@@ -193,24 +200,25 @@ impl DB {
         secondary_path: P,
         name: &'static str,
         cfs: Vec<ColumnFamilyName>,
+        cache_size: usize,
     ) -> anyhow::Result<DB> {
         let inner = with_error_logging(
             || rocksdb::DB::open_cf_as_secondary(opts, primary_path, secondary_path, cfs),
             "open_cf_as_secondary",
         )?;
-        Ok(Self::log_construct(name, inner))
+        Ok(Self::log_construct(name, inner, cache_size))
     }
 
     // Cache size estimation: we want to allocate about 1GB for cache. Estimate that slot keys are about 80 bytes and slot values
     // are around 400 bytes + 56 bytes of overhead on the stack (see weighter). Multiply by 1.5 to account for overhead (per quick-cache docs).
     // That gives estimated item capacity of 1GB / (80 + 400 + 56) * 1.5 ~= 1.2M.
-    fn log_construct(name: &'static str, inner: rocksdb::DB) -> DB {
+    fn log_construct(name: &'static str, inner: rocksdb::DB, cache_size: usize) -> DB {
         info!(rocksdb_name = name, path = %inner.path().display(), "Opened RocksDB");
         DB {
             name,
             cache: RwLock::new(Cache::with_weighter(
-                1_200_000,
-                1_000_000_000,
+                ((cache_size / (80 + 400 + 56)) * 3) / 2,
+                cache_size as u64,
                 BasicWeighter,
             )),
             db: Arc::new(inner),
@@ -486,12 +494,11 @@ impl DB {
                     Operation::Put { value } => {
                         write_sizes.push(key.len() + value.len());
                         db_batch.put_cf(cf_handle, &key, &value);
-                        let _ = cache.replace((cf_name, key), Some(value), true);
-                        // uses "soft=true" to avoid changing heat of the key
+                        cache.insert((cf_name, key), Some(value));
                     }
                     Operation::Delete => {
                         db_batch.delete_cf(cf_handle, &key);
-                        let _ = cache.replace((cf_name, key), None, true); // uses "soft=true" to avoid changing heat of the key
+                        cache.insert((cf_name, key), None);
                         deletes_for_cf += 1;
                     }
                     Operation::DeleteRange { .. } => {
@@ -752,8 +759,14 @@ mod tests {
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
 
-        let db = DB::open(tmpdir.path(), "test_db_debug", column_families, &db_opts)
-            .expect("Failed to open DB.");
+        let db = DB::open(
+            tmpdir.path(),
+            "test_db_debug",
+            column_families,
+            &db_opts,
+            1_000_000,
+        )
+        .expect("Failed to open DB.");
 
         let db_debug = format!("{db:?}");
         assert!(db_debug.contains("test_db_debug"));

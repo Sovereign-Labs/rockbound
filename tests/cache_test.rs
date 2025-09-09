@@ -46,7 +46,14 @@ fn open_db(dir: impl AsRef<std::path::Path>) -> DB {
     let mut db_opts = rocksdb::Options::default();
     db_opts.create_if_missing(true);
     db_opts.create_missing_column_families(true);
-    DB::open(dir, "cache_test", get_column_families(), &db_opts).expect("Failed to open DB.")
+    DB::open(
+        dir,
+        "cache_test",
+        get_column_families(),
+        &db_opts,
+        1_000_000,
+    )
+    .expect("Failed to open DB.") // Use 1 MB cache for testing
 }
 
 struct TestDB {
