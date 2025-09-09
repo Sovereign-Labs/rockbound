@@ -184,7 +184,7 @@ impl DeltaReader {
     }
 
     #[allow(dead_code)]
-    fn iter<S: Schema>(&self) -> anyhow::Result<DeltaReaderIter<SnapshotIter>> {
+    fn iter<S: Schema>(&self) -> anyhow::Result<DeltaReaderIter<'_, SnapshotIter<'_>>> {
         let snapshot_iterators = self
             .snapshots
             .iter()
@@ -203,7 +203,7 @@ impl DeltaReader {
     fn iter_range<S: Schema>(
         &self,
         range: impl std::ops::RangeBounds<SchemaKey> + Clone,
-    ) -> anyhow::Result<DeltaReaderIter<SnapshotIterRange>> {
+    ) -> anyhow::Result<DeltaReaderIter<'_, SnapshotIterRange<'_>>> {
         let snapshot_iterators = self
             .snapshots
             .iter()
@@ -219,7 +219,7 @@ impl DeltaReader {
         ))
     }
 
-    fn iter_rev<S: Schema>(&self) -> anyhow::Result<DeltaReaderIter<Rev<SnapshotIter>>> {
+    fn iter_rev<S: Schema>(&self) -> anyhow::Result<DeltaReaderIter<'_, Rev<SnapshotIter<'_>>>> {
         // Snapshot iterators.
         // Snapshots are in natural order, but k/v are in reversed.
         // Snapshots need to be in natural order, so chronology is always preserved.
@@ -241,7 +241,7 @@ impl DeltaReader {
     fn iter_rev_range<S: Schema>(
         &self,
         range: impl std::ops::RangeBounds<SchemaKey> + Clone,
-    ) -> anyhow::Result<DeltaReaderIter<Rev<SnapshotIterRange>>> {
+    ) -> anyhow::Result<DeltaReaderIter<'_, Rev<SnapshotIterRange<'_>>>> {
         let snapshot_iterators = self
             .snapshots
             .iter()
@@ -432,7 +432,10 @@ mod tests {
         let mut db_opts = rocksdb::Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
-        Arc::new(DB::open(dir, "test", column_families, &db_opts).expect("Failed to open DB."))
+        Arc::new(
+            DB::open(dir, "test", column_families, &db_opts, 1_000_000)
+                .expect("Failed to open DB."),
+        )
     }
 
     // Test utils
