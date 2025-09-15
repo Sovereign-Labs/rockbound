@@ -505,7 +505,7 @@ where
         // behavior of the system.
         let loaded_version = self.db.get_committed_version()?;
         if loaded_version.is_some_and(|v| v > latest_version) {
-            tracing::debug!(?loaded_version, "DB is out of date, fetching 'live' values from historical table. Using latest version {:?}", latest_version);
+            tracing::trace!(?loaded_version, "DB is out of date, fetching 'live' values from historical table. Using latest version {:?}", latest_version);
             // The data from the base version is guaranteed to match our data - but data from the latest version could be from a different fork that was committed
             return Ok(self.get_historical_borrowed(key, latest_version)?);
         }
@@ -515,7 +515,7 @@ where
         let loaded_version = self.db.get_committed_version()?;
         if loaded_version.is_some_and(|v| v > latest_version) {
             // Coherency - check that the DB is still in date before returning the value. If not, we need to retry from the historical table.
-            tracing::debug!(
+            tracing::trace!(
                 ?loaded_version, "DB became out of date during a read. Fetching 'live' values from historical table. Using latest version {:?}",
                 latest_version
             );
