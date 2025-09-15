@@ -270,10 +270,10 @@ impl DB {
                         // Note: We have to deserialize the value while holding the read lock because the lifetime of the borrow is tied to `inner`.
                         // This prevents us from unifying the two branches.
                         // Note: We don't count bytes read from the cache
-                        cache.insert(
-                            (S::COLUMN_FAMILY_NAME, k),
-                            result.as_ref().map(|v| v.to_vec()),
-                        );
+                        // cache.insert(
+                        //     (S::COLUMN_FAMILY_NAME, k),
+                        //     result.as_ref().map(|v| v.to_vec()),
+                        // );
                     }
                     return result
                         .map(|raw_value| <S::Value as ValueCodec<S>>::decode_value(&raw_value))
@@ -494,11 +494,11 @@ impl DB {
                     Operation::Put { value } => {
                         write_sizes.push(key.len() + value.len());
                         db_batch.put_cf(cf_handle, &key, &value);
-                        cache.insert((cf_name, key), Some(value));
+                        // cache.insert((cf_name, key), Some(value));
                     }
                     Operation::Delete => {
                         db_batch.delete_cf(cf_handle, &key);
-                        cache.insert((cf_name, key), None);
+                        // cache.insert((cf_name, key), None);
                         deletes_for_cf += 1;
                     }
                     Operation::DeleteRange { .. } => {
