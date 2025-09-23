@@ -500,11 +500,11 @@ where
         let Some(latest_version) = self.latest_version() else {
             return Ok(None);
         };
-        // If the DB mutated underneath us such that the live version is now newer than this snapshot's versino, we need to fetch from the historical table. This is much slower than fetching from the live table, but it should be a rare case.
+        // If the DB mutated underneath us such that the live version is now newer than this snapshot's version, we need to fetch from the historical table. This is much slower than fetching from the live table, but it should be a rare case.
         // Note that the data that was committed could come from a different fork even if it's at the same height as our snapshot. This is intentionally allowed for compatibiltiy with pre-existing
         // behavior of the system.
         let loaded_version = self.db.get_committed_version()?;
-        if loaded_version.is_some_and(|v| v > latest_version) {
+        if loaded_version.is_some_and(|v| v.saturating_sub(1) > latest_version) { // Note that we subtract 1 because we want to read from the latest version if the committed version is our sibling.
             tracing::trace!(?loaded_version, "DB is out of date, fetching 'live' values from historical table. Using latest version {:?}", latest_version);
             // The data from the base version is guaranteed to match our data - but data from the latest version could be from a different fork that was committed
             return Ok(self.get_historical_borrowed(key, latest_version)?);
@@ -513,7 +513,7 @@ where
         let live_value = self.db.get_live_value(key.borrow())?;
         // If the DB has no committed version or if its latest version is less than the latest version we know about, then it hasn't changed underneath us in a way that would invalidate the read.
         let loaded_version = self.db.get_committed_version()?;
-        if loaded_version.is_some_and(|v| v > latest_version) {
+        if loaded_version.is_some_and(|v| v.saturating_sub(1) > latest_version) { // Note that we subtract 1 because we want to read from the latest version if the committed version is our sibling.
             // Coherency - check that the DB is still in date before returning the value. If not, we need to retry from the historical table.
             tracing::trace!(
                 ?loaded_version, "DB became out of date during a read. Fetching 'live' values from historical table. Using latest version {:?}",
