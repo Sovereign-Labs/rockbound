@@ -500,7 +500,7 @@ where
         let Some(latest_version) = self.latest_version() else {
             return Ok(None);
         };
-        // If the DB mutated underneath us such that the live version is now newer than this snapshot's versino, we need to fetch from the historical table. This is much slower than fetching from the live table, but it should be a rare case.
+        // If the DB mutated underneath us such that the live version is now newer than this snapshot's version, we need to fetch from the historical table. This is much slower than fetching from the live table, but it should be a rare case.
         // Note that the data that was committed could come from a different fork even if it's at the same height as our snapshot. This is intentionally allowed for compatibiltiy with pre-existing
         // behavior of the system.
         let loaded_version = self.db.get_committed_version()?;
@@ -523,6 +523,38 @@ where
         } else {
             Ok(live_value)
         }
+    }
+
+    /// Returns the global latest value for the given key.
+    pub fn get_latest_borrowed_unbound(
+        &self,
+        key: impl Borrow<K>,
+    ) -> anyhow::Result<Option<V::Value>> {
+        let live_table_version = self.db.get_committed_version()?;
+        let latest_version = self.latest_version();
+        // If the "live" table is ahead of this storage, fetch directly from the live table.
+        let Some(latest_version) = latest_version else {
+            return self.db.get_live_value(key.borrow());
+        };
+        if live_table_version.is_some_and(|v| v > latest_version) {
+            return self.db.get_live_value(key.borrow());
+        }
+        // Otherwise, look through the snapshots
+        for (idx, snapshot) in self.snapshots.iter().rev().enumerate() {
+            let snapshot_version = latest_version.saturating_sub(idx as u64);
+            // If the snapshot is older than (or the same age as) the live table, we can stop looking.
+            if live_table_version.is_some_and(|live_db_version| live_db_version >= snapshot_version)
+            {
+                break;
+            }
+
+            // Check the snapshot
+            if let Some(value) = snapshot.versioned_table_writes.get(key.borrow()) {
+                return Ok(value.clone());
+            }
+        }
+        // If we've looked through all the snapshots and the live table is still ahead, fetch from the live table.
+        self.db.get_live_value(key.borrow())
     }
 
     /// Returns the value of a key in the historical column family as of the given version.
