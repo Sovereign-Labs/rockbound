@@ -574,10 +574,7 @@ impl DB {
         with_error_logging(
             || {
                 self.db.cf_handle(cf_name).ok_or_else(|| {
-                    format_err!(
-                        "DB::cf_handle not found for column family name: {}",
-                        cf_name
-                    )
+                    format_err!("DB::cf_handle not found for column family name: {cf_name}",)
                 })
             },
             "get_cf_handle",
@@ -614,9 +611,7 @@ impl DB {
                     .property_int_value_cf(self.get_cf_handle(cf_name)?, property_name)?
                     .ok_or_else(|| {
                         format_err!(
-                            "Unable to get property \"{}\" of  column family \"{}\".",
-                            property_name,
-                            cf_name,
+                            "Unable to get property \"{property_name}\" of  column family \"{cf_name}\".",
                         )
                     })
             },
