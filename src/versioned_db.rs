@@ -365,7 +365,6 @@ where
 
     /// Materializes a batch of writes to the database.
     // TODO: This is a confusing API that modifies the live DB batch in place *and* returns a batch. This is the most efficient way we can do things at the moment, but... oof.
-    #[must_use]
     pub fn materialize(
         &self,
         batch: &VersionedSchemaBatch<V>,
