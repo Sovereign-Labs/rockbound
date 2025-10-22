@@ -119,7 +119,17 @@ impl ValueCodec<VersionMetadata> for u64 {
 /// - Read from the live column family
 #[derive(Clone, Debug)]
 pub struct VersionedDB<S: SchemaWithVersion> {
-    db: Arc<DB>,
+    /// Holds the live state and the committed versions metadata.
+    ///
+    /// # Warning
+    /// This database *must* be written last so that we're in a consistent state on crash.
+    /// When we recover, we'll read that version N-1 was the last committed version even if version N has been written
+    /// to the archival DB - but that's fine because we'll reprocess block N and derive the same write set for archival state
+    /// since the live_db is still correct. Conversely, if we were to commit archival state last then there would be no way to
+    /// correctly re-execute the previous block..
+    live_db: Arc<DB>,
+    /// Holds *only* the archival and pruning data, inluding pruned version metadata.
+    archival_db: Arc<DB>,
     _schema: S,
 }
 
@@ -130,12 +140,12 @@ where
 {
     /// Returns the oldest version that is available in the database.
     pub fn get_pruned_version(&self) -> anyhow::Result<Option<u64>> {
-        self.db
+        self.archival_db
             .get::<S::VersionMetadatacolumn>(&VersionedTableMetadataKey::PrunedVersion)
     }
     /// Returns the latest committed version in the database.
     pub fn get_committed_version(&self) -> anyhow::Result<Option<u64>> {
-        self.db
+        self.live_db
             .get::<S::VersionMetadatacolumn>(&VersionedTableMetadataKey::CommittedVersion)
     }
 }
@@ -268,7 +278,10 @@ pub trait SchemaWithVersion: Schema {
     type HistoricalColumnFamily: Schema<Key = VersionedKey<Self, Self::Key>, Value = Self::Value>;
     /// A column family for storing the pruning keys of the schema.
     type PruningColumnFamily: Schema<Key = PrunableKey<Self, Self::Key>, Value = ()>;
-    /// A column family for storing the committed version of the schema.
+    /// A column family for storing the committed version of storage and the latest pruned version.
+    /// For backwards compatibility, we make the slightly awkward choice of string a column family of this name in both the live and archival DBs
+    /// where the archival DB only stores the pruned version metadata and the live DB stores only the committed version metadata.
+    /// (This way, the behavior of the split DBs is identical to the old behavior of a single DB.)
     type VersionMetadatacolumn: Schema<Key = VersionedTableMetadataKey, Value = u64>;
 }
 
@@ -282,13 +295,14 @@ where
     /// Adds the column families for the versioned schema to the existing column families.
     pub fn add_column_families(
         existing_column_families: &mut Vec<ColumnFamilyDescriptor>,
+        separate_archival_and_pruning: bool,
     ) -> anyhow::Result<()> {
         let historical_versioned_column_family = V::HistoricalColumnFamily::COLUMN_FAMILY_NAME;
         let pruning_column_family = V::PruningColumnFamily::COLUMN_FAMILY_NAME;
         let live_column_family = V::COLUMN_FAMILY_NAME;
-        let committed_version_column_family = V::VersionMetadatacolumn::COLUMN_FAMILY_NAME;
+        let metadata_column_family = V::VersionMetadatacolumn::COLUMN_FAMILY_NAME;
         for column in existing_column_families.iter() {
-            if column.name() == committed_version_column_family
+            if column.name() == metadata_column_family
                 || column.name() == historical_versioned_column_family
                 || column.name() == live_column_family
                 || column.name() == pruning_column_family
@@ -296,17 +310,22 @@ where
                 bail!("{} column name is reserved for internal use", column.name());
             }
         }
-        existing_column_families.push(default_cf_descriptor(historical_versioned_column_family));
+
+        if !separate_archival_and_pruning {
+            existing_column_families
+                .push(default_cf_descriptor(historical_versioned_column_family));
+            existing_column_families.push(default_cf_descriptor(pruning_column_family));
+        }
         existing_column_families.push(live_versioned_column_family_descriptor(live_column_family));
-        existing_column_families.push(default_cf_descriptor(pruning_column_family));
-        existing_column_families.push(default_cf_descriptor(committed_version_column_family));
+        existing_column_families.push(default_cf_descriptor(metadata_column_family));
         Ok(())
     }
 
     /// Creates a new versioned DB from an existing DB.
-    pub fn from_db(db: Arc<DB>) -> anyhow::Result<Self> {
+    pub fn from_dbs(live_db: Arc<DB>, archival_db: Arc<DB>) -> anyhow::Result<Self> {
         Ok(Self {
-            db,
+            live_db,
+            archival_db,
             _schema: Default::default(),
         })
     }
@@ -322,7 +341,7 @@ where
         let first_version_to_keep = version.saturating_add(1);
         let range = ..first_version_to_keep.to_be_bytes().to_vec();
         let iterator = self
-            .db
+            .archival_db
             .raw_iter_range::<V::PruningColumnFamily>(range, ScanDirection::Forward)?;
         Ok(iterator.map(|(key, _value)| <V::PruningColumnFamily as Schema>::Key::decode_key(&key)))
     }
@@ -330,43 +349,46 @@ where
     /// Name of the database that can be used for logging or metrics or tracing.
     #[inline]
     pub fn name(&self) -> &'static str {
-        self.db.name()
+        self.live_db.name()
     }
 
     /// Returns the value of a key in the live column family.
     pub fn get_live_value(&self, key: &impl KeyEncoder<V>) -> anyhow::Result<Option<V::Value>> {
-        self.db.get::<V>(key)
+        self.live_db.get::<V>(key)
     }
 
     /// Returns the latest committed version in the database.
     pub fn load_latest_committed_version(&self) -> anyhow::Result<Option<u64>> {
-        self.db
+        self.live_db
             .get::<V::VersionMetadatacolumn>(&VersionedTableMetadataKey::CommittedVersion)
     }
 
     /// Materializes a batch of writes to the database.
+    // TODO: This is a confusing API that modifies the live DB batch in place *and* returns a batch. This is the most efficient way we can do things at the moment, but... oof.
+    #[must_use]
     pub fn materialize(
         &self,
         batch: &VersionedSchemaBatch<V>,
         output_batch: &mut SchemaBatch,
         version: u64,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<SchemaBatch> {
+        let mut historical_batch = SchemaBatch::new();
         for (key, value) in batch.versioned_table_writes.iter() {
             // Write to the Live keys table
             if let Some(value) = value {
                 output_batch.put::<V>(key, value)?;
-                output_batch.put::<V::HistoricalColumnFamily>(
+                historical_batch.put::<V::HistoricalColumnFamily>(
                     &VersionedKey::<V, &V::Key>::new(key, version),
                     value,
                 )?;
             } else {
                 output_batch.delete::<V>(key)?;
-                output_batch.delete::<V::HistoricalColumnFamily>(
+                historical_batch.delete::<V::HistoricalColumnFamily>(
                     &VersionedKey::<V, &V::Key>::new(key, version),
                 )?;
             }
             // Write to the pruning table
-            output_batch.put::<V::PruningColumnFamily>(
+            historical_batch.put::<V::PruningColumnFamily>(
                 &PrunableKey::<V, &V::Key>::new(version, key),
                 &(),
             )?;
@@ -376,7 +398,12 @@ where
             &VersionedTableMetadataKey::CommittedVersion,
             &version,
         )?;
-        Ok(())
+        Ok(historical_batch)
+    }
+
+    /// Commits the archival state to the archival DB.
+    pub fn commit_archival(&self, batch: SchemaBatch) -> anyhow::Result<()> {
+        self.archival_db.write_schemas(batch)
     }
 
     /// Returns the value of a key in the historical column family as of the given version.
@@ -413,7 +440,7 @@ where
         let key_with_version = VersionedKey::<V, _>::new(key_to_get, max_version).encode_key()?;
         let range = ..=&key_with_version;
         let mut iterator = self
-            .db
+            .archival_db
             .raw_iter_range::<V::HistoricalColumnFamily>(range, ScanDirection::Backward)?;
         if let Some((key, value_bytes)) = iterator.next() {
             // Safety: All keys are suffixed with an 8-byte version.
