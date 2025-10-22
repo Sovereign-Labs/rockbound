@@ -279,7 +279,7 @@ pub trait SchemaWithVersion: Schema {
     /// A column family for storing the pruning keys of the schema.
     type PruningColumnFamily: Schema<Key = PrunableKey<Self, Self::Key>, Value = ()>;
     /// A column family for storing the committed version of storage and the latest pruned version.
-    /// For backwards compatibility, we make the slightly awkward choice of string a column family of this name in both the live and archival DBs
+    /// For backwards compatibility, we make the slightly awkward choice of storing a column family of this name in both the live and archival DBs
     /// where the archival DB only stores the pruned version metadata and the live DB stores only the committed version metadata.
     /// (This way, the behavior of the split DBs is identical to the old behavior of a single DB.)
     type VersionMetadatacolumn: Schema<Key = VersionedTableMetadataKey, Value = u64>;
