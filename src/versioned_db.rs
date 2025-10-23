@@ -399,11 +399,6 @@ where
         Ok(())
     }
 
-    /// Commits the archival state to the archival DB.
-    pub fn commit_archival(&self, batch: SchemaBatch) -> anyhow::Result<()> {
-        self.archival_db.write_schemas(batch)
-    }
-
     /// Returns the value of a key in the historical column family as of the given version.
     pub fn get_historical_value(
         &self,
