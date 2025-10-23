@@ -364,40 +364,39 @@ where
     }
 
     /// Materializes a batch of writes to the database.
-    // TODO: This is a confusing API that modifies the live DB batch in place *and* returns a batch. This is the most efficient way we can do things at the moment, but... oof.
     pub fn materialize(
         &self,
         batch: &VersionedSchemaBatch<V>,
-        output_batch: &mut SchemaBatch,
+        live_batch: &mut SchemaBatch,
+        archival_batch: &mut SchemaBatch,
         version: u64,
-    ) -> anyhow::Result<SchemaBatch> {
-        let mut historical_batch = SchemaBatch::new();
+    ) -> anyhow::Result<()> {
         for (key, value) in batch.versioned_table_writes.iter() {
             // Write to the Live keys table
             if let Some(value) = value {
-                output_batch.put::<V>(key, value)?;
-                historical_batch.put::<V::HistoricalColumnFamily>(
+                live_batch.put::<V>(key, value)?;
+                archival_batch.put::<V::HistoricalColumnFamily>(
                     &VersionedKey::<V, &V::Key>::new(key, version),
                     value,
                 )?;
             } else {
-                output_batch.delete::<V>(key)?;
-                historical_batch.delete::<V::HistoricalColumnFamily>(
+                live_batch.delete::<V>(key)?;
+                archival_batch.delete::<V::HistoricalColumnFamily>(
                     &VersionedKey::<V, &V::Key>::new(key, version),
                 )?;
             }
             // Write to the pruning table
-            historical_batch.put::<V::PruningColumnFamily>(
+            archival_batch.put::<V::PruningColumnFamily>(
                 &PrunableKey::<V, &V::Key>::new(version, key),
                 &(),
             )?;
         }
         // Write to the historical table
-        output_batch.put::<V::VersionMetadatacolumn>(
+        live_batch.put::<V::VersionMetadatacolumn>(
             &VersionedTableMetadataKey::CommittedVersion,
             &version,
         )?;
-        Ok(historical_batch)
+        Ok(())
     }
 
     /// Commits the archival state to the archival DB.
