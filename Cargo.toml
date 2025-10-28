@@ -1,6 +1,6 @@
 [package]
 name = "rockbound"
-version = "1.0.0"
+version = "0.1.0"
 edition = "2021"
 authors = ["Sovereign Labs <info@sovereign.xyz>"]
 homepage = "https://github.com/sovereign-labs/rockbound"
