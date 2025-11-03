@@ -275,14 +275,15 @@ impl Iterator for RawDbIter<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use rocksdb::DEFAULT_COLUMN_FAMILY_NAME;
+    use std::path::Path;
 
     use super::*;
     use crate::schema::ColumnFamilyName;
+    use crate::schema::KeyEncoder;
     use crate::test::TestField;
     use crate::{define_schema, DB};
+    use proptest::prelude::*;
 
     define_schema!(TestSchema1, TestField, TestField, "TestCF1");
 
@@ -306,308 +307,311 @@ mod tests {
         .expect("Failed to open DB.")
     }
 
-    mod raw_db_iterator {
-        use proptest::prelude::*;
+    #[test]
+    fn test_empty_raw_iterator() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db = open_db(tmpdir.path());
 
-        use super::*;
-        use crate::schema::KeyEncoder;
+        let iter_forward = db.raw_iter::<S>(ScanDirection::Forward).unwrap();
+        let count_forward = iter_forward.count();
+        assert_eq!(0, count_forward);
 
-        #[test]
-        fn test_empty_raw_iterator() {
-            let tmpdir = tempfile::tempdir().unwrap();
-            let db = open_db(tmpdir.path());
+        let iter_backward = db.raw_iter::<S>(ScanDirection::Backward).unwrap();
+        let count_backward = iter_backward.count();
+        assert_eq!(0, count_backward);
+    }
 
-            let iter_forward = db.raw_iter::<S>(ScanDirection::Forward).unwrap();
-            let count_forward = iter_forward.count();
-            assert_eq!(0, count_forward);
+    fn collect_actual_values(iter: RawDbIter) -> Vec<(u32, u32)> {
+        iter.map(|(key, value)| {
+            let key = <<S as Schema>::Key as KeyDecoder<S>>::decode_key(&key).unwrap();
+            let value = <<S as Schema>::Value as ValueCodec<S>>::decode_value(&value).unwrap();
+            (key.0, value.0)
+        })
+        .collect::<Vec<_>>()
+    }
 
-            let iter_backward = db.raw_iter::<S>(ScanDirection::Backward).unwrap();
-            let count_backward = iter_backward.count();
-            assert_eq!(0, count_backward);
-        }
+    fn encode_key(field: &TestField) -> SchemaKey {
+        <TestField as KeyEncoder<S>>::encode_key(field).unwrap()
+    }
 
-        fn collect_actual_values(iter: RawDbIter) -> Vec<(u32, u32)> {
-            iter.map(|(key, value)| {
-                let key = <<S as Schema>::Key as KeyDecoder<S>>::decode_key(&key).unwrap();
-                let value = <<S as Schema>::Value as ValueCodec<S>>::decode_value(&value).unwrap();
-                (key.0, value.0)
+    fn test_iterator(
+        db: &DB,
+        prefix: &'static str,
+        range: impl std::ops::RangeBounds<SchemaKey> + Clone,
+        mut expected_values: Vec<(u32, u32)>,
+    ) {
+        let iter_range_forward = db
+            .raw_iter_range::<S>(range.clone(), ScanDirection::Forward)
+            .unwrap();
+        let actual_values = collect_actual_values(iter_range_forward);
+
+        assert_eq!(expected_values, actual_values, "{prefix} forward",);
+        let iter_range_backward = db
+            .raw_iter_range::<S>(range, ScanDirection::Backward)
+            .unwrap();
+        let actual_values = collect_actual_values(iter_range_backward);
+        expected_values.reverse();
+        assert_eq!(expected_values, actual_values, "{prefix} backward");
+    }
+
+    #[test]
+    fn iterator_tests() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db = open_db(tmpdir.path());
+
+        let field_1 = TestField(10);
+        let field_2 = TestField(20);
+        let field_3 = TestField(30);
+        let field_4 = TestField(40);
+        let field_5 = TestField(50);
+        let field_6 = TestField(60);
+
+        db.put::<S>(&field_3, &field_2).unwrap();
+        db.put::<S>(&field_2, &field_1).unwrap();
+        db.put::<S>(&field_4, &field_5).unwrap();
+        db.put::<S>(&field_1, &field_4).unwrap();
+        db.put::<S>(&field_5, &field_6).unwrap();
+        db.put::<S>(&field_6, &field_6).unwrap();
+
+        // All values, forward
+        let iter_forward = db.raw_iter::<S>(ScanDirection::Forward).unwrap();
+
+        let actual_values = collect_actual_values(iter_forward);
+        let expected_values = vec![(10, 40), (20, 10), (30, 20), (40, 50), (50, 60), (60, 60)];
+        assert_eq!(expected_values, actual_values, "all values, forward");
+
+        // All values, backward
+        let iter_backward = db.raw_iter::<S>(ScanDirection::Backward).unwrap();
+        let actual_values = collect_actual_values(iter_backward);
+        let expected_values = vec![(60, 60), (50, 60), (40, 50), (30, 20), (20, 10), (10, 40)];
+        assert_eq!(expected_values, actual_values, "all values, backward");
+
+        // All values, initialize with forward and then .rev()
+        let iter_rev = db.iter::<S>().unwrap().rev();
+        let actual_values: Vec<(u32, u32)> = iter_rev
+            .map(|res| {
+                let item = res.unwrap();
+                (item.key.0, item.value.0)
             })
-            .collect::<Vec<_>>()
+            .collect();
+        let expected_values = vec![(60, 60), (50, 60), (40, 50), (30, 20), (20, 10), (10, 40)];
+        assert_eq!(expected_values, actual_values, "all values, .rev()");
+
+        // Bounds: Ranges
+        let lower_bound = encode_key(&field_2);
+        let upper_bound = encode_key(&field_5);
+
+        test_iterator(
+            &db,
+            "20..50",
+            lower_bound.clone()..upper_bound.clone(),
+            vec![(20, 10), (30, 20), (40, 50)],
+        );
+        test_iterator(
+            &db,
+            "20..=50",
+            lower_bound.clone()..=upper_bound.clone(),
+            vec![(20, 10), (30, 20), (40, 50), (50, 60)],
+        );
+        test_iterator(
+            &db,
+            "15..45",
+            encode_key(&TestField(15))..encode_key(&TestField(45)),
+            vec![(20, 10), (30, 20), (40, 50)],
+        );
+        test_iterator(
+            &db,
+            "15..=45",
+            encode_key(&TestField(15))..=encode_key(&TestField(45)),
+            vec![(20, 10), (30, 20), (40, 50)],
+        );
+        test_iterator(
+            &db,
+            "20..",
+            lower_bound.clone()..,
+            vec![(20, 10), (30, 20), (40, 50), (50, 60), (60, 60)],
+        );
+        test_iterator(
+            &db,
+            "..50",
+            ..upper_bound.clone(),
+            vec![(10, 40), (20, 10), (30, 20), (40, 50)],
+        );
+        test_iterator(
+            &db,
+            "..=50",
+            ..=upper_bound.clone(),
+            vec![(10, 40), (20, 10), (30, 20), (40, 50), (50, 60)],
+        );
+        test_iterator(
+            &db,
+            "..=59",
+            ..encode_key(&TestField(59)),
+            vec![(10, 40), (20, 10), (30, 20), (40, 50), (50, 60)],
+        );
+        test_iterator(
+            &db,
+            "..",
+            ..,
+            vec![(10, 40), (20, 10), (30, 20), (40, 50), (50, 60), (60, 60)],
+        );
+        test_iterator(
+            &db,
+            "50..=50",
+            upper_bound.clone()..=upper_bound.clone(),
+            vec![(50, 60)],
+        );
+        test_iterator(
+            &db,
+            "outside upper 0..100",
+            encode_key(&TestField(100))..encode_key(&TestField(102)),
+            vec![],
+        );
+
+        test_iterator(
+            &db,
+            "outside lower 0..10",
+            encode_key(&TestField(0))..encode_key(&TestField(1)),
+            vec![],
+        );
+
+        {
+            for direction in [ScanDirection::Forward, ScanDirection::Backward] {
+                // Inverse
+                let err = db
+                    .raw_iter_range::<S>(upper_bound.clone()..lower_bound.clone(), direction)
+                    .err()
+                    .unwrap();
+                assert_eq!(
+                    "[Rockbound]: error in raw_iter_range: lower_bound > upper_bound",
+                    err.to_string()
+                );
+
+                // Empty
+                let iter = db
+                    .raw_iter_range::<S>(upper_bound.clone()..upper_bound.clone(), direction)
+                    .unwrap();
+                let actual_values = collect_actual_values(iter);
+                assert_eq!(Vec::<(u32, u32)>::new(), actual_values);
+            }
         }
+    }
 
-        fn encode_key(field: &TestField) -> SchemaKey {
-            <TestField as KeyEncoder<S>>::encode_key(field).unwrap()
+    fn check_iterator_proptest(numbers: Vec<u32>) {
+        assert!(numbers.len() >= 10);
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db = open_db(tmpdir.path());
+
+        // Numbers
+        let existing_lower = numbers[2];
+        let existing_upper = numbers[8];
+
+        let min_value = *numbers.iter().min().unwrap();
+        let max_value = *numbers.iter().max().unwrap();
+        let maybe_non_existing_lower_1 = existing_lower.saturating_sub(1);
+        let maybe_non_existing_lower_2 = existing_lower.checked_add(1).unwrap_or(u32::MAX - 2);
+        let maybe_non_existing_upper_1 = existing_upper.saturating_sub(1);
+        let maybe_non_existing_upper_2 = existing_upper.checked_add(1).unwrap_or(u32::MAX - 2);
+
+        // Ranges will be constructed from these pairs
+        let range_pairs = vec![
+            (min_value, max_value),
+            (existing_lower, existing_upper),
+            (min_value, existing_lower),
+            (min_value, existing_upper),
+            (existing_lower, max_value),
+            (existing_upper, max_value),
+            (existing_lower, maybe_non_existing_upper_1),
+            (existing_lower, maybe_non_existing_upper_2),
+            (maybe_non_existing_lower_1, existing_upper),
+            (maybe_non_existing_lower_2, existing_upper),
+            (maybe_non_existing_lower_1, maybe_non_existing_upper_1),
+            (maybe_non_existing_lower_1, maybe_non_existing_upper_2),
+            (maybe_non_existing_lower_2, maybe_non_existing_upper_1),
+            (maybe_non_existing_lower_1, maybe_non_existing_upper_2),
+            (maybe_non_existing_lower_1, max_value),
+            (maybe_non_existing_lower_2, max_value),
+            (min_value, maybe_non_existing_upper_1),
+            (min_value, maybe_non_existing_upper_2),
+        ];
+
+        for number in numbers {
+            db.put::<S>(&TestField(number), &TestField(number)).unwrap();
         }
+        for (low, high) in range_pairs {
+            if low > high {
+                continue;
+            }
+            let low = TestField(low);
+            let high = TestField(high);
 
-        fn test_iterator(
-            db: &DB,
-            prefix: &'static str,
-            range: impl std::ops::RangeBounds<SchemaKey> + Clone,
-            mut expected_values: Vec<(u32, u32)>,
-        ) {
-            let iter_range_forward = db
-                .raw_iter_range::<S>(range.clone(), ScanDirection::Forward)
-                .unwrap();
-            let actual_values = collect_actual_values(iter_range_forward);
+            let range = encode_key(&low)..encode_key(&high);
+            let range_inclusive = encode_key(&low)..=encode_key(&high);
+            let range_to = ..encode_key(&high);
+            let range_to_inclusive = ..=encode_key(&high);
+            let range_from = encode_key(&low)..;
+            let range_full = ..;
 
-            assert_eq!(expected_values, actual_values, "{prefix} forward",);
-            let iter_range_backward = db
-                .raw_iter_range::<S>(range, ScanDirection::Backward)
-                .unwrap();
-            let actual_values = collect_actual_values(iter_range_backward);
-            expected_values.reverse();
-            assert_eq!(expected_values, actual_values, "{prefix} backward");
+            check_range(&db, range);
+            check_range(&db, range_inclusive);
+            check_range(&db, range_to);
+            check_range(&db, range_to_inclusive);
+            check_range(&db, range_from);
+            check_range(&db, range_full);
+        }
+    }
+
+    fn check_range<R: std::ops::RangeBounds<SchemaKey> + Clone + std::fmt::Debug>(
+        db: &DB,
+        range: R,
+    ) {
+        for direction in [ScanDirection::Forward, ScanDirection::Backward] {
+            let iter_range = db.raw_iter_range::<S>(range.clone(), direction).unwrap();
+            validate_iterator(iter_range, range.clone(), direction);
+        }
+    }
+
+    fn validate_iterator<I, R>(iterator: I, range: R, direction: ScanDirection)
+    where
+        I: Iterator<Item = (SchemaKey, SchemaValue)>,
+        R: std::ops::RangeBounds<SchemaKey> + std::fmt::Debug,
+    {
+        let mut prev_key: Option<TestField> = None;
+        for (key, _) in iterator {
+            assert!(range.contains(&key));
+            let key = <<S as Schema>::Key as KeyDecoder<S>>::decode_key(&key).unwrap();
+            if let Some(prev_key) = prev_key {
+                match direction {
+                    ScanDirection::Forward => assert!(
+                        key.0 >= prev_key.0,
+                        "key={}, prev_key={} range={:?}",
+                        key.0,
+                        prev_key.0,
+                        range
+                    ),
+                    ScanDirection::Backward => assert!(
+                        key.0 <= prev_key.0,
+                        "key={}, prev_key={} range={:?}",
+                        key.0,
+                        prev_key.0,
+                        range
+                    ),
+                };
+            }
+            prev_key = Some(key);
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn raw_db_iterator_iterate_proptest_any_number(input in prop::collection::vec(any::<u32>(), 10..80)) {
+            check_iterator_proptest(input);
         }
 
         #[test]
-        fn raw_db_iterator_iterate() {
-            let tmpdir = tempfile::tempdir().unwrap();
-            let db = open_db(tmpdir.path());
-
-            let field_1 = TestField(10);
-            let field_2 = TestField(20);
-            let field_3 = TestField(30);
-            let field_4 = TestField(40);
-            let field_5 = TestField(50);
-            let field_6 = TestField(60);
-
-            db.put::<S>(&field_3, &field_2).unwrap();
-            db.put::<S>(&field_2, &field_1).unwrap();
-            db.put::<S>(&field_4, &field_5).unwrap();
-            db.put::<S>(&field_1, &field_4).unwrap();
-            db.put::<S>(&field_5, &field_6).unwrap();
-            db.put::<S>(&field_6, &field_6).unwrap();
-
-            // All values, forward
-            let iter_forward = db.raw_iter::<S>(ScanDirection::Forward).unwrap();
-
-            let actual_values = collect_actual_values(iter_forward);
-            let expected_values = vec![(10, 40), (20, 10), (30, 20), (40, 50), (50, 60), (60, 60)];
-            assert_eq!(expected_values, actual_values, "all values, forward");
-
-            // All values, backward
-            let iter_backward = db.raw_iter::<S>(ScanDirection::Backward).unwrap();
-            let actual_values = collect_actual_values(iter_backward);
-            let expected_values = vec![(60, 60), (50, 60), (40, 50), (30, 20), (20, 10), (10, 40)];
-
-            assert_eq!(expected_values, actual_values, "all values, backward");
-
-            // Bounds: Ranges
-            let lower_bound = encode_key(&field_2);
-            let upper_bound = encode_key(&field_5);
-
-            test_iterator(
-                &db,
-                "20..50",
-                lower_bound.clone()..upper_bound.clone(),
-                vec![(20, 10), (30, 20), (40, 50)],
-            );
-            test_iterator(
-                &db,
-                "20..=50",
-                lower_bound.clone()..=upper_bound.clone(),
-                vec![(20, 10), (30, 20), (40, 50), (50, 60)],
-            );
-            test_iterator(
-                &db,
-                "15..45",
-                encode_key(&TestField(15))..encode_key(&TestField(45)),
-                vec![(20, 10), (30, 20), (40, 50)],
-            );
-            test_iterator(
-                &db,
-                "15..=45",
-                encode_key(&TestField(15))..=encode_key(&TestField(45)),
-                vec![(20, 10), (30, 20), (40, 50)],
-            );
-            test_iterator(
-                &db,
-                "20..",
-                lower_bound.clone()..,
-                vec![(20, 10), (30, 20), (40, 50), (50, 60), (60, 60)],
-            );
-            test_iterator(
-                &db,
-                "..50",
-                ..upper_bound.clone(),
-                vec![(10, 40), (20, 10), (30, 20), (40, 50)],
-            );
-            test_iterator(
-                &db,
-                "..=50",
-                ..=upper_bound.clone(),
-                vec![(10, 40), (20, 10), (30, 20), (40, 50), (50, 60)],
-            );
-            test_iterator(
-                &db,
-                "..=59",
-                ..encode_key(&TestField(59)),
-                vec![(10, 40), (20, 10), (30, 20), (40, 50), (50, 60)],
-            );
-            test_iterator(
-                &db,
-                "..",
-                ..,
-                vec![(10, 40), (20, 10), (30, 20), (40, 50), (50, 60), (60, 60)],
-            );
-            test_iterator(
-                &db,
-                "50..=50",
-                upper_bound.clone()..=upper_bound.clone(),
-                vec![(50, 60)],
-            );
-            test_iterator(
-                &db,
-                "outside upper 0..100",
-                encode_key(&TestField(100))..encode_key(&TestField(102)),
-                vec![],
-            );
-
-            test_iterator(
-                &db,
-                "outside lower 0..10",
-                encode_key(&TestField(0))..encode_key(&TestField(1)),
-                vec![],
-            );
-
-            {
-                for direction in [ScanDirection::Forward, ScanDirection::Backward] {
-                    // Inverse
-                    let err = db
-                        .raw_iter_range::<S>(upper_bound.clone()..lower_bound.clone(), direction)
-                        .err()
-                        .unwrap();
-                    assert_eq!(
-                        "[Rockbound]: error in raw_iter_range: lower_bound > upper_bound",
-                        err.to_string()
-                    );
-
-                    // Empty
-                    let iter = db
-                        .raw_iter_range::<S>(upper_bound.clone()..upper_bound.clone(), direction)
-                        .unwrap();
-                    let actual_values = collect_actual_values(iter);
-                    assert_eq!(Vec::<(u32, u32)>::new(), actual_values);
-                }
-            }
-        }
-
-        fn check_iterator_proptest(numbers: Vec<u32>) {
-            assert!(numbers.len() >= 10);
-            let tmpdir = tempfile::tempdir().unwrap();
-            let db = open_db(tmpdir.path());
-
-            // Numbers
-            let existing_lower = numbers[2];
-            let existing_upper = numbers[8];
-
-            let min_value = *numbers.iter().min().unwrap();
-            let max_value = *numbers.iter().max().unwrap();
-            let maybe_non_existing_lower_1 = existing_lower.saturating_sub(1);
-            let maybe_non_existing_lower_2 = existing_lower.checked_add(1).unwrap_or(u32::MAX - 2);
-            let maybe_non_existing_upper_1 = existing_upper.saturating_sub(1);
-            let maybe_non_existing_upper_2 = existing_upper.checked_add(1).unwrap_or(u32::MAX - 2);
-
-            // Ranges will be constructed from these pairs
-            let range_pairs = vec![
-                (min_value, max_value),
-                (existing_lower, existing_upper),
-                (min_value, existing_lower),
-                (min_value, existing_upper),
-                (existing_lower, max_value),
-                (existing_upper, max_value),
-                (existing_lower, maybe_non_existing_upper_1),
-                (existing_lower, maybe_non_existing_upper_2),
-                (maybe_non_existing_lower_1, existing_upper),
-                (maybe_non_existing_lower_2, existing_upper),
-                (maybe_non_existing_lower_1, maybe_non_existing_upper_1),
-                (maybe_non_existing_lower_1, maybe_non_existing_upper_2),
-                (maybe_non_existing_lower_2, maybe_non_existing_upper_1),
-                (maybe_non_existing_lower_1, maybe_non_existing_upper_2),
-                (maybe_non_existing_lower_1, max_value),
-                (maybe_non_existing_lower_2, max_value),
-                (min_value, maybe_non_existing_upper_1),
-                (min_value, maybe_non_existing_upper_2),
-            ];
-
-            for number in numbers {
-                db.put::<S>(&TestField(number), &TestField(number)).unwrap();
-            }
-            for (low, high) in range_pairs {
-                if low > high {
-                    continue;
-                }
-                let low = TestField(low);
-                let high = TestField(high);
-
-                let range = encode_key(&low)..encode_key(&high);
-                let range_inclusive = encode_key(&low)..=encode_key(&high);
-                let range_to = ..encode_key(&high);
-                let range_to_inclusive = ..=encode_key(&high);
-                let range_from = encode_key(&low)..;
-                let range_full = ..;
-
-                check_range(&db, range);
-                check_range(&db, range_inclusive);
-                check_range(&db, range_to);
-                check_range(&db, range_to_inclusive);
-                check_range(&db, range_from);
-                check_range(&db, range_full);
-            }
-        }
-
-        fn check_range<R: std::ops::RangeBounds<SchemaKey> + Clone + std::fmt::Debug>(
-            db: &DB,
-            range: R,
-        ) {
-            for direction in [ScanDirection::Forward, ScanDirection::Backward] {
-                let iter_range = db.raw_iter_range::<S>(range.clone(), direction).unwrap();
-                validate_iterator(iter_range, range.clone(), direction);
-            }
-        }
-
-        fn validate_iterator<I, R>(iterator: I, range: R, direction: ScanDirection)
-        where
-            I: Iterator<Item = (SchemaKey, SchemaValue)>,
-            R: std::ops::RangeBounds<SchemaKey> + std::fmt::Debug,
-        {
-            let mut prev_key: Option<TestField> = None;
-            for (key, _) in iterator {
-                assert!(range.contains(&key));
-                let key = <<S as Schema>::Key as KeyDecoder<S>>::decode_key(&key).unwrap();
-                if let Some(prev_key) = prev_key {
-                    match direction {
-                        ScanDirection::Forward => assert!(
-                            key.0 >= prev_key.0,
-                            "key={}, prev_key={} range={:?}",
-                            key.0,
-                            prev_key.0,
-                            range
-                        ),
-                        ScanDirection::Backward => assert!(
-                            key.0 <= prev_key.0,
-                            "key={}, prev_key={} range={:?}",
-                            key.0,
-                            prev_key.0,
-                            range
-                        ),
-                    };
-                }
-                prev_key = Some(key);
-            }
-        }
-
-        proptest! {
-            #[test]
-            fn raw_db_iterator_iterate_proptest_any_number(input in prop::collection::vec(any::<u32>(), 10..80)) {
-                check_iterator_proptest(input);
-            }
-
-            #[test]
-            fn raw_db_iterator_iterate_proptest_uniq_numbers(input in prop::collection::hash_set(any::<u32>(), 10..80)) {
-                let input: Vec<u32> = input.into_iter().collect();
-                check_iterator_proptest(input);
-            }
+        fn raw_db_iterator_iterate_proptest_uniq_numbers(input in prop::collection::hash_set(any::<u32>(), 10..80)) {
+            let input: Vec<u32> = input.into_iter().collect();
+            check_iterator_proptest(input);
         }
     }
 }
