@@ -100,11 +100,7 @@ where
             ScanDirection::Forward => ScanDirection::Backward,
             ScanDirection::Backward => ScanDirection::Forward,
         };
-        SchemaIterator {
-            db_iter: self.db_iter,
-            direction: new_direction,
-            phantom: Default::default(),
-        }
+        Self::new(self.db_iter, new_direction)
     }
 
     fn next_impl(&mut self) -> Result<Option<IteratorOutput<S::Key, S::Value>>> {
