@@ -35,6 +35,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v3
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
       - name: Install Rust
         run: rustup toolchain install stable
       - uses: Swatinem/rust-cache@v2
@@ -50,6 +52,8 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
       - name: Install Rust
         run: rustup toolchain install stable
       - name: cargo install cargo-hack
@@ -63,6 +67,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v3
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
       - uses: taiki-e/install-action@nextest
       - name: Install Rust
         run: rustup toolchain install stable
