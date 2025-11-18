@@ -102,7 +102,7 @@ impl DB {
     pub fn open(
         path: impl AsRef<Path>,
         name: &'static str,
-        column_families: impl IntoIterator<Item = impl Into<String>>,
+        column_families: impl IntoIterator<Item = impl Into<(String, bool)>>,
         db_opts: &rocksdb::Options,
     ) -> anyhow::Result<Self> {
         let descriptors = column_families
@@ -144,7 +144,7 @@ impl DB {
         cache_size: usize,
         cacheable_column_families: Vec<String>,
     ) -> DB {
-        info!(rocksdb_name = name, path = %inner.path().display(), cacheable_column_families = %cacheable_column_families.join(","), "Opened RocksDB");
+        info!(rocksdb_name = name, path = %inner.path().display(), "Opened RocksDB");
         DB {
             name,
             cache: RwLock::new(Cache::with_weighter(
