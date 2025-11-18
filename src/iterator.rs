@@ -298,7 +298,6 @@ mod tests {
             "test-iterator",
             get_column_families(),
             &db_opts,
-            1_000_000,
         )
         .expect("Failed to open DB.")
     }

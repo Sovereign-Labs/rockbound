@@ -95,32 +95,24 @@ pub fn default_cf_descriptor(cf_name: impl Into<String>) -> rocksdb::ColumnFamil
 
 impl DB {
     /// Opens a database backed by RocksDB, using the provided column family names and default
-    /// column family options.
+    /// column family options. The opened DB does not support caching. If you need caching, use the `open_with_cfds` method instead.
     ///
     /// The `column_families` iterator contains the column family name and a boolean indicating whether the column family should be cached.
     #[tracing::instrument(skip_all, level = "error")]
     pub fn open(
         path: impl AsRef<Path>,
         name: &'static str,
-        column_families: impl IntoIterator<Item = impl Into<(String, bool)>>,
+        column_families: impl IntoIterator<Item = impl Into<String>>,
         db_opts: &rocksdb::Options,
-        cache_size: usize,
     ) -> anyhow::Result<Self> {
-        let mut descriptors = vec![];
-        let mut cacheable_column_families = vec![];
-        for (cf_name, should_cache) in column_families.into_iter().map(|cf| cf.into()) {
-            if should_cache {
-                cacheable_column_families.push(cf_name.clone());
-            }
-            descriptors.push(default_cf_descriptor(cf_name));
-        }
+        let descriptors = column_families.into_iter().map(|cf| default_cf_descriptor(cf.into()));
         let db = DB::open_with_cfds(
             db_opts,
             path,
             name,
             descriptors,
-            cacheable_column_families,
-            cache_size,
+            vec![],
+            0,
         )?;
         Ok(db)
     }
@@ -712,7 +704,6 @@ mod tests {
             "test_db_debug",
             column_families,
             &db_opts,
-            1_000_000,
         )
         .expect("Failed to open DB.");
 

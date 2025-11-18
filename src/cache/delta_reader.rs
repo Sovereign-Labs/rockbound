@@ -433,7 +433,7 @@ mod tests {
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
         Arc::new(
-            DB::open(dir, "test", column_families, &db_opts, 1_000_000)
+            DB::open(dir, "test", column_families, &db_opts)
                 .expect("Failed to open DB."),
         )
     }
