@@ -102,7 +102,7 @@ impl DB {
     pub fn open(
         path: impl AsRef<Path>,
         name: &'static str,
-        column_families: impl IntoIterator<Item = impl Into<(String, bool)>>,
+        column_families: impl IntoIterator<Item = impl Into<String>>,
         db_opts: &rocksdb::Options,
     ) -> anyhow::Result<Self> {
         let descriptors = column_families

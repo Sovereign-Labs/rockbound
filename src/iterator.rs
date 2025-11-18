@@ -293,7 +293,13 @@ mod tests {
         let mut db_opts = rocksdb::Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
-        DB::open(dir, "test-iterator", get_column_families(), &db_opts).expect("Failed to open DB.")
+        DB::open(
+            dir,
+            "test-iterator",
+            get_column_families(),
+            &db_opts,
+        )
+        .expect("Failed to open DB.")
     }
 
     #[test]
