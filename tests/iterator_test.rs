@@ -44,7 +44,6 @@ fn open_inner_db(path: &std::path::Path) -> DB {
         "test-iterator-db",
         column_families,
         &db_opts,
-        1_000_000,
     )
     .unwrap()
 }
