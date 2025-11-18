@@ -7,9 +7,9 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
+use rockbound::default_cf_descriptor;
 use rockbound::schema::{ColumnFamilyName, Schema};
 use rockbound::test::TestField;
-use rockbound::default_cf_descriptor;
 use rockbound::{SchemaBatch, DB};
 use rocksdb::DEFAULT_COLUMN_FAMILY_NAME;
 use tempfile::TempDir;
