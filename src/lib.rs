@@ -105,15 +105,10 @@ impl DB {
         column_families: impl IntoIterator<Item = impl Into<String>>,
         db_opts: &rocksdb::Options,
     ) -> anyhow::Result<Self> {
-        let descriptors = column_families.into_iter().map(|cf| default_cf_descriptor(cf.into()));
-        let db = DB::open_with_cfds(
-            db_opts,
-            path,
-            name,
-            descriptors,
-            vec![],
-            0,
-        )?;
+        let descriptors = column_families
+            .into_iter()
+            .map(|cf| default_cf_descriptor(cf.into()));
+        let db = DB::open_with_cfds(db_opts, path, name, descriptors, vec![], 0)?;
         Ok(db)
     }
 
@@ -699,13 +694,8 @@ mod tests {
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
 
-        let db = DB::open(
-            tmpdir.path(),
-            "test_db_debug",
-            column_families,
-            &db_opts,
-        )
-        .expect("Failed to open DB.");
+        let db = DB::open(tmpdir.path(), "test_db_debug", column_families, &db_opts)
+            .expect("Failed to open DB.");
 
         let db_debug = format!("{db:?}");
         assert!(db_debug.contains("test_db_debug"));
