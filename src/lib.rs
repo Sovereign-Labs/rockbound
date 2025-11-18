@@ -28,7 +28,7 @@ pub mod test;
 
 pub use config::{gen_rocksdb_options, RocksdbConfig};
 
-use std::{borrow::Borrow, path::Path, sync::Arc, time::Duration};
+use std::{borrow::Borrow, path::Path, sync::Arc};
 
 use anyhow::format_err;
 use iterator::ScanDirection;
@@ -83,6 +83,7 @@ pub struct DB {
     cache: RwLock<Cache<(ColumnFamilyName, SchemaKey), Option<SchemaValue>, BasicWeighter>>,
     // All iteration circumvents the lock on the DB. This is fine, since we enforce that iterable column families are not cachable.
     db: Arc<rocksdb::DB>,
+    cacheable_column_families: Vec<String>,
 }
 
 /// Returns the default column family descriptor. Includes LZ4 compression.
@@ -95,63 +96,33 @@ pub fn default_cf_descriptor(cf_name: impl Into<String>) -> rocksdb::ColumnFamil
 impl DB {
     /// Opens a database backed by RocksDB, using the provided column family names and default
     /// column family options.
+    ///
+    /// The `column_families` iterator contains the column family name and a boolean indicating whether the column family should be cached.
     #[tracing::instrument(skip_all, level = "error")]
     pub fn open(
         path: impl AsRef<Path>,
         name: &'static str,
-        column_families: impl IntoIterator<Item = impl Into<String>>,
+        column_families: impl IntoIterator<Item = impl Into<(String, bool)>>,
         db_opts: &rocksdb::Options,
         cache_size: usize,
     ) -> anyhow::Result<Self> {
+        let mut descriptors = vec![];
+        let mut cacheable_column_families = vec![];
+        for (cf_name, should_cache) in column_families.into_iter().map(|cf| cf.into()) {
+            if should_cache {
+                cacheable_column_families.push(cf_name.clone());
+            }
+            descriptors.push(default_cf_descriptor(cf_name));
+        }
         let db = DB::open_with_cfds(
             db_opts,
             path,
             name,
-            column_families.into_iter().map(default_cf_descriptor),
+            descriptors,
+            cacheable_column_families,
             cache_size,
         )?;
         Ok(db)
-    }
-
-    /// Opens a database backed by RocksDB, using the provided column family names and default
-    /// column family options.
-    #[tracing::instrument(skip_all, level = "error")]
-    pub fn open_with_ttl(
-        path: impl AsRef<Path>,
-        name: &'static str,
-        column_families: impl IntoIterator<Item = impl Into<String>>,
-        db_opts: &rocksdb::Options,
-        ttl: Duration,
-        cache_size: usize,
-    ) -> anyhow::Result<Self> {
-        let db = DB::open_with_cfds_and_ttl(
-            db_opts,
-            path,
-            name,
-            column_families.into_iter().map(|cf_name| {
-                let mut cf_opts = rocksdb::Options::default();
-                cf_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-                rocksdb::ColumnFamilyDescriptor::new(cf_name, cf_opts)
-            }),
-            ttl,
-            cache_size,
-        )?;
-        Ok(db)
-    }
-
-    /// Open RocksDB with the provided column family descriptors and ttl.
-    /// This allows the caller to configure options for each column family.
-    #[tracing::instrument(skip_all, level = "error")]
-    pub fn open_with_cfds_and_ttl(
-        db_opts: &rocksdb::Options,
-        path: impl AsRef<Path>,
-        name: &'static str,
-        cfds: impl IntoIterator<Item = rocksdb::ColumnFamilyDescriptor>,
-        ttl: Duration,
-        cache_size: usize,
-    ) -> anyhow::Result<DB> {
-        let inner = rocksdb::DB::open_cf_descriptors_with_ttl(db_opts, path, cfds, ttl)?;
-        Ok(Self::log_construct(name, inner, cache_size))
     }
 
     /// Open RocksDB with the provided column family descriptors.
@@ -162,57 +133,30 @@ impl DB {
         path: impl AsRef<Path>,
         name: &'static str,
         cfds: impl IntoIterator<Item = rocksdb::ColumnFamilyDescriptor>,
+        cacheable_column_families: Vec<String>,
         cache_size: usize,
     ) -> anyhow::Result<DB> {
         let inner = with_error_logging(
             || rocksdb::DB::open_cf_descriptors(db_opts, path, cfds),
             "open_with_cfds",
         )?;
-        Ok(Self::log_construct(name, inner, cache_size))
-    }
-
-    /// Open db in readonly mode. This db is completely static, so any writes that occur on the primary
-    /// after it has been opened will not be visible to the readonly instance.
-    #[tracing::instrument(skip_all, level = "error")]
-    pub fn open_cf_readonly(
-        opts: &rocksdb::Options,
-        path: impl AsRef<Path>,
-        name: &'static str,
-        cfs: Vec<ColumnFamilyName>,
-        cache_size: usize,
-    ) -> anyhow::Result<DB> {
-        let error_if_log_file_exists = false;
-        let inner = with_error_logging(
-            || rocksdb::DB::open_cf_for_read_only(opts, path, cfs, error_if_log_file_exists),
-            "open_cf_readonly",
-        )?;
-
-        Ok(Self::log_construct(name, inner, cache_size))
-    }
-
-    /// Open db in secondary mode. A secondary db does not support writes, but can be dynamically caught up
-    /// to the primary instance by a manual call. See <https://github.com/facebook/rocksdb/wiki/Read-only-and-Secondary-instances>
-    /// for more details.
-    #[tracing::instrument(skip_all, level = "error")]
-    pub fn open_cf_as_secondary<P: AsRef<Path>>(
-        opts: &rocksdb::Options,
-        primary_path: P,
-        secondary_path: P,
-        name: &'static str,
-        cfs: Vec<ColumnFamilyName>,
-        cache_size: usize,
-    ) -> anyhow::Result<DB> {
-        let inner = with_error_logging(
-            || rocksdb::DB::open_cf_as_secondary(opts, primary_path, secondary_path, cfs),
-            "open_cf_as_secondary",
-        )?;
-        Ok(Self::log_construct(name, inner, cache_size))
+        Ok(Self::log_construct(
+            name,
+            inner,
+            cache_size,
+            cacheable_column_families,
+        ))
     }
 
     // Cache size estimation: we want to allocate about 1GB for cache. Estimate that slot keys are about 80 bytes and slot values
     // are around 400 bytes + 56 bytes of overhead on the stack (see weighter). Multiply by 1.5 to account for overhead (per quick-cache docs).
     // That gives estimated item capacity of 1GB / (80 + 400 + 56) * 1.5 ~= 1.2M.
-    fn log_construct(name: &'static str, inner: rocksdb::DB, cache_size: usize) -> DB {
+    fn log_construct(
+        name: &'static str,
+        inner: rocksdb::DB,
+        cache_size: usize,
+        cacheable_column_families: Vec<String>,
+    ) -> DB {
         info!(rocksdb_name = name, path = %inner.path().display(), "Opened RocksDB");
         DB {
             name,
@@ -222,6 +166,7 @@ impl DB {
                 BasicWeighter,
             )),
             db: Arc::new(inner),
+            cacheable_column_families,
         }
     }
 
@@ -486,6 +431,10 @@ impl DB {
         let mut db_batch = rocksdb::WriteBatch::default();
         let mut columns_written = Vec::with_capacity(batch.last_writes.len());
         for (cf_name, rows) in batch.last_writes.into_iter() {
+            let should_cache = self
+                .cacheable_column_families
+                .iter()
+                .any(|cf| cf == &cf_name);
             let cf_handle = self.get_cf_handle(cf_name)?;
             let mut write_sizes = Vec::with_capacity(rows.len());
             let mut deletes_for_cf = 0;
@@ -494,11 +443,15 @@ impl DB {
                     Operation::Put { value } => {
                         write_sizes.push(key.len() + value.len());
                         db_batch.put_cf(cf_handle, &key, &value);
-                        cache.insert((cf_name, key), Some(value));
+                        if should_cache {
+                            cache.insert((cf_name, key), Some(value));
+                        }
                     }
                     Operation::Delete => {
                         db_batch.delete_cf(cf_handle, &key);
-                        cache.insert((cf_name, key), None);
+                        if should_cache {
+                            cache.insert((cf_name, key), None);
+                        }
                         deletes_for_cf += 1;
                     }
                     Operation::DeleteRange { .. } => {
