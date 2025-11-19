@@ -73,6 +73,8 @@ impl Equivalent<(ColumnFamilyName, SchemaKey)> for Pair<ColumnFamilyName, &Schem
     }
 }
 
+pub(crate) type DbCache = Cache<(ColumnFamilyName, SchemaKey), Option<SchemaValue>, BasicWeighter>;
+
 /// This DB is a schematized RocksDB wrapper where all data passed in and out are typed according to
 /// [`Schema`]s.
 #[derive(Debug)]
@@ -80,7 +82,7 @@ pub struct DB {
     name: &'static str, // for logging
     // We use an RwLock to ensure consistency between the cache and the DB. Writes to the DB also grab the write lock.
     // on the cache.
-    cache: RwLock<Cache<(ColumnFamilyName, SchemaKey), Option<SchemaValue>, BasicWeighter>>,
+    cache: RwLock<DbCache>,
     // All iteration circumvents the lock on the DB. This is fine, since we enforce that iterable column families are not cachable.
     db: Arc<rocksdb::DB>,
     cacheable_column_families: Vec<String>,
