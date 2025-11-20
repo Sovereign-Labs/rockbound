@@ -635,10 +635,10 @@ where
                     // If this key is smaller than the current smallest key, update our view of the smallest key and remember which snapshot it came from.
                     if smallest_key
                         .as_ref()
-                        .map(|(_smallest_idx, smallest_key)| key < smallest_key)
+                        .map(|(_smallest_idx, smallest_key)| *key < smallest_key)
                         .unwrap_or(true)
                     {
-                        smallest_key = Some((LocationOfSmallestKey::Snapshot(idx), key));
+                        smallest_key = Some((LocationOfSmallestKey::Snapshot(idx), (*key).clone()));
                     }
                 }
             }
@@ -655,7 +655,7 @@ where
                     .map(|(_smallest_idx, smallest_key)| key < smallest_key)
                     .unwrap_or(true)
                 {
-                    smallest_key = Some((LocationOfSmallestKey::Db, &key));
+                    smallest_key = Some((LocationOfSmallestKey::Db, key.clone()));
                 }
             }
 
@@ -692,7 +692,7 @@ where
             }
             // Step 3.1 advance the db iterator
             if let Some((key, _value)) = self.db_iterator.as_mut().and_then(|iter| iter.peek()) {
-                if key == &smallest_key {
+                if *key == smallest_key {
                     let _ = self.db_iterator.as_mut().and_then(|iter| iter.next());
                 }
             }
