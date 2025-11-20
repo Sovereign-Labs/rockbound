@@ -30,19 +30,35 @@ impl SchemaBatch {
             .start_timer();
 
         let key = key.encode_key()?;
+        self.put_raw(key, value)?;
+
+        Ok(())
+    }
+
+    /// Put a pre-encoded key and its value into the batch.
+    pub fn put_raw<S: Schema>(
+        &mut self,
+        key: Vec<u8>,
+        value: &impl ValueCodec<S>,
+    ) -> anyhow::Result<()> {
         let put_operation = Operation::Put {
             value: value.encode_value()?,
         };
         self.insert_operation::<S>(key, put_operation);
-
         Ok(())
     }
 
     /// Adds a delete operation to the batch.
     pub fn delete<S: Schema>(&mut self, key: &impl KeyEncoder<S>) -> anyhow::Result<()> {
         let key = key.encode_key()?;
-        self.insert_operation::<S>(key, Operation::Delete);
+        self.delete_raw::<S>(key)?;
 
+        Ok(())
+    }
+
+    /// Delete a pre-encoded key from the batch. A schema must be provided to ensure the key is deleted from the correct column family.
+    pub fn delete_raw<S: Schema>(&mut self, key: Vec<u8>) -> anyhow::Result<()> {
+        self.insert_operation::<S>(key, Operation::Delete);
         Ok(())
     }
 
