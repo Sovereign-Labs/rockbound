@@ -525,7 +525,7 @@ impl DB {
         let serialized_size = db_batch.size_in_bytes();
 
         with_error_logging(
-            || self.db.write_opt(db_batch, &default_write_options()),
+            || self.db.write_opt(db_batch, &rocksdb::WriteOptions::default()),
             "write_schemas::write_opt",
         )?;
         // Drop the write lock on the cache.
@@ -730,15 +730,6 @@ pub enum CodecError {
     /// I/O error.
     #[error(transparent)]
     Io(#[from] std::io::Error),
-}
-
-/// For now, we always use synchronous writes. This makes sure that once the operation returns
-/// `Ok(())` the data is persisted even if the machine crashes. In the future we might consider
-/// selectively turning this off for some non-critical writes to improve performance.
-fn default_write_options() -> rocksdb::WriteOptions {
-    let mut opts = rocksdb::WriteOptions::default();
-    opts.set_sync(true);
-    opts
 }
 
 #[cfg(test)]
