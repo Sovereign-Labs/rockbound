@@ -28,30 +28,7 @@ fn open_db(dir: impl AsRef<Path>) -> DB {
     let mut db_opts = rocksdb::Options::default();
     db_opts.create_if_missing(true);
     db_opts.create_missing_column_families(true);
-    DB::open(dir, "test", get_column_families(), &db_opts, 1_000_000).expect("Failed to open DB.")
-}
-
-fn open_db_read_only(dir: &TempDir) -> DB {
-    DB::open_cf_readonly(
-        &rocksdb::Options::default(),
-        dir.path(),
-        "test",
-        get_column_families(),
-        1_000_000,
-    )
-    .expect("Failed to open DB.")
-}
-
-fn open_db_as_secondary(dir: &TempDir, dir_sec: &TempDir) -> DB {
-    DB::open_cf_as_secondary(
-        &rocksdb::Options::default(),
-        &dir.path(),
-        &dir_sec.path(),
-        "test",
-        get_column_families(),
-        1_000_000,
-    )
-    .expect("Failed to open DB.")
+    DB::open(dir, "test", get_column_families(), &db_opts).expect("Failed to open DB.")
 }
 
 struct TestDB {
@@ -248,38 +225,6 @@ fn test_reopen() {
             Some(TestField(0)),
         );
     }
-}
-
-#[test]
-fn test_open_read_only() {
-    let tmpdir = tempfile::tempdir().unwrap();
-    {
-        let db = open_db(&tmpdir);
-        db.put::<TestSchema1>(&TestField(0), &TestField(0)).unwrap();
-    }
-    {
-        let db = open_db_read_only(&tmpdir);
-        assert_eq!(
-            db.get::<TestSchema1>(&TestField(0)).unwrap(),
-            Some(TestField(0)),
-        );
-        assert!(db.put::<TestSchema1>(&TestField(1), &TestField(1)).is_err());
-    }
-}
-
-#[test]
-fn test_open_as_secondary() {
-    let tmpdir = tempfile::tempdir().unwrap();
-    let tmpdir_sec = tempfile::tempdir().unwrap();
-
-    let db = open_db(&tmpdir);
-    db.put::<TestSchema1>(&TestField(0), &TestField(0)).unwrap();
-
-    let db_sec = open_db_as_secondary(&tmpdir, &tmpdir_sec);
-    assert_eq!(
-        db_sec.get::<TestSchema1>(&TestField(0)).unwrap(),
-        Some(TestField(0)),
-    );
 }
 
 #[test]
