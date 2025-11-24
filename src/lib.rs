@@ -144,7 +144,7 @@ impl DB {
         cache_size: usize,
         cacheable_column_families: Vec<String>,
     ) -> DB {
-        info!(rocksdb_name = name, path = %inner.path().display(), "Opened RocksDB");
+        info!(rocksdb_name = name, path = %inner.path().display(), cacheable_column_families = %cacheable_column_families.join(","), "Opened RocksDB");
         DB {
             name,
             cache: RwLock::new(Cache::with_weighter(
