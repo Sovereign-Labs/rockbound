@@ -67,11 +67,13 @@ impl<T: Borrow<SchemaKey>> Weighter<(ColumnFamilyName, T), Option<SchemaValue>> 
 /// A newtype for tuple to allow implementing `Equivalent` for it.
 #[derive(Debug, Hash)]
 struct Pair<A, B>(pub A, pub B);
-impl Equivalent<(ColumnFamilyName, SchemaKey)> for Pair<ColumnFamilyName, &SchemaKey> {
+impl Equivalent<(ColumnFamilyName, SchemaKey)> for Pair<ColumnFamilyName, &[u8]> {
     fn equivalent(&self, rhs: &(ColumnFamilyName, SchemaKey)) -> bool {
-        self.0 == rhs.0 && self.1 == &rhs.1
+        self.0 == rhs.0 && self.1 == rhs.1
     }
 }
+
+pub(crate) type DbCache = Cache<(ColumnFamilyName, SchemaKey), Option<SchemaValue>, BasicWeighter>;
 
 /// This DB is a schematized RocksDB wrapper where all data passed in and out are typed according to
 /// [`Schema`]s.
@@ -80,7 +82,7 @@ pub struct DB {
     name: &'static str, // for logging
     // We use an RwLock to ensure consistency between the cache and the DB. Writes to the DB also grab the write lock.
     // on the cache.
-    cache: RwLock<Cache<(ColumnFamilyName, SchemaKey), Option<SchemaValue>, BasicWeighter>>,
+    cache: RwLock<DbCache>,
     // All iteration circumvents the lock on the DB. This is fine, since we enforce that iterable column families are not cachable.
     db: Arc<rocksdb::DB>,
     cacheable_column_families: Vec<String>,
@@ -144,7 +146,7 @@ impl DB {
         cache_size: usize,
         cacheable_column_families: Vec<String>,
     ) -> DB {
-        info!(rocksdb_name = name, path = %inner.path().display(), cacheable_column_families = %cacheable_column_families.join(","), "Opened RocksDB");
+        info!(rocksdb_name = name, path = %inner.path().display(), "Opened RocksDB");
         DB {
             name,
             cache: RwLock::new(Cache::with_weighter(
@@ -169,13 +171,21 @@ impl DB {
         &self,
         schema_key: &impl KeyEncoder<S>,
     ) -> anyhow::Result<Option<S::Value>> {
+        self.get_raw::<S>(schema_key.encode_key()?.as_slice())
+    }
+
+    /// Reads single record by key.
+    #[tracing::instrument(skip_all, level = "error")]
+    pub fn get_raw<S: Schema>(
+        &self,
+        encoded_schema_key: &[u8],
+    ) -> anyhow::Result<Option<S::Value>> {
         with_error_logging::<_, _, anyhow::Error>(
             || {
                 let _timer = SCHEMADB_GET_LATENCY_SECONDS
                     .with_label_values(&[S::COLUMN_FAMILY_NAME])
                     .start_timer();
 
-                let k = schema_key.encode_key()?;
                 let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
 
                 // Only grab the read lock if we're accessing a cached column family.
@@ -187,7 +197,8 @@ impl DB {
                     // a bad thread interleaving could cause us to read from the DB, get pre-empted while another thread writes, and then write
                     // the stale value to the cache
                     if let Some(cache) = lock.as_ref() {
-                        let cache_result = cache.get(&Pair(S::COLUMN_FAMILY_NAME, &k));
+                        let cache_result =
+                            cache.get(&Pair(S::COLUMN_FAMILY_NAME, encoded_schema_key));
                         if let Some(result) = cache_result {
                             return result
                                 .map(|v| <S::Value as ValueCodec<S>>::decode_value(&v))
@@ -196,14 +207,14 @@ impl DB {
                         }
                     }
 
-                    let result = self.db.get_pinned_cf(cf_handle, &k)?;
+                    let result = self.db.get_pinned_cf(cf_handle, encoded_schema_key)?;
                     // If the cache is locked for writing, don't try to put the value, just return
                     if let Some(cache) = lock {
                         // Note: We have to deserialize the value while holding the read lock because the lifetime of the borrow is tied to `inner`.
                         // This prevents us from unifying the two branches.
                         // Note: We don't count bytes read from the cache
                         cache.insert(
-                            (S::COLUMN_FAMILY_NAME, k),
+                            (S::COLUMN_FAMILY_NAME, encoded_schema_key.to_vec()),
                             result.as_ref().map(|v| v.to_vec()),
                         );
                     }
@@ -213,7 +224,7 @@ impl DB {
                         .map_err(|err| err.into());
                 }
 
-                let result = self.db.get_pinned_cf(cf_handle, &k)?;
+                let result = self.db.get_pinned_cf(cf_handle, encoded_schema_key)?;
                 SCHEMADB_GET_BYTES
                     .with_label_values(&[S::COLUMN_FAMILY_NAME])
                     .observe(result.as_ref().map_or(0.0, |v| v.len() as f64));
@@ -391,6 +402,21 @@ impl DB {
             "Caching is incompatible with iterators! Cannot iterate over {}",
             S::COLUMN_FAMILY_NAME
         );
+        if is_range_bounds_inverse(&range) {
+            tracing::error!("[Rockbound]: error in raw_iter_range: lower_bound > upper_bound");
+            anyhow::bail!("[Rockbound]: error in raw_iter_range: lower_bound > upper_bound");
+        }
+        let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
+        Ok(RawDbIter::new(&self.db, cf_handle, range, direction))
+    }
+
+    /// Iterator over a range of keys in a schema, allowing iteration over cached column families. This is only correct if a lock is held to ensure consistency.
+    pub(crate) fn iter_range_allow_cached<'a, S: Schema>(
+        &'a self,
+        _guard: &parking_lot::RwLockReadGuard<'a, DbCache>,
+        range: impl std::ops::RangeBounds<SchemaKey>,
+        direction: ScanDirection,
+    ) -> anyhow::Result<RawDbIter<'a>> {
         if is_range_bounds_inverse(&range) {
             tracing::error!("[Rockbound]: error in raw_iter_range: lower_bound > upper_bound");
             anyhow::bail!("[Rockbound]: error in raw_iter_range: lower_bound > upper_bound");
