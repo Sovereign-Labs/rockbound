@@ -3,7 +3,7 @@
 
 //! Tests for cache consistency with the backing RocksDB
 
-use std::sync::{Arc};
+use std::sync::Arc;
 
 use rockbound::schema::{ColumnFamilyName, KeyDecoder, KeyEncoder, Schema, ValueCodec};
 use rockbound::test::TestField;
@@ -203,12 +203,21 @@ fn check_iterator(
     assert_eq!(iter.next(), None);
 }
 
-fn commit_batch(versioned_db: &VersionedDB<LiveKeys>, batch: &VersionedSchemaBatch<LiveKeys>, version: u64) {
-	let mut live_keys_batch = SchemaBatch::new();
+fn commit_batch(
+    versioned_db: &VersionedDB<LiveKeys>,
+    batch: &VersionedSchemaBatch<LiveKeys>,
+    version: u64,
+) {
+    let mut live_keys_batch = SchemaBatch::new();
     let mut historical_keys_batch = SchemaBatch::new();
 
     versioned_db
-        .materialize(&batch, &mut live_keys_batch, &mut historical_keys_batch, version)
+        .materialize(
+            &batch,
+            &mut live_keys_batch,
+            &mut historical_keys_batch,
+            version,
+        )
         .unwrap();
     versioned_db
         .live_db()
@@ -222,13 +231,13 @@ fn commit_batch(versioned_db: &VersionedDB<LiveKeys>, batch: &VersionedSchemaBat
 
 fn put_keys(versioned_db: &VersionedDB<LiveKeys>, keys: &[(&[u8], u32)], version: u64) {
     let mut batch = VersionedSchemaBatch::<LiveKeys>::default();
-	for (key, value) in keys {
+    for (key, value) in keys {
         batch.put_versioned(Arc::new(key.to_vec()), TestField(*value as u32));
     }
 
-	commit_batch(versioned_db, &batch, version);
+    commit_batch(versioned_db, &batch, version);
 
-	for (key, value) in keys {
+    for (key, value) in keys {
         assert_eq!(
             versioned_db
                 .get_live_value(&Arc::new(key.to_vec()).encode_key().unwrap())
@@ -242,7 +251,6 @@ fn put_keys(versioned_db: &VersionedDB<LiveKeys>, keys: &[(&[u8], u32)], version
             Some(TestField(*value as u32))
         );
     }
-   
 }
 
 #[test]
@@ -312,45 +320,35 @@ fn test_iteration() {
         b"key",
         &[(b"key11", 0), (b"key12", 2), (b"key20", 0)],
     );
-	check_iterator(
-        &delta_reader,
-        b"key1",
-        &[(b"key11", 0), (b"key12", 2)],
-    );
+    check_iterator(&delta_reader, b"key1", &[(b"key11", 0), (b"key12", 2)]);
 
-
-	// Committing the oldest snapshot should not change the iterator.
-	commit_batch(&versioned_db, &snapshot_1, 1);
-	check_iterator(
+    // Committing the oldest snapshot should not change the iterator.
+    commit_batch(&versioned_db, &snapshot_1, 1);
+    check_iterator(
         &delta_reader,
         b"key",
         &[(b"key11", 0), (b"key12", 2), (b"key20", 0)],
     );
-	check_iterator(
-        &delta_reader,
-        b"key1",
-        &[(b"key11", 0), (b"key12", 2)],
-    );
+    check_iterator(&delta_reader, b"key1", &[(b"key11", 0), (b"key12", 2)]);
 
-	// Committing the second snapshot should not change the iterator.
-	commit_batch(&versioned_db, &snapshot_2, 2);
-	check_iterator(
+    // Committing the second snapshot should not change the iterator.
+    commit_batch(&versioned_db, &snapshot_2, 2);
+    check_iterator(
         &delta_reader,
         b"key",
         &[(b"key11", 0), (b"key12", 2), (b"key20", 0)],
     );
-	check_iterator(
-        &delta_reader,
-        b"key1",
-        &[(b"key11", 0), (b"key12", 2)],
-    );
+    check_iterator(&delta_reader, b"key1", &[(b"key11", 0), (b"key12", 2)]);
 
-	// Commiting another batch should make it impossible to create an iterator
-	commit_batch(&versioned_db, &VersionedSchemaBatch::<LiveKeys>::default(), 3);
-	assert!(delta_reader
+    // Commiting another batch should make it impossible to create an iterator
+    commit_batch(
+        &versioned_db,
+        &VersionedSchemaBatch::<LiveKeys>::default(),
+        3,
+    );
+    assert!(delta_reader
         .iter_with_prefix(Arc::new(b"key".to_vec()))
         .is_err());
-    
 }
 
 #[test]
@@ -359,28 +357,29 @@ fn test_open_iterator_blocks_writes() {
     let db = Arc::new(test_db.db);
     let versioned_db = VersionedDB::<LiveKeys>::from_dbs(db.clone(), db.clone()).unwrap();
 
-	let delta_reader = VersionedDeltaReader::<LiveKeys>::new(versioned_db.clone(), None, vec![]);
+    let delta_reader = VersionedDeltaReader::<LiveKeys>::new(versioned_db.clone(), None, vec![]);
 
-	let mut iter = delta_reader
+    let mut iter = delta_reader
         .iter_with_prefix(Arc::new(b"key".to_vec()))
         .unwrap();
 
-	let (tx, rx) = std::sync::mpsc::channel();
-	std::thread::spawn(move || {
-		tx.send("starting").unwrap();
-		commit_batch(&versioned_db, &VersionedSchemaBatch::<LiveKeys>::default(), 0);
-		tx.send("finished").unwrap();
-	});
-	
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        tx.send("starting").unwrap();
+        commit_batch(
+            &versioned_db,
+            &VersionedSchemaBatch::<LiveKeys>::default(),
+            0,
+        );
+        tx.send("finished").unwrap();
+    });
 
-	// Block until the background thread has sent its message, then sleep to ensure it has time to run if it's not blocked
-	assert!(rx.recv().unwrap() == "starting");
-	std::thread::sleep(std::time::Duration::from_secs(5));
-	// Assert that it didn't finish. Then drop the iterator to release the read lock and ensure that it completes.
-	assert!(rx.try_recv().is_err());
-	assert!(iter.next().is_none());
-	drop(iter);
-	assert!(rx.recv().unwrap() == "finished");
-	
+    // Block until the background thread has sent its message, then sleep to ensure it has time to run if it's not blocked
+    assert!(rx.recv().unwrap() == "starting");
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    // Assert that it didn't finish. Then drop the iterator to release the read lock and ensure that it completes.
+    assert!(rx.try_recv().is_err());
+    assert!(iter.next().is_none());
+    drop(iter);
+    assert!(rx.recv().unwrap() == "finished");
 }
-    

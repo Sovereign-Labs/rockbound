@@ -535,7 +535,7 @@ pub struct VersionedDeltaReader<V: SchemaWithVersion> {
     db: VersionedDB<V>,
     // The version of the underlying DB at the time this snapshot was taken.
     base_version: Option<u64>,
-    // The snapshots to include in the reader, ordered from newest to oldest. 
+    // The snapshots to include in the reader, ordered from newest to oldest.
     snapshots: Vec<Arc<VersionedSchemaBatch<V>>>,
 }
 
@@ -549,7 +549,7 @@ where
     u64: ValueCodec<V::VersionMetadatacolumn>,
 {
     /// Creates a new versioned delta reader.
-    /// 
+    ///
     /// Note that the snapshots are ordered from newest to oldest.
     pub fn new(
         db: VersionedDB<V>,
@@ -611,18 +611,16 @@ where
 
     // Return the next key/value pair from the iterator.
     fn next(&mut self) -> Option<Self::Item> {
-
         // The body of this loop does two passes over the versioned DB contents (including all snapshots and the DB in each pass)
         // first pass: peek each iterator and find the smallest *key* available from any iterator.
         // second pass: advance each iterator whose peeked key is equal to the smallest key, keeping the first (newest) *value* that you find
-        // 
+        //
         // After these two passes, all iterators are consistent and we've saved the most recent value of the next key in lexicographic order into the variable `smallest_key`.
         // *but*, there's a wrinkle. Snapshots save deleted keys as `None`, while deleted keys are simply absent from the DB. To reflect this,
-        // we don't want to return the k/v pair if the value is a `None` from a snapshot. 
-        // 
+        // we don't want to return the k/v pair if the value is a `None` from a snapshot.
+        //
         // To handle this, we simply run the core algorithm in a loop until we find a key/value pair whose value is not `None` and return it.
         loop {
-
             // Step 1: peek at each snapshot and the Db to find the global smallest key that matches our prefix.
             let mut smallest_key = None;
             // 1.1 Look at each snapshot
