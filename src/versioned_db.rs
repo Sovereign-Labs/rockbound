@@ -1,6 +1,5 @@
 use std::{
-    borrow::Borrow,
-    collections::{btree_map, BTreeMap, HashMap},
+    collections::{btree_map, BTreeMap},
     iter::Peekable,
     marker::PhantomData,
     sync::Arc,
@@ -577,6 +576,8 @@ where
     }
 }
 
+type MaybePeekableBtreeMapRange<'a, K, V> = Option<Peekable<btree_map::Range<'a, K, V>>>;
+
 /// An iterator over the live key/value pairs in a VersionedDB, including the current snapshots.
 ///
 /// Internally, this struct has to peek at each snapshot and the db to find the next smallest key and returns that result.
@@ -588,7 +589,7 @@ pub struct VersionedDbIterator<'a, V: SchemaWithVersion> {
     // Now the caller sees a state of the world which never existed where Key1 -> A and Key2 -> B.
     _read_lock: RwLockReadGuard<'a, DbCache>,
     // Borrow the snapshots to keep the lifetimes tied together. We could clone, but this makes it easier to reason about.
-    snapshots: Vec<Option<Peekable<btree_map::Range<'a, Vec<u8>, Option<V::Value>>>>>,
+    snapshots: Vec<MaybePeekableBtreeMapRange<'a, Vec<u8>, Option<V::Value>>>,
     db_iterator: Option<Peekable<RawDbIter<'a>>>,
     prefix: Vec<u8>,
 }
@@ -658,9 +659,7 @@ where
             }
 
             // If we didn't find any keys that matches our prefix, we're done.
-            let Some((smallest_idx, smallest_key)) = smallest_key else {
-                return None;
-            };
+            let (smallest_idx, smallest_key) = smallest_key?;
             let smallest_key = smallest_key.clone();
 
             // Step 2: advance the iterator that corresponds to the smallest key and get they key/value pair to return

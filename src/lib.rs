@@ -69,7 +69,7 @@ impl<T: Borrow<SchemaKey>> Weighter<(ColumnFamilyName, T), Option<SchemaValue>> 
 struct Pair<A, B>(pub A, pub B);
 impl Equivalent<(ColumnFamilyName, SchemaKey)> for Pair<ColumnFamilyName, &[u8]> {
     fn equivalent(&self, rhs: &(ColumnFamilyName, SchemaKey)) -> bool {
-        self.0 == rhs.0 && self.1 == &rhs.1
+        self.0 == rhs.0 && self.1 == rhs.1
     }
 }
 
