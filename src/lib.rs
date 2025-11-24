@@ -421,7 +421,7 @@ impl DB {
             let should_cache = self
                 .cacheable_column_families
                 .iter()
-                .any(|cf| cf == &cf_name);
+                .any(|cf| cf == cf_name);
             let cf_handle = self.get_cf_handle(cf_name)?;
             let mut write_sizes = Vec::with_capacity(rows.len());
             let mut deletes_for_cf = 0;
