@@ -179,7 +179,7 @@ fn check_iterator(
         let next = next.unwrap_or_else(|| {
             panic!(
                 "Expected key {} with value {} in iterator, but got None",
-                std::str::from_utf8(*key).unwrap(),
+                std::str::from_utf8(key).unwrap(),
                 value
             )
         });
@@ -187,16 +187,16 @@ fn check_iterator(
             next.0,
             Arc::new(key.to_vec()),
             "Expected key {} with value {} in iterator, but got key {}",
-            std::str::from_utf8(*key).unwrap(),
+            std::str::from_utf8(key).unwrap(),
             value,
             std::str::from_utf8(&next.0).unwrap()
         );
         assert_eq!(
             next.1,
-            Some(TestField(*value as u32)),
+            Some(TestField(*value)),
             "Expected value {} for key {} in iterator, but got {}",
             value,
-            std::str::from_utf8(*key).unwrap(),
+            std::str::from_utf8(key).unwrap(),
             next.1.unwrap().0
         );
     }
@@ -213,7 +213,7 @@ fn commit_batch(
 
     versioned_db
         .materialize(
-            &batch,
+            batch,
             &mut live_keys_batch,
             &mut historical_keys_batch,
             version,
@@ -232,7 +232,7 @@ fn commit_batch(
 fn put_keys(versioned_db: &VersionedDB<LiveKeys>, keys: &[(&[u8], u32)], version: u64) {
     let mut batch = VersionedSchemaBatch::<LiveKeys>::default();
     for (key, value) in keys {
-        batch.put_versioned(Arc::new(key.to_vec()), TestField(*value as u32));
+        batch.put_versioned(Arc::new(key.to_vec()), TestField(*value));
     }
 
     commit_batch(versioned_db, &batch, version);
@@ -242,13 +242,13 @@ fn put_keys(versioned_db: &VersionedDB<LiveKeys>, keys: &[(&[u8], u32)], version
             versioned_db
                 .get_live_value(&Arc::new(key.to_vec()).encode_key().unwrap())
                 .unwrap(),
-            Some(TestField(*value as u32))
+            Some(TestField(*value))
         );
         assert_eq!(
             versioned_db
                 .get_historical_value(&Arc::new(key.to_vec()), version)
                 .unwrap(),
-            Some(TestField(*value as u32))
+            Some(TestField(*value))
         );
     }
 }
