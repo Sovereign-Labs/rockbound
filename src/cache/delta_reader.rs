@@ -432,10 +432,7 @@ mod tests {
         let mut db_opts = rocksdb::Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
-        Arc::new(
-            DB::open(dir, "test", column_families, &db_opts, 1_000_000)
-                .expect("Failed to open DB."),
-        )
+        Arc::new(DB::open(dir, "test", column_families, &db_opts).expect("Failed to open DB."))
     }
 
     // Test utils

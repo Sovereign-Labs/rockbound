@@ -7,6 +7,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
+use rockbound::default_cf_descriptor;
 use rockbound::schema::{ColumnFamilyName, Schema};
 use rockbound::test::TestField;
 use rockbound::{SchemaBatch, DB};
@@ -46,11 +47,12 @@ fn open_db(dir: impl AsRef<std::path::Path>) -> DB {
     let mut db_opts = rocksdb::Options::default();
     db_opts.create_if_missing(true);
     db_opts.create_missing_column_families(true);
-    DB::open(
+    DB::open_with_cfds(
+        &db_opts,
         dir,
         "cache_test",
-        get_column_families(),
-        &db_opts,
+        get_column_families().into_iter().map(default_cf_descriptor),
+        vec![CachedTestSchema::COLUMN_FAMILY_NAME.into()],
         1_000_000,
     )
     .expect("Failed to open DB.") // Use 1 MB cache for testing
