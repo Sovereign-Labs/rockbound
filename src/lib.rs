@@ -197,6 +197,7 @@ impl DB {
                 let _timer = SCHEMADB_GET_LATENCY_SECONDS
                     .with_label_values(&[cf_name])
                     .start_timer();
+                println!("Getting raw value for key: {:?} from cf: {}", encoded_schema_key, cf_name);
 
                 let cf_handle = self.get_cf_handle(cf_name)?;
 
@@ -409,17 +410,40 @@ impl DB {
         range: impl std::ops::RangeBounds<SchemaKey>,
         direction: ScanDirection,
     ) -> anyhow::Result<RawDbIter<'_>> {
+        self.raw_iter_range_with_decode_fn::<S, (SchemaKey, SchemaValue)>(range, direction, &|(key, value)| (key.to_vec(), value.to_vec()))
+    }
+
+     /// Get a [`RawDbIter`] in given range and direction.
+     pub(crate) fn raw_iter_range_with_decode_fn<S: Schema, Item>(
+        &self,
+        range: impl std::ops::RangeBounds<SchemaKey>,
+        direction: ScanDirection,
+        decode_fn: &'static dyn Fn((&[u8], &[u8])) -> Item,
+    ) -> anyhow::Result<RawDbIter<'_, Item>> {
         assert!(
             !S::SHOULD_CACHE,
             "Caching is incompatible with iterators! Cannot iterate over {}",
             S::COLUMN_FAMILY_NAME
         );
+        
+        Ok(self.raw_iter_cf_with_decode_fn::<Item>(S::COLUMN_FAMILY_NAME, range, direction, decode_fn)?)
+    }
+
+    
+    /// Get a [`RawDbIter`] in given range and direction.
+    pub(crate) fn raw_iter_cf_with_decode_fn<Item>(
+        &self,
+        cf_name: &str,
+        range: impl std::ops::RangeBounds<SchemaKey>,
+        direction: ScanDirection,
+        decode_fn: &'static dyn Fn((&[u8], &[u8])) -> Item,
+    ) -> anyhow::Result<RawDbIter<'_, Item>> {
         if is_range_bounds_inverse(&range) {
             tracing::error!("[Rockbound]: error in raw_iter_range: lower_bound > upper_bound");
             anyhow::bail!("[Rockbound]: error in raw_iter_range: lower_bound > upper_bound");
         }
-        let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
-        Ok(RawDbIter::new(&self.db, cf_handle, range, direction))
+        let cf_handle = self.get_cf_handle(cf_name)?;
+        Ok(RawDbIter::new_with_decode_fn(&self.db, cf_handle, range, direction, decode_fn))
     }
 
     /// Iterator over a range of keys in a schema, allowing iteration over cached column families. This is only correct if a lock is held to ensure consistency.
@@ -635,6 +659,9 @@ impl DB {
     #[cfg(feature = "test-utils")]
     pub fn cache_misses(&self) -> u64 {
         self.cache.read().misses()
+    }
+    pub(crate) fn write_opt(&self, batch: rocksdb::WriteBatch, options: &rocksdb::WriteOptions) -> Result<(), rocksdb::Error> {
+        self.db.write_opt(batch, options)
     }
 }
 

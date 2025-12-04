@@ -7,10 +7,10 @@ use std::sync::Arc;
 
 use rockbound::schema::{ColumnFamilyName, KeyDecoder, KeyEncoder, Schema, ValueCodec};
 use rockbound::versioned_db::{
-    HasPrefix, PrunableKey, SchemaWithVersion, VersionedDB, VersionedDeltaReader, VersionedKey, VersionedSchemaBatch, VersionedTableMetadataKey
+    ArcBytes, HasPrefix, SchemaWithVersion, VersionedDB, VersionedDeltaReader, VersionedSchemaBatch
 };
 use rockbound::{default_cf_descriptor, CodecError};
-use rockbound::{SchemaBatch, DB};
+use rockbound::{DB};
 use rocksdb::DEFAULT_COLUMN_FAMILY_NAME;
 use tempfile::TempDir;
 
@@ -51,22 +51,56 @@ impl AsRef<[u8]> for TestField {
     }
 }
 
+#[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Default)]
+pub struct TestKey(Arc<Vec<u8>>);
+
+impl From<Vec<u8>> for TestKey {
+    fn from(key: Vec<u8>) -> Self {
+        Self(Arc::new(key))
+    }
+}
+
+impl From<Arc<Vec<u8>>> for TestKey {
+    fn from(key: Arc<Vec<u8>>) -> Self {
+        Self(key)
+    }
+}
+
+impl AsRef<[u8]> for TestKey {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+}
+
+impl ArcBytes for TestKey {}
+
+impl KeyEncoder<LiveKeys> for TestKey {
+    fn encode_key(&self) -> Result<Vec<u8>, CodecError> {
+        Ok(self.0.as_ref().to_vec())
+    }
+}
+
+impl KeyDecoder<LiveKeys> for TestKey {
+    fn decode_key(data: &[u8]) -> Result<Self, CodecError> {
+        Ok(TestKey::from(data.to_vec()))
+    }
+}
 
 // Create cached and non-cached schemas for testing
 #[derive(Debug, Default, Clone, PartialOrd, Ord, PartialEq, Eq)]
 pub struct LiveKeys;
 
 impl Schema for LiveKeys {
-    type Key = Arc<Vec<u8>>;
+    type Key = TestKey;
     type Value = TestField;
     const COLUMN_FAMILY_NAME: ColumnFamilyName = "LiveKeysCF";
     const SHOULD_CACHE: bool = true;
 }
 
 impl SchemaWithVersion for LiveKeys {
-    type HistoricalColumnFamily = HistoricalKeys;
-    type PruningColumnFamily = PruningKeys;
-    type VersionMetadatacolumn = VersionMetadata;
+    const HISTORICAL_COLUMN_FAMILY_NAME: ColumnFamilyName = "HistoricalKeysCF";
+    const PRUNING_COLUMN_FAMILY_NAME: ColumnFamilyName = "PruningKeysCF";
+    const VERSION_METADATA_COLUMN_FAMILY_NAME: ColumnFamilyName = "VersionMetadataCF";
 }
 
 impl KeyDecoder<LiveKeys> for Arc<Vec<u8>> {
@@ -87,78 +121,19 @@ impl KeyDecoder<LiveKeys> for Vec<u8> {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct PruningKeys;
-
-impl Schema for PruningKeys {
-    type Key = PrunableKey<LiveKeys, Arc<Vec<u8>>>;
-    type Value = ();
-    const COLUMN_FAMILY_NAME: ColumnFamilyName = "PruningKeysCF";
-    const SHOULD_CACHE: bool = false;
-}
-
-impl ValueCodec<PruningKeys> for () {
-    fn encode_value(&self) -> Result<Vec<u8>, CodecError> {
-        Ok(vec![])
-    }
-    fn decode_value(_data: &[u8]) -> Result<Self, CodecError> {
-        Ok(())
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct VersionMetadata;
-
-impl Schema for VersionMetadata {
-    type Key = VersionedTableMetadataKey;
-    type Value = u64;
-    const COLUMN_FAMILY_NAME: ColumnFamilyName = "VersionMetadataCF";
-    const SHOULD_CACHE: bool = false;
-}
-
-impl KeyEncoder<VersionMetadata> for VersionedTableMetadataKey {
-    fn encode_key(&self) -> Result<Vec<u8>, CodecError> {
-        self.encode()
-    }
-}
-
-impl KeyDecoder<VersionMetadata> for VersionedTableMetadataKey {
-    fn decode_key(data: &[u8]) -> Result<Self, CodecError> {
-        Self::decode(data)
-    }
-}
-
-impl ValueCodec<VersionMetadata> for u64 {
-    fn encode_value(&self) -> Result<Vec<u8>, CodecError> {
-        Ok(self.to_be_bytes().to_vec())
-    }
-    fn decode_value(data: &[u8]) -> Result<Self, CodecError> {
-        Ok(u64::from_be_bytes(data.try_into().map_err(|_| {
-            CodecError::InvalidKeyLength {
-                expected: 8,
-                got: data.len(),
-            }
-        })?))
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct HistoricalKeys;
-
-impl Schema for HistoricalKeys {
-    type Key = VersionedKey<LiveKeys, Arc<Vec<u8>>>;
-    type Value = TestField;
-    const COLUMN_FAMILY_NAME: ColumnFamilyName = "HistoricalKeysCF";
-    const SHOULD_CACHE: bool = false;
-}
+// impl KeyDecoder<PrunableKey> for TestKey {
+//     fn decode_key(data: &[u8]) -> Result<Self, CodecError> {
+//         Ok(TestKey::from(data.to_vec()))
+//     }
+// }
 
 fn get_column_families() -> Vec<ColumnFamilyName> {
     vec![
         DEFAULT_COLUMN_FAMILY_NAME,
         LiveKeys::COLUMN_FAMILY_NAME,
-        PruningKeys::COLUMN_FAMILY_NAME,
-        VersionMetadata::COLUMN_FAMILY_NAME,
-        HistoricalKeys::COLUMN_FAMILY_NAME,
+        LiveKeys::HISTORICAL_COLUMN_FAMILY_NAME,
+        LiveKeys::PRUNING_COLUMN_FAMILY_NAME,
+        LiveKeys::VERSION_METADATA_COLUMN_FAMILY_NAME,
     ]
 }
 
@@ -202,13 +177,19 @@ impl std::ops::Deref for TestDB {
     }
 }
 
+impl HasPrefix<TestKey> for TestKey {
+    fn has_prefix(&self, prefix: &TestKey) -> bool {
+        self.0.as_ref().starts_with(prefix.0.as_ref())
+    }
+}
+
 fn check_iterator(
     delta_reader: &VersionedDeltaReader<LiveKeys>,
     prefix: &[u8],
     expected_values: &[(&[u8], u32)],
 ) {
     let mut iter = delta_reader
-        .iter_with_prefix(Arc::new(prefix.to_vec()))
+        .iter_with_prefix(TestKey::from(prefix.to_vec()))
         .unwrap();
     for (key, value) in expected_values {
         let next = iter.next();
@@ -221,11 +202,11 @@ fn check_iterator(
         });
         assert_eq!(
             next.0,
-            Arc::new(key.to_vec()),
+            TestKey::from(key.to_vec()),
             "Expected key {} with value {} in iterator, but got key {}",
             std::str::from_utf8(key).unwrap(),
             value,
-            std::str::from_utf8(&next.0).unwrap()
+            std::str::from_utf8(next.0.as_ref()).unwrap()
         );
         assert_eq!(
             next.1,
@@ -269,15 +250,17 @@ fn commit_batch(
 fn put_keys(versioned_db: &VersionedDB<LiveKeys>, keys: &[(&[u8], u32)], version: u64) {
     let mut batch = VersionedSchemaBatch::<LiveKeys>::default();
     for (key, value) in keys {
-        batch.put_versioned(Arc::new(key.to_vec()), TestField::new(*value));
+        batch.put_versioned(TestKey::from(key.to_vec()), TestField::new(*value));
     }
 
     commit_batch(versioned_db, &batch, version);
 
     for (key, value) in keys {
+        let key = TestKey::from(key.to_vec()).encode_key().unwrap();
+        println!("Getting live value for key: {:?}", key);
         assert_eq!(
             versioned_db
-                .get_live_value(&Arc::new(key.to_vec()).encode_key().unwrap())
+                .get_live_value(&key)
                 .unwrap(),
             Some(TestField::new(*value))
         );
@@ -301,7 +284,7 @@ fn test_iteration() {
     assert_eq!(version, None);
     let delta_reader = VersionedDeltaReader::<LiveKeys>::new(versioned_db.clone(), None, vec![]);
     let mut iter = delta_reader
-        .iter_with_prefix(Arc::new(b"key".to_vec()))
+        .iter_with_prefix(TestKey::from(b"key".to_vec()))
         .unwrap();
     assert_eq!(iter.next(), None);
     drop(iter);
@@ -322,8 +305,8 @@ fn test_iteration() {
     check_iterator(&delta_reader, b"key1", &[(b"key11", 0), (b"key19", 0)]);
 
     let mut snapshot = VersionedSchemaBatch::<LiveKeys>::default();
-    snapshot.put_versioned(Arc::new(b"key12".to_vec()), TestField::new(1));
-    snapshot.put_versioned(Arc::new(b"key19".to_vec()), TestField::new(1));
+    snapshot.put_versioned(TestKey::from(b"key12".to_vec()), TestField::new(1));
+    snapshot.put_versioned(TestKey::from(b"key19".to_vec()), TestField::new(1));
 
     let snapshot_1 = Arc::new(snapshot);
     let delta_reader = VersionedDeltaReader::<LiveKeys>::new(
@@ -343,8 +326,8 @@ fn test_iteration() {
     );
 
     let mut snapshot = VersionedSchemaBatch::<LiveKeys>::default();
-    snapshot.put_versioned(Arc::new(b"key12".to_vec()), TestField::new(2));
-    snapshot.delete_versioned(Arc::new(b"key19".to_vec()));
+    snapshot.put_versioned(TestKey::from(b"key12".to_vec()), TestField::new(2));
+    snapshot.delete_versioned(TestKey::from(b"key19".to_vec()));
 
     let snapshot_2 = Arc::new(snapshot);
     let delta_reader = VersionedDeltaReader::<LiveKeys>::new(
@@ -384,7 +367,7 @@ fn test_iteration() {
         3,
     );
     assert!(delta_reader
-        .iter_with_prefix(Arc::new(b"key".to_vec()))
+        .iter_with_prefix(TestKey::from(b"key".to_vec()))
         .is_err());
 }
 
@@ -397,7 +380,7 @@ fn test_open_iterator_blocks_writes() {
     let delta_reader = VersionedDeltaReader::<LiveKeys>::new(versioned_db.clone(), None, vec![]);
 
     let mut iter = delta_reader
-        .iter_with_prefix(Arc::new(b"key".to_vec()))
+        .iter_with_prefix(TestKey::from(b"key".to_vec()))
         .unwrap();
 
     let (tx, rx) = std::sync::mpsc::channel();
