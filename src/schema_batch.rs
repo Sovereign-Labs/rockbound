@@ -272,7 +272,7 @@ mod tests {
 
         #[test]
         fn empty_schema_batch_iterator() {
-            let batch = SchemaBatch::new();
+            let batch = SchemaBatch::<SchemaKey, SchemaValue>::new();
             let mut iter_forward = batch.iter::<TestSchema1>();
             assert_eq!(None, iter_forward.next());
             let mut iter_backward = batch.iter::<TestSchema1>().rev();

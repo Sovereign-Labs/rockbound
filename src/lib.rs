@@ -180,16 +180,28 @@ impl DB {
         &self,
         encoded_schema_key: &[u8],
     ) -> anyhow::Result<Option<S::Value>> {
+       self.get_raw_with_cf_and_decoder::<S::Value>(S::COLUMN_FAMILY_NAME, encoded_schema_key,&<S::Value as ValueCodec<S>>::decode_value, S::SHOULD_CACHE)
+    }
+
+    /// Reads single record by key.
+    #[tracing::instrument(skip_all, level = "error")]
+    pub fn get_raw_with_cf_and_decoder<V>(
+        &self,
+        cf_name: &'static str,
+        encoded_schema_key: &[u8],
+        decoder: &impl Fn(&[u8]) -> Result<V, CodecError>,
+        should_cache: bool,
+    ) -> anyhow::Result<Option<V>> {
         with_error_logging::<_, _, anyhow::Error>(
             || {
                 let _timer = SCHEMADB_GET_LATENCY_SECONDS
-                    .with_label_values(&[S::COLUMN_FAMILY_NAME])
+                    .with_label_values(&[cf_name])
                     .start_timer();
 
-                let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
+                let cf_handle = self.get_cf_handle(cf_name)?;
 
                 // Only grab the read lock if we're accessing a cached column family.
-                if S::SHOULD_CACHE {
+                if should_cache {
                     let lock = self.cache.try_read();
                     // If the cache is locked for writing, just fall back to the DB. It provides consistency without locking
                     // Otherwise, we'll hold the lock until we've finished reading and (if necessary) modifying the cache.
@@ -198,10 +210,10 @@ impl DB {
                     // the stale value to the cache
                     if let Some(cache) = lock.as_ref() {
                         let cache_result =
-                            cache.get(&Pair(S::COLUMN_FAMILY_NAME, encoded_schema_key));
+                            cache.get(&Pair(cf_name, encoded_schema_key));
                         if let Some(result) = cache_result {
                             return result
-                                .map(|v| <S::Value as ValueCodec<S>>::decode_value(&v))
+                                .map(|v| decoder(&v))
                                 .transpose()
                                 .map_err(|err| err.into());
                         }
@@ -214,22 +226,22 @@ impl DB {
                         // This prevents us from unifying the two branches.
                         // Note: We don't count bytes read from the cache
                         cache.insert(
-                            (S::COLUMN_FAMILY_NAME, encoded_schema_key.to_vec()),
+                            (cf_name, encoded_schema_key.to_vec()),
                             result.as_ref().map(|v| v.to_vec()),
                         );
                     }
                     return result
-                        .map(|raw_value| <S::Value as ValueCodec<S>>::decode_value(&raw_value))
+                        .map(|raw_value| decoder(&raw_value))
                         .transpose()
                         .map_err(|err| err.into());
                 }
 
                 let result = self.db.get_pinned_cf(cf_handle, encoded_schema_key)?;
                 SCHEMADB_GET_BYTES
-                    .with_label_values(&[S::COLUMN_FAMILY_NAME])
+                    .with_label_values(&[cf_name])
                     .observe(result.as_ref().map_or(0.0, |v| v.len() as f64));
                 result
-                    .map(|raw_value| <S::Value as ValueCodec<S>>::decode_value(&raw_value))
+                    .map(|raw_value| decoder(&raw_value))
                     .transpose()
                     .map_err(|err| err.into())
             },
@@ -525,6 +537,12 @@ impl DB {
     #[tracing::instrument(skip_all, level = "error")]
     /// Writes a group of records wrapped in a [`SchemaBatch`].
     pub fn write_schemas(&self, batch: SchemaBatch) -> anyhow::Result<()> {
+        with_error_logging(|| self.write_schemas_inner(batch), "write_schemas")
+    }
+
+    #[tracing::instrument(skip_all, level = "error")]
+    /// Writes a group of records wrapped in a [`SchemaBatch`].
+    pub fn write_versioned_schemas<K, V>(&self, batch: SchemaBatch) -> anyhow::Result<()> {
         with_error_logging(|| self.write_schemas_inner(batch), "write_schemas")
     }
 

@@ -6,18 +6,54 @@
 use std::sync::Arc;
 
 use rockbound::schema::{ColumnFamilyName, KeyDecoder, KeyEncoder, Schema, ValueCodec};
-use rockbound::test::TestField;
 use rockbound::versioned_db::{
-    PrunableKey, SchemaWithVersion, VersionedDB, VersionedDeltaReader, VersionedKey,
-    VersionedSchemaBatch, VersionedTableMetadataKey,
+    HasPrefix, PrunableKey, SchemaWithVersion, VersionedDB, VersionedDeltaReader, VersionedKey, VersionedSchemaBatch, VersionedTableMetadataKey
 };
 use rockbound::{default_cf_descriptor, CodecError};
 use rockbound::{SchemaBatch, DB};
 use rocksdb::DEFAULT_COLUMN_FAMILY_NAME;
 use tempfile::TempDir;
 
+
+#[derive(Debug, Default, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
+pub struct TestField([u8; 4]);
+impl TestField {
+    pub fn new(value: u32) -> Self {
+        Self(value.to_be_bytes())
+    }
+}
+
+
+impl<S: Schema> ValueCodec<S> for TestField {
+    fn encode_value(&self) -> Result<Vec<u8>, CodecError> {
+        Ok(self.0.to_vec())
+    }
+
+    fn decode_value(data: &[u8]) -> Result<Self, CodecError> {
+        Ok(Self(data.try_into().map_err(|_| {
+            CodecError::InvalidKeyLength {
+                expected: 4,
+                got: data.len(),
+            }
+        })?))
+    }
+}
+
+impl std::fmt::Display for TestField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", u32::from_le_bytes(self.0))
+    }
+}
+
+impl AsRef<[u8]> for TestField {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+
 // Create cached and non-cached schemas for testing
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialOrd, Ord, PartialEq, Eq)]
 pub struct LiveKeys;
 
 impl Schema for LiveKeys {
@@ -193,11 +229,11 @@ fn check_iterator(
         );
         assert_eq!(
             next.1,
-            Some(TestField(*value)),
+            Some(TestField::new(*value)),
             "Expected value {} for key {} in iterator, but got {}",
             value,
             std::str::from_utf8(key).unwrap(),
-            next.1.unwrap().0
+            next.1.unwrap()
         );
     }
     assert_eq!(iter.next(), None);
@@ -208,31 +244,32 @@ fn commit_batch(
     batch: &VersionedSchemaBatch<LiveKeys>,
     version: u64,
 ) {
-    let mut live_keys_batch = SchemaBatch::new();
-    let mut historical_keys_batch = SchemaBatch::new();
+    versioned_db.commit(batch, version).unwrap();
+    // let mut live_keys_batch = SchemaBatch::new();
+    // let mut historical_keys_batch = SchemaBatch::new();
 
-    versioned_db
-        .materialize(
-            batch,
-            &mut live_keys_batch,
-            &mut historical_keys_batch,
-            version,
-        )
-        .unwrap();
-    versioned_db
-        .live_db()
-        .write_schemas(live_keys_batch)
-        .unwrap();
-    versioned_db
-        .archival_db()
-        .write_schemas(historical_keys_batch)
-        .unwrap();
+    // versioned_db
+    //     .materialize(
+    //         batch,
+    //         &mut live_keys_batch,
+    //         &mut historical_keys_batch,
+    //         version,
+    //     )
+    //     .unwrap();
+    // versioned_db
+    //     .live_db()
+    //     .write_schemas(live_keys_batch)
+    //     .unwrap();
+    // versioned_db
+    //     .archival_db()
+    //     .write_schemas(historical_keys_batch)
+    //     .unwrap();
 }
 
 fn put_keys(versioned_db: &VersionedDB<LiveKeys>, keys: &[(&[u8], u32)], version: u64) {
     let mut batch = VersionedSchemaBatch::<LiveKeys>::default();
     for (key, value) in keys {
-        batch.put_versioned(Arc::new(key.to_vec()), TestField(*value));
+        batch.put_versioned(Arc::new(key.to_vec()), TestField::new(*value));
     }
 
     commit_batch(versioned_db, &batch, version);
@@ -242,13 +279,13 @@ fn put_keys(versioned_db: &VersionedDB<LiveKeys>, keys: &[(&[u8], u32)], version
             versioned_db
                 .get_live_value(&Arc::new(key.to_vec()).encode_key().unwrap())
                 .unwrap(),
-            Some(TestField(*value))
+            Some(TestField::new(*value))
         );
         assert_eq!(
             versioned_db
                 .get_historical_value(&Arc::new(key.to_vec()), version)
                 .unwrap(),
-            Some(TestField(*value))
+            Some(TestField::new(*value))
         );
     }
 }
@@ -285,8 +322,8 @@ fn test_iteration() {
     check_iterator(&delta_reader, b"key1", &[(b"key11", 0), (b"key19", 0)]);
 
     let mut snapshot = VersionedSchemaBatch::<LiveKeys>::default();
-    snapshot.put_versioned(Arc::new(b"key12".to_vec()), TestField(1));
-    snapshot.put_versioned(Arc::new(b"key19".to_vec()), TestField(1));
+    snapshot.put_versioned(Arc::new(b"key12".to_vec()), TestField::new(1));
+    snapshot.put_versioned(Arc::new(b"key19".to_vec()), TestField::new(1));
 
     let snapshot_1 = Arc::new(snapshot);
     let delta_reader = VersionedDeltaReader::<LiveKeys>::new(
@@ -306,7 +343,7 @@ fn test_iteration() {
     );
 
     let mut snapshot = VersionedSchemaBatch::<LiveKeys>::default();
-    snapshot.put_versioned(Arc::new(b"key12".to_vec()), TestField(2));
+    snapshot.put_versioned(Arc::new(b"key12".to_vec()), TestField::new(2));
     snapshot.delete_versioned(Arc::new(b"key19".to_vec()));
 
     let snapshot_2 = Arc::new(snapshot);
