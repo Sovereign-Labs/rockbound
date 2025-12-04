@@ -639,29 +639,29 @@ pub type SchemaValue = Vec<u8>;
 /// Represents operation written to the database.
 #[cfg_attr(feature = "arbitrary", derive(proptest_derive::Arbitrary))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub enum Operation {
+pub enum Operation<K = SchemaKey, V = SchemaValue> {
     /// Writing a value to the DB.
     Put {
         /// Value to write
-        value: SchemaValue,
+        value: V,
     },
     /// Deleting a value
     Delete,
     /// Deleting a range of values
     DeleteRange {
         /// Start of the range to delete
-        from: SchemaKey,
+        from: K,
         /// End of the range to delete
-        to: SchemaKey,
+        to: K,
     },
 }
 
-impl Operation {
+impl<K, V: AsRef<[u8]>> Operation<K, V> {
     /// Returns [`S::Value`] if the operation is [`Operation::Put`] and `None` if [`Operation::Delete`].
     fn decode_value<S: Schema>(&self) -> anyhow::Result<Option<S::Value>> {
         match self {
             Operation::Put { value } => {
-                let value = S::Value::decode_value(value)?;
+                let value = S::Value::decode_value(value.as_ref())?;
                 Ok(Some(value))
             }
             Operation::Delete | Operation::DeleteRange { .. } => Ok(None),
