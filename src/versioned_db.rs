@@ -10,7 +10,7 @@ use parking_lot::RwLockReadGuard;
 use rocksdb::ColumnFamilyDescriptor;
 
 use crate::{
-    default_cf_descriptor, default_write_options, iterator::{RawDbIter, ScanDirection}, metrics::SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS, schema::{ColumnFamilyName, KeyCodec, KeyDecoder, KeyEncoder, ValueCodec}, with_error_logging, CodecError, DbCache, Schema, SchemaBatch, DB
+    default_cf_descriptor, default_write_options, iterator::{RawDbIter, ScanDirection}, metrics::{SCHEMADB_BATCH_COMMIT_BYTES, SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS, SCHEMADB_DELETES, SCHEMADB_PUT_BYTES}, schema::{ColumnFamilyName, KeyCodec, KeyDecoder, KeyEncoder, ValueCodec}, with_error_logging, CodecError, DbCache, Schema, SchemaBatch, DB
 };
 #[derive(Debug, Default)]
 pub(crate) struct VersionMetadata;
@@ -534,19 +534,29 @@ where
         // Update the next version to commit if relevant.
         // Block any readers while the DB isn't fully consistent
         let cache = self.live_db.cache.write();
-        // Optimization: Avoid allocating a new vector for each key.
-        //
+        // Optimization:
         // At various times we need the key *prefixed* with the version (for pruning), on its own (for live reads), and suffixed with the version (for archival reads).
         // To reduce allocations and memcopies, we create a single vector [version || key || version] and use it for all three cases, simply slicing the relevant subset.
         //
         // As a further optimization, we reuse a single `Vec` for all keys.
+
         let mut key_with_version = KeyWithVersionPrefixAndSuffix::new(version);
+
+        // Create batches and column families
         let mut live_db_batch = rocksdb::WriteBatch::default();
         let mut archival_db_batch = rocksdb::WriteBatch::default();
         let live_cf_handle = self.live_db.get_cf_handle(V::COLUMN_FAMILY_NAME)?;
         let archival_cf_handle = self.archival_db.get_cf_handle(V::HISTORICAL_COLUMN_FAMILY_NAME)?;
         let pruning_cf_handle = self.archival_db.get_cf_handle(V::PRUNING_COLUMN_FAMILY_NAME)?;
         let metadata_cf_handle = self.live_db.get_cf_handle(V::VERSION_METADATA_COLUMN_FAMILY_NAME)?;
+
+        //  Keys for metrics
+        let mut live_put_bytes = 0;
+        let mut deletes = 0;
+        let mut archival_puts_bytes = 0;
+        let mut pruning_puts_bytes = 0;
+
+        // TODO: Assert version consistency before writing
         // FIXME: Handle caching
         for (key, value) in batch.versioned_table_writes.iter() {
             key_with_version.set_key(key.as_ref());
@@ -555,66 +565,26 @@ where
                 Some(value) => {
                     assert!(!key_with_version.live_key().is_empty(), "Live values may not have zero-length. This prevents confusion with placholders for deleted values.");
                     println!("Inserting live key: {:?}", key_with_version.live_key());
+                    live_put_bytes += key_with_version.live_key().len() + value.as_ref().len();
                     live_db_batch.put_cf(live_cf_handle, key_with_version.live_key(), &value);
+                    archival_puts_bytes += key_with_version.archival_key().len() + value.as_ref().len();
                     archival_db_batch.put_cf(archival_cf_handle, key_with_version.archival_key(), &value);
                 }
                 None => {
                     println!("Deleting live key: {:?}", key_with_version.live_key());
+                    deletes +=1;
+                    archival_puts_bytes += key_with_version.archival_key().len();
                     live_db_batch.delete_cf(live_cf_handle, &key);
                     archival_db_batch.put_cf(archival_cf_handle, key_with_version.archival_key(), &[]);
                 }
             }
             archival_db_batch.put_cf(pruning_cf_handle, key_with_version.pruning_key(), &[]);
+            pruning_puts_bytes += key_with_version.pruning_key().len();
         }
         live_db_batch.put_cf(metadata_cf_handle, VersionedTableMetadataKey::CommittedVersion.as_bytes(), &version.to_be_bytes());
-        
-        // let mut columns_written = Vec::with_capacity(batch.versioned_table_writes.len());
-        // for (cf_name, rows) in batch.last_writes.into_iter() {
-        //     let should_cache = self
-        //         .cacheable_column_families
-        //         .iter()
-        //         .any(|cf| cf == cf_name);
-        //     let cf_handle = self.get_cf_handle(cf_name)?;
-        //     let mut write_sizes = Vec::with_capacity(rows.len());
-        //     let mut deletes_for_cf = 0;
-        //     for (key, operation) in rows {
-        //         match operation {
-        //             Operation::Put { value } => {
-        //                 write_sizes.push(key.len() + value.len());
-        //                 db_batch.put_cf(cf_handle, &key, &value);
-        //                 if should_cache {
-        //                     cache.insert((cf_name, key), Some(value));
-        //                 }
-        //             }
-        //             Operation::Delete => {
-        //                 db_batch.delete_cf(cf_handle, &key);
-        //                 if should_cache {
-        //                     cache.insert((cf_name, key), None);
-        //                 }
-        //                 deletes_for_cf += 1;
-        //             }
-        //             Operation::DeleteRange { .. } => {
-        //                 warn!("Unexpected range operation found: {:?}", operation)
-        //             }
-        //         }
-        //     }
-        //     columns_written.push((cf_name, write_sizes, deletes_for_cf));
-        // }
-        // for (cf_name, operations) in batch.range_ops.iter() {
-        //     let cf_handle = self.get_cf_handle(cf_name)?;
-        //     for operation in operations {
-        //         match operation {
-        //             Operation::DeleteRange { from, to } => {
-        //                 db_batch.delete_range_cf(cf_handle, from, to)
-        //             }
-        //             _ => warn!(
-        //                 "Unexpected non range based operation found: {:?}",
-        //                 operation
-        //             ),
-        //         }
-        //     }
-        // }
-        // let serialized_size = db_batch.size_in_bytes();
+       
+        let serialized_size = live_db_batch.size_in_bytes() + archival_db_batch.size_in_bytes();
+        let archival_serialized_size = archival_db_batch.size_in_bytes();
         with_error_logging(
             || self.archival_db.write_opt(archival_db_batch, &default_write_options()),
             "write_versioned_schemas::write_archival_opt",
@@ -627,27 +597,30 @@ where
         // Drop the write lock on the cache.
         drop(cache);
 
-        // Bump counters only after DB write succeeds.
-        // for (cf_name, bytes, deletes) in columns_written {
-        //     for write_size in bytes {
-        //         SCHEMADB_PUT_BYTES
-        //             .with_label_values(&[cf_name])
-        //             .observe(write_size as f64);
-        //     }
-        //     SCHEMADB_DELETES
-        //         .with_label_values(&[cf_name])
-        //         .inc_by(deletes);
-        // }
-        // for (cf_name, operations) in batch.range_ops.iter() {
-        //     for operation in operations {
-        //         if let Operation::DeleteRange { .. } = operation {
-        //             SCHEMADB_DELETE_RANGE.with_label_values(&[cf_name]).inc();
-        //         }
-        //     }
-        // }
-        // SCHEMADB_BATCH_COMMIT_BYTES
-        //     .with_label_values(&[self.name])
-        //     .observe(serialized_size as f64);
+
+        // Track metrics after the writes succeed
+        {
+            SCHEMADB_PUT_BYTES
+                .with_label_values(&[V::COLUMN_FAMILY_NAME])
+                .observe(live_put_bytes as f64);
+            SCHEMADB_DELETES
+                .with_label_values(&[V::COLUMN_FAMILY_NAME])
+                .inc_by(deletes);
+            SCHEMADB_PUT_BYTES
+                .with_label_values(&[V::HISTORICAL_COLUMN_FAMILY_NAME])
+                .observe(archival_puts_bytes as f64);
+            SCHEMADB_PUT_BYTES
+                .with_label_values(&[V::PRUNING_COLUMN_FAMILY_NAME])
+                .observe(pruning_puts_bytes as f64);
+            
+            SCHEMADB_BATCH_COMMIT_BYTES
+                .with_label_values(&[self.live_db.name()])
+                .observe(serialized_size as f64);
+            SCHEMADB_BATCH_COMMIT_BYTES
+                .with_label_values(&[self.archival_db.name()])
+                .observe(archival_serialized_size as f64);
+        }
+        
 
 
         Ok(())
