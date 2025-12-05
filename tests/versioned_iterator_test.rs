@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use rockbound::schema::{ColumnFamilyName, KeyDecoder, KeyEncoder, Schema, ValueCodec};
 use rockbound::versioned_db::{
-    ArcBytes, HasPrefix, SchemaWithVersion, VersionedDB, VersionedDeltaReader, VersionedSchemaBatch
+     HasPrefix, SchemaWithVersion, VersionedDB, VersionedDeltaReader, VersionedSchemaBatch, VersionedSchemaKeyMarker
 };
 use rockbound::{default_cf_descriptor, CodecError};
 use rockbound::{DB};
@@ -72,7 +72,6 @@ impl AsRef<[u8]> for TestKey {
     }
 }
 
-impl ArcBytes for TestKey {}
 
 impl KeyEncoder<LiveKeys> for TestKey {
     fn encode_key(&self) -> Result<Vec<u8>, CodecError> {
@@ -96,6 +95,8 @@ impl Schema for LiveKeys {
     const COLUMN_FAMILY_NAME: ColumnFamilyName = "LiveKeysCF";
     const SHOULD_CACHE: bool = true;
 }
+
+impl VersionedSchemaKeyMarker for TestKey {}
 
 impl SchemaWithVersion for LiveKeys {
     const HISTORICAL_COLUMN_FAMILY_NAME: ColumnFamilyName = "HistoricalKeysCF";
@@ -146,8 +147,6 @@ fn open_db(dir: impl AsRef<std::path::Path>) -> DB {
         dir,
         "cache_test",
         get_column_families().into_iter().map(default_cf_descriptor),
-        vec![LiveKeys::COLUMN_FAMILY_NAME.into()],
-        1_000_000,
     )
     .expect("Failed to open DB.") // Use 1 MB cache for testing
 }
@@ -256,7 +255,7 @@ fn put_keys(versioned_db: &VersionedDB<LiveKeys>, keys: &[(&[u8], u32)], version
     commit_batch(versioned_db, &batch, version);
 
     for (key, value) in keys {
-        let key = TestKey::from(key.to_vec()).encode_key().unwrap();
+        let key = TestKey::from(key.to_vec());
         println!("Getting live value for key: {:?}", key);
         assert_eq!(
             versioned_db
@@ -266,7 +265,7 @@ fn put_keys(versioned_db: &VersionedDB<LiveKeys>, keys: &[(&[u8], u32)], version
         );
         assert_eq!(
             versioned_db
-                .get_historical_value(&Arc::new(key.to_vec()), version)
+                .get_historical_value(&key, version)
                 .unwrap(),
             Some(TestField::new(*value))
         );
@@ -277,7 +276,7 @@ fn put_keys(versioned_db: &VersionedDB<LiveKeys>, keys: &[(&[u8], u32)], version
 fn test_iteration() {
     let test_db = TestDB::new();
     let db = Arc::new(test_db.db);
-    let versioned_db = VersionedDB::<LiveKeys>::from_dbs(db.clone(), db.clone()).unwrap();
+    let versioned_db = Arc::new(VersionedDB::<LiveKeys>::from_dbs(db.clone(), db.clone(), 0).unwrap());
 
     // Check iteration against an empty DB.
     let version = versioned_db.get_committed_version().unwrap();
@@ -375,7 +374,7 @@ fn test_iteration() {
 fn test_open_iterator_blocks_writes() {
     let test_db = TestDB::new();
     let db = Arc::new(test_db.db);
-    let versioned_db = VersionedDB::<LiveKeys>::from_dbs(db.clone(), db.clone()).unwrap();
+    let versioned_db = Arc::new(VersionedDB::<LiveKeys>::from_dbs(db.clone(), db.clone(), 0).unwrap());
 
     let delta_reader = VersionedDeltaReader::<LiveKeys>::new(versioned_db.clone(), None, vec![]);
 

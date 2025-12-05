@@ -52,8 +52,6 @@ fn open_db(dir: impl AsRef<std::path::Path>) -> DB {
         dir,
         "cache_test",
         get_column_families().into_iter().map(default_cf_descriptor),
-        vec![CachedTestSchema::COLUMN_FAMILY_NAME.into()],
-        1_000_000,
     )
     .expect("Failed to open DB.") // Use 1 MB cache for testing
 }
