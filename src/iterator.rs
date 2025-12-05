@@ -166,8 +166,10 @@ where
 impl<S> FusedIterator for SchemaIterator<'_, S> where S: Schema {}
 
 /// Iterates over given column in [`rocksdb::DB`] using raw types.
-pub(crate) struct RawDbIter<'a, Item = (SchemaKey, SchemaValue)> 
-where Item: 'static {
+pub(crate) struct RawDbIter<'a, Item = (SchemaKey, SchemaValue)>
+where
+    Item: 'static,
+{
     db_iter: rocksdb::DBRawIterator<'a>,
     direction: ScanDirection,
     upper_bound: std::ops::Bound<SchemaKey>,
@@ -181,12 +183,13 @@ impl<'a> RawDbIter<'a> {
         range: impl std::ops::RangeBounds<SchemaKey>,
         direction: ScanDirection,
     ) -> Self {
-        Self::new_with_decode_fn(inner, cf_handle, range, direction, &|(key, value)| (key.to_vec(), value.to_vec()))
+        Self::new_with_decode_fn(inner, cf_handle, range, direction, &|(key, value)| {
+            (key.to_vec(), value.to_vec())
+        })
     }
 }
 
 impl<'a, Item> RawDbIter<'a, Item> {
-
     pub(crate) fn new_with_decode_fn(
         inner: &'a rocksdb::DB,
         cf_handle: &ColumnFamily,

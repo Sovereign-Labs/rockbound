@@ -54,7 +54,10 @@ struct BasicWeighter;
 
 impl<K: AsRef<[u8]>, V: AsRef<[u8]>> Weighter<K, Option<V>> for BasicWeighter {
     fn weight(&self, key: &K, value: &Option<V>) -> u64 {
-        key.as_ref().len() as u64 + value.as_ref().map_or(0, |v| v.as_ref().len()) as u64 + 48
+        // Slot keys take 70 bytes on the stack pluse an optional heap allocation. Values are heap allocated. Assume 24 bytes for each Vec on the stack, pluse the lengths.
+        std::cmp::max(key.as_ref().len() as u64, 70)
+            + value.as_ref().map_or(0, |v| v.as_ref().len()) as u64
+            + 48
     }
 }
 
@@ -128,19 +131,13 @@ impl DB {
             || rocksdb::DB::open_cf_descriptors(db_opts, path, cfds),
             "open_with_cfds",
         )?;
-        Ok(Self::log_construct(
-            name,
-            inner,
-        ))
+        Ok(Self::log_construct(name, inner))
     }
 
     // Cache size estimation: we want to allocate about 1GB for cache. Estimate that slot keys are about 80 bytes and slot values
     // are around 400 bytes + 56 bytes of overhead on the stack (see weighter). Multiply by 1.5 to account for overhead (per quick-cache docs).
     // That gives estimated item capacity of 1GB / (80 + 400 + 56) * 1.5 ~= 1.2M.
-    fn log_construct(
-        name: &'static str,
-        inner: rocksdb::DB,
-    ) -> DB {
+    fn log_construct(name: &'static str, inner: rocksdb::DB) -> DB {
         info!(rocksdb_name = name, path = %inner.path().display(), "Opened RocksDB");
         DB {
             name,
@@ -169,7 +166,11 @@ impl DB {
         &self,
         encoded_schema_key: &[u8],
     ) -> anyhow::Result<Option<S::Value>> {
-       self.get_raw_with_cf_and_decoder::<S::Value>(S::COLUMN_FAMILY_NAME, encoded_schema_key,&<S::Value as ValueCodec<S>>::decode_value)
+        self.get_raw_with_cf_and_decoder::<S::Value>(
+            S::COLUMN_FAMILY_NAME,
+            encoded_schema_key,
+            &<S::Value as ValueCodec<S>>::decode_value,
+        )
     }
 
     /// Reads single record by key.
@@ -185,7 +186,7 @@ impl DB {
                 let _timer = SCHEMADB_GET_LATENCY_SECONDS
                     .with_label_values(&[cf_name])
                     .start_timer();
-                println!("Getting raw value for key: {:?} from cf: {}", encoded_schema_key, cf_name);
+                // println!("Getting raw value for key: {:?} from cf: {}", encoded_schema_key, cf_name);
 
                 let cf_handle = self.get_cf_handle(cf_name)?;
                 let result = self.db.get_pinned_cf(cf_handle, encoded_schema_key)?;
@@ -361,11 +362,15 @@ impl DB {
         range: impl std::ops::RangeBounds<SchemaKey>,
         direction: ScanDirection,
     ) -> anyhow::Result<RawDbIter<'_>> {
-        self.raw_iter_range_with_decode_fn::<S, (SchemaKey, SchemaValue)>(range, direction, &|(key, value)| (key.to_vec(), value.to_vec()))
+        self.raw_iter_range_with_decode_fn::<S, (SchemaKey, SchemaValue)>(
+            range,
+            direction,
+            &|(key, value)| (key.to_vec(), value.to_vec()),
+        )
     }
 
-     /// Get a [`RawDbIter`] in given range and direction.
-     pub(crate) fn raw_iter_range_with_decode_fn<S: Schema, Item>(
+    /// Get a [`RawDbIter`] in given range and direction.
+    pub(crate) fn raw_iter_range_with_decode_fn<S: Schema, Item>(
         &self,
         range: impl std::ops::RangeBounds<SchemaKey>,
         direction: ScanDirection,
@@ -376,11 +381,15 @@ impl DB {
             "Caching is incompatible with iterators! Cannot iterate over {}",
             S::COLUMN_FAMILY_NAME
         );
-        
-        Ok(self.raw_iter_cf_with_decode_fn::<Item>(S::COLUMN_FAMILY_NAME, range, direction, decode_fn)?)
+
+        Ok(self.raw_iter_cf_with_decode_fn::<Item>(
+            S::COLUMN_FAMILY_NAME,
+            range,
+            direction,
+            decode_fn,
+        )?)
     }
 
-    
     /// Get a [`RawDbIter`] in given range and direction.
     pub(crate) fn raw_iter_cf_with_decode_fn<Item>(
         &self,
@@ -394,7 +403,9 @@ impl DB {
             anyhow::bail!("[Rockbound]: error in raw_iter_range: lower_bound > upper_bound");
         }
         let cf_handle = self.get_cf_handle(cf_name)?;
-        Ok(RawDbIter::new_with_decode_fn(&self.db, cf_handle, range, direction, decode_fn))
+        Ok(RawDbIter::new_with_decode_fn(
+            &self.db, cf_handle, range, direction, decode_fn,
+        ))
     }
 
     /// Iterator over a range of keys in a schema, allowing iteration over cached column families. This is only correct if a lock is held to ensure consistency.
@@ -581,7 +592,11 @@ impl DB {
         tokio::task::block_in_place(|| self.create_checkpoint(path))
     }
 
-    pub(crate) fn write_opt(&self, batch: rocksdb::WriteBatch, options: &rocksdb::WriteOptions) -> Result<(), rocksdb::Error> {
+    pub(crate) fn write_opt(
+        &self,
+        batch: rocksdb::WriteBatch,
+        options: &rocksdb::WriteOptions,
+    ) -> Result<(), rocksdb::Error> {
         self.db.write_opt(batch, options)
     }
 }

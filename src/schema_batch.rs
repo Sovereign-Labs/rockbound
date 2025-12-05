@@ -22,9 +22,7 @@ impl<K, V> Default for SchemaBatch<K, V> {
     }
 }
 
-
 impl SchemaBatch {
-
     /// Adds an insert/update operation to the batch.
     pub fn put<S: Schema>(
         &mut self,
@@ -41,7 +39,6 @@ impl SchemaBatch {
         Ok(())
     }
 
-
     /// Adds a delete operation to the batch.
     pub fn delete<S: Schema>(&mut self, key: &impl KeyEncoder<S>) -> anyhow::Result<()> {
         let key = key.encode_key()?;
@@ -49,7 +46,6 @@ impl SchemaBatch {
 
         Ok(())
     }
-
 
     /// Adds a delete range operation to the batch.
     ///
@@ -77,7 +73,6 @@ impl SchemaBatch {
         self.get_operation_raw::<S>(&key)
     }
 
-
     /// Getting value by key if it was written in this batch.
     /// Deleted operation will return None as well as missing key
     pub fn get_value<S: Schema>(&self, key: &impl KeyCodec<S>) -> anyhow::Result<Option<S::Value>> {
@@ -88,7 +83,6 @@ impl SchemaBatch {
         }
         Ok(None)
     }
-
 }
 
 impl<K: Ord, V> SchemaBatch<K, V> {
@@ -98,14 +92,8 @@ impl<K: Ord, V> SchemaBatch<K, V> {
     }
 
     /// Put a pre-encoded key and its value into the batch.
-    pub fn put_raw<S: Schema>(
-        &mut self,
-        key: K,
-        value: V,
-    ) -> anyhow::Result<()> {
-        let put_operation = Operation::Put {
-            value,
-        };
+    pub fn put_raw<S: Schema>(&mut self, key: K, value: V) -> anyhow::Result<()> {
+        let put_operation = Operation::Put { value };
         self.insert_operation::<S>(key, put_operation);
         Ok(())
     }
@@ -116,12 +104,10 @@ impl<K: Ord, V> SchemaBatch<K, V> {
         Ok(())
     }
 
-
     fn insert_operation<S: Schema>(&mut self, key: K, operation: Operation<K, V>) {
         let column_writes = self.last_writes.entry(S::COLUMN_FAMILY_NAME).or_default();
         column_writes.insert(key, operation);
     }
-
 
     /// Getting the operation from current schema batch if present
     pub(crate) fn get_operation_raw<S: Schema>(
@@ -135,7 +121,6 @@ impl<K: Ord, V> SchemaBatch<K, V> {
         }
     }
 
-  
     /// Iterator over all values in lexicographic order.
     pub fn iter<S: Schema>(&self) -> btree_map::Iter<'_, K, Operation<K, V>> {
         self.last_writes
