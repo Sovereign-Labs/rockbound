@@ -21,8 +21,8 @@ use crate::{
         SCHEMADB_BATCH_COMMIT_BYTES, SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS, SCHEMADB_DELETES,
         SCHEMADB_PUT_BYTES,
     },
-    schema::{ColumnFamilyName, KeyCodec, KeyDecoder, KeyEncoder, ValueCodec},
-    with_error_logging, BasicWeighter, CodecError, DbCache, Schema, SchemaBatch, DB,
+    schema::{ColumnFamilyName, KeyDecoder, KeyEncoder, ValueCodec},
+    with_error_logging, BasicWeighter, CodecError, Schema, DB,
 };
 #[derive(Debug, Default)]
 pub(crate) struct VersionMetadata;

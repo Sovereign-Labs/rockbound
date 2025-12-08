@@ -37,7 +37,7 @@ use metrics::{
     SCHEMADB_BATCH_COMMIT_BYTES, SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS, SCHEMADB_DELETES,
     SCHEMADB_DELETE_RANGE, SCHEMADB_GET_BYTES, SCHEMADB_GET_LATENCY_SECONDS, SCHEMADB_PUT_BYTES,
 };
-use quick_cache::{sync::Cache, Equivalent, Weighter};
+use quick_cache::{sync::Cache, Weighter};
 pub use rocksdb;
 use rocksdb::ReadOptions;
 pub use rocksdb::DEFAULT_COLUMN_FAMILY_NAME;
@@ -45,7 +45,7 @@ use thiserror::Error;
 use tracing::{info, warn};
 
 pub use crate::schema::Schema;
-use crate::schema::{ColumnFamilyName, KeyCodec, ValueCodec};
+use crate::schema::{KeyCodec, ValueCodec};
 pub use crate::schema_batch::SchemaBatch;
 use crate::{iterator::RawDbIter, schema::KeyEncoder};
 
@@ -60,28 +60,6 @@ impl<K: AsRef<[u8]>, V: AsRef<[u8]>> Weighter<K, Option<V>> for BasicWeighter {
             + 48
     }
 }
-
-// impl<T: Borrow<SchemaKey>> Weighter<(ColumnFamilyName, T), Option<SchemaValue>> for BasicWeighter {
-//     fn weight(&self, key: &(ColumnFamilyName, T), value: &Option<SchemaValue>) -> u64 {
-//         // 8 bytes for the pointer to the ColumnFamilyName (a 'static str) plus the key and value lengths
-//         // 3 words (24 bytes) each on the stack for the Vec<u8>s, plus their capacity
-//         8 + 24
-//             + 24
-//             + key.1.borrow().capacity() as u64
-//             + value.as_ref().map_or(0, |v| v.capacity()) as u64
-//     }
-// }
-
-/// A newtype for tuple to allow implementing `Equivalent` for it.
-#[derive(Debug, Hash)]
-struct Pair<A, B>(pub A, pub B);
-impl Equivalent<(ColumnFamilyName, SchemaKey)> for Pair<ColumnFamilyName, &[u8]> {
-    fn equivalent(&self, rhs: &(ColumnFamilyName, SchemaKey)) -> bool {
-        self.0 == rhs.0 && self.1 == rhs.1
-    }
-}
-
-pub(crate) type DbCache = Cache<(ColumnFamilyName, SchemaKey), Option<SchemaValue>, BasicWeighter>;
 
 /// This DB is a schematized RocksDB wrapper where all data passed in and out are typed according to
 /// [`Schema`]s.
@@ -362,7 +340,6 @@ impl DB {
         direction: ScanDirection,
         decode_fn: &'static dyn Fn((&[u8], &[u8])) -> Item,
     ) -> anyhow::Result<RawDbIter<'_, Item>> {
-
         Ok(self.raw_iter_cf_with_decode_fn::<Item>(
             S::COLUMN_FAMILY_NAME,
             range,
