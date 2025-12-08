@@ -3,12 +3,9 @@
 
 //! Tests for cache consistency with the backing RocksDB
 
-use std::sync::{Arc, Barrier};
+use std::sync::Arc;
 
-use rockbound::{
-    cache::delta_reader,
-    versioned_db::{VersionedDB, VersionedDeltaReader, VersionedSchemaBatch},
-};
+use rockbound::versioned_db::{VersionedDB, VersionedDeltaReader, VersionedSchemaBatch};
 
 use crate::versioned_db_inner::{commit_batch, put_keys, TestDB};
 

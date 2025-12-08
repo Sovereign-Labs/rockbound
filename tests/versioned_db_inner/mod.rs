@@ -93,7 +93,6 @@ impl Schema for LiveKeys {
     type Key = TestKey;
     type Value = TestField;
     const COLUMN_FAMILY_NAME: ColumnFamilyName = "LiveKeysCF";
-    const SHOULD_CACHE: bool = true;
 }
 
 impl VersionedSchemaKeyMarker for TestKey {}
@@ -161,10 +160,6 @@ impl TestDB {
     fn from_tempdir(tmpdir: TempDir) -> Self {
         let db = open_db(&tmpdir);
         TestDB { tmpdir, db }
-    }
-
-    fn take_tempdir(self) -> TempDir {
-        self.tmpdir
     }
 }
 

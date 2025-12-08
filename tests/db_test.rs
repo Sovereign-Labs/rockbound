@@ -150,7 +150,7 @@ fn test_single_schema_batch() {
         .put::<TestSchema2>(&TestField(5), &TestField(5))
         .unwrap();
 
-    db.write_schemas(db_batch).unwrap();
+    db.write_schemas(&db_batch).unwrap();
 
     assert_eq!(
         collect_values::<TestSchema1>(&db),
@@ -177,7 +177,7 @@ fn test_two_schema_batches() {
         .put::<TestSchema1>(&TestField(2), &TestField(2))
         .unwrap();
     db_batch1.delete::<TestSchema1>(&TestField(2)).unwrap();
-    db.write_schemas(db_batch1).unwrap();
+    db.write_schemas(&db_batch1).unwrap();
 
     assert_eq!(
         collect_values::<TestSchema1>(&db),
@@ -195,7 +195,7 @@ fn test_two_schema_batches() {
     db_batch2
         .put::<TestSchema2>(&TestField(5), &TestField(5))
         .unwrap();
-    db.write_schemas(db_batch2).unwrap();
+    db.write_schemas(&db_batch2).unwrap();
 
     assert_eq!(
         collect_values::<TestSchema1>(&db),
@@ -239,7 +239,7 @@ fn test_report_size() {
         db_batch
             .put::<TestSchema2>(&TestField(i), &TestField(i))
             .unwrap();
-        db.write_schemas(db_batch).unwrap();
+        db.write_schemas(&db_batch).unwrap();
     }
 
     db.flush_cf("TestCF1").unwrap();
