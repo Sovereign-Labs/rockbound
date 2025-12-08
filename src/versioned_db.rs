@@ -438,8 +438,7 @@ where
         // Because some keys are longer than 8 bytes, we use an exclusive range
         let first_version_to_keep = version.saturating_add(1);
         let range = ..first_version_to_keep.to_be_bytes().to_vec();
-        Ok(self
-            .archival_db
+        self.archival_db
             .raw_iter_range_with_decode_fn::<V, PrunableKey<V>>(
                 range,
                 ScanDirection::Forward,
@@ -447,7 +446,7 @@ where
                     PrunableKey::decode_key(key)
                         .expect("DB Corruption: Failed to decode pruning key")
                 },
-            )?)
+            )
     }
 
     fn load_committed_version_from_disk(live_db: &DB) -> anyhow::Result<Option<u64>> {
@@ -552,13 +551,13 @@ where
                     assert!(!key_with_version.live_key().is_empty(), "Live values may not have zero-length. This prevents confusion with placholders for deleted values.");
                     // println!("Inserting live key: {:?}", key_with_version.live_key());
                     live_put_bytes += key_with_version.live_key().len() + value.as_ref().len();
-                    live_db_batch.put_cf(live_cf_handle, key_with_version.live_key(), &value);
+                    live_db_batch.put_cf(live_cf_handle, key_with_version.live_key(), value);
                     archival_puts_bytes +=
                         key_with_version.archival_key().len() + value.as_ref().len();
                     archival_db_batch.put_cf(
                         archival_cf_handle,
                         key_with_version.archival_key(),
-                        &value,
+                        value,
                     );
                     cache.insert(key.clone(), Some(value.clone()));
                 }
@@ -566,22 +565,22 @@ where
                     // println!("Deleting live key: {:?}", key_with_version.live_key());
                     deletes += 1;
                     archival_puts_bytes += key_with_version.archival_key().len();
-                    live_db_batch.delete_cf(live_cf_handle, &key);
+                    live_db_batch.delete_cf(live_cf_handle, key);
                     archival_db_batch.put_cf(
                         archival_cf_handle,
                         key_with_version.archival_key(),
-                        &[],
+                        [],
                     );
                     cache.insert(key.clone(), None);
                 }
             }
-            archival_db_batch.put_cf(pruning_cf_handle, key_with_version.pruning_key(), &[]);
+            archival_db_batch.put_cf(pruning_cf_handle, key_with_version.pruning_key(), []);
             pruning_puts_bytes += key_with_version.pruning_key().len();
         }
         live_db_batch.put_cf(
             metadata_cf_handle,
             VersionedTableMetadataKey::CommittedVersion.as_bytes(),
-            &version.to_be_bytes(),
+            version.to_be_bytes(),
         );
 
         let serialized_size = live_db_batch.size_in_bytes() + archival_db_batch.size_in_bytes();
@@ -1082,7 +1081,7 @@ where
                 version_of_current_snapshot -= 1;
                 continue;
             }
-            if let Some(value) = snapshot.versioned_table_writes.get(&key) {
+            if let Some(value) = snapshot.versioned_table_writes.get(key) {
                 return Ok(value.clone());
             }
             version_of_current_snapshot = match version_of_current_snapshot.checked_sub(1) {

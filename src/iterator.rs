@@ -8,6 +8,8 @@ use crate::metrics::{SCHEMADB_ITER_BYTES, SCHEMADB_ITER_LATENCY_SECONDS};
 use crate::schema::{KeyDecoder, Schema, ValueCodec};
 use crate::{SchemaKey, SchemaValue};
 
+pub(crate) type DecodeFn<Item> = &'static dyn Fn((&[u8], &[u8])) -> Item;
+
 /// This defines a type that can be used to seek a [`SchemaIterator`], via
 /// interfaces like [`SchemaIterator::seek`]. Mind you, not all
 /// [`KeyEncoder`](crate::schema::KeyEncoder)s shall be [`SeekKeyEncoder`]s, and
@@ -173,7 +175,7 @@ where
     db_iter: rocksdb::DBRawIterator<'a>,
     direction: ScanDirection,
     upper_bound: std::ops::Bound<SchemaKey>,
-    decode_fn: &'static dyn Fn((&[u8], &[u8])) -> Item,
+    decode_fn: DecodeFn<Item>,
 }
 
 impl<'a> RawDbIter<'a> {
@@ -195,7 +197,7 @@ impl<'a, Item> RawDbIter<'a, Item> {
         cf_handle: &ColumnFamily,
         range: impl std::ops::RangeBounds<SchemaKey>,
         direction: ScanDirection,
-        decode_fn: &'static dyn Fn((&[u8], &[u8])) -> Item,
+        decode_fn: DecodeFn<Item>,
     ) -> Self {
         if let std::ops::Bound::Excluded(_) = range.start_bound() {
             panic!("Excluded start_bound is not supported");

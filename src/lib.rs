@@ -45,9 +45,14 @@ use thiserror::Error;
 use tracing::{info, warn};
 
 pub use crate::schema::Schema;
-use crate::schema::{KeyCodec, ValueCodec};
 pub use crate::schema_batch::SchemaBatch;
+use crate::{
+    iterator::DecodeFn,
+    schema::{KeyCodec, ValueCodec},
+};
 use crate::{iterator::RawDbIter, schema::KeyEncoder};
+
+type CacheForSchema<S> = Cache<<S as Schema>::Key, Option<<S as Schema>::Value>, BasicWeighter>;
 
 #[derive(Clone, Debug)]
 struct BasicWeighter;
@@ -338,14 +343,9 @@ impl DB {
         &self,
         range: impl std::ops::RangeBounds<SchemaKey>,
         direction: ScanDirection,
-        decode_fn: &'static dyn Fn((&[u8], &[u8])) -> Item,
+        decode_fn: DecodeFn<Item>,
     ) -> anyhow::Result<RawDbIter<'_, Item>> {
-        Ok(self.raw_iter_cf_with_decode_fn::<Item>(
-            S::COLUMN_FAMILY_NAME,
-            range,
-            direction,
-            decode_fn,
-        )?)
+        self.raw_iter_cf_with_decode_fn::<Item>(S::COLUMN_FAMILY_NAME, range, direction, decode_fn)
     }
 
     /// Get a [`RawDbIter`] in given range and direction.
@@ -354,7 +354,7 @@ impl DB {
         cf_name: &str,
         range: impl std::ops::RangeBounds<SchemaKey>,
         direction: ScanDirection,
-        decode_fn: &'static dyn Fn((&[u8], &[u8])) -> Item,
+        decode_fn: DecodeFn<Item>,
     ) -> anyhow::Result<RawDbIter<'_, Item>> {
         if is_range_bounds_inverse(&range) {
             tracing::error!("[Rockbound]: error in raw_iter_range: lower_bound > upper_bound");
@@ -369,7 +369,7 @@ impl DB {
     /// Iterator over a range of keys in a schema, allowing iteration over cached column families. This is only correct if a lock is held to ensure consistency.
     pub(crate) fn iter_range_allow_cached<'a, S: Schema>(
         &'a self,
-        _guard: &parking_lot::RwLockReadGuard<'a, Cache<S::Key, Option<S::Value>, BasicWeighter>>,
+        _guard: &parking_lot::RwLockReadGuard<'a, CacheForSchema<S>>,
         range: impl std::ops::RangeBounds<SchemaKey>,
         direction: ScanDirection,
     ) -> anyhow::Result<RawDbIter<'a>> {
