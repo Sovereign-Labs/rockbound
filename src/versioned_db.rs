@@ -503,9 +503,8 @@ where
         Some(value)
     }
 
-    // TODO: Enable pruning!
 
-    /// foo
+    /// Commits a batch of versioned writes to the database.
     pub fn commit(&self, batch: &VersionedSchemaBatch<V>, version: u64) -> anyhow::Result<()>
     where
         V::Value: AsRef<[u8]>,
