@@ -224,7 +224,7 @@ impl DB {
             || {
                 let mut batch = SchemaBatch::new();
                 batch.put::<S>(key, value)?;
-                self.write_schemas_inner(batch)
+                self.write_schemas_inner(&batch)
             },
             "put",
         )
@@ -249,7 +249,7 @@ impl DB {
             || {
                 let mut batch = SchemaBatch::new();
                 batch.delete::<S>(key)?;
-                self.write_schemas_inner(batch)
+                self.write_schemas_inner(&batch)
             },
             "delete",
         )
@@ -277,10 +277,6 @@ impl DB {
             || {
                 let from = from.encode_seek_key()?;
                 let to = to.encode_seek_key()?;
-                assert!(
-                    !S::SHOULD_CACHE,
-                    "Range deletes are incompatible with caching!"
-                );
                 self.db.delete_range_cf(cf_handle, from, to)?;
                 Ok(())
             },
@@ -307,11 +303,6 @@ impl DB {
         opts: ReadOptions,
         direction: ScanDirection,
     ) -> anyhow::Result<SchemaIterator<'_, S>> {
-        assert!(
-            !S::SHOULD_CACHE,
-            "Caching is incompatible with iterators! Cannot iterate over {}",
-            S::COLUMN_FAMILY_NAME
-        );
         let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
         Ok(SchemaIterator::new(
             self.db.raw_iterator_cf_opt(cf_handle, opts),
@@ -347,11 +338,6 @@ impl DB {
         &self,
         direction: ScanDirection,
     ) -> anyhow::Result<RawDbIter<'_>> {
-        assert!(
-            !S::SHOULD_CACHE,
-            "Caching is incompatible with iterators! Cannot iterate over {}",
-            S::COLUMN_FAMILY_NAME
-        );
         let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
         Ok(RawDbIter::new(&self.db, cf_handle, .., direction))
     }
@@ -376,11 +362,6 @@ impl DB {
         direction: ScanDirection,
         decode_fn: &'static dyn Fn((&[u8], &[u8])) -> Item,
     ) -> anyhow::Result<RawDbIter<'_, Item>> {
-        assert!(
-            !S::SHOULD_CACHE,
-            "Caching is incompatible with iterators! Cannot iterate over {}",
-            S::COLUMN_FAMILY_NAME
-        );
 
         Ok(self.raw_iter_cf_with_decode_fn::<Item>(
             S::COLUMN_FAMILY_NAME,
@@ -431,7 +412,7 @@ impl DB {
         self.iter_with_direction::<S>(opts, ScanDirection::Forward)
     }
 
-    fn write_schemas_inner(&self, batch: SchemaBatch) -> anyhow::Result<()> {
+    fn write_schemas_inner(&self, batch: &SchemaBatch) -> anyhow::Result<()> {
         let _timer = SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS
             .with_label_values(&[self.name])
             .start_timer();
@@ -440,7 +421,7 @@ impl DB {
 
         let mut db_batch = rocksdb::WriteBatch::default();
         let mut columns_written = Vec::with_capacity(batch.last_writes.len());
-        for (cf_name, rows) in batch.last_writes.into_iter() {
+        for (cf_name, rows) in batch.last_writes.iter() {
             let cf_handle = self.get_cf_handle(cf_name)?;
             let mut write_sizes = Vec::with_capacity(rows.len());
             let mut deletes_for_cf = 0;
@@ -448,10 +429,10 @@ impl DB {
                 match operation {
                     Operation::Put { value } => {
                         write_sizes.push(key.len() + value.len());
-                        db_batch.put_cf(cf_handle, &key, &value);
+                        db_batch.put_cf(cf_handle, key, value);
                     }
                     Operation::Delete => {
-                        db_batch.delete_cf(cf_handle, &key);
+                        db_batch.delete_cf(cf_handle, key);
                         deletes_for_cf += 1;
                     }
                     Operation::DeleteRange { .. } => {
@@ -509,19 +490,19 @@ impl DB {
 
     #[tracing::instrument(skip_all, level = "error")]
     /// Writes a group of records wrapped in a [`SchemaBatch`].
-    pub fn write_schemas(&self, batch: SchemaBatch) -> anyhow::Result<()> {
+    pub fn write_schemas(&self, batch: &SchemaBatch) -> anyhow::Result<()> {
         with_error_logging(|| self.write_schemas_inner(batch), "write_schemas")
     }
 
     #[tracing::instrument(skip_all, level = "error")]
     /// Writes a group of records wrapped in a [`SchemaBatch`].
-    pub fn write_versioned_schemas<K, V>(&self, batch: SchemaBatch) -> anyhow::Result<()> {
+    pub fn write_versioned_schemas<K, V>(&self, batch: &SchemaBatch) -> anyhow::Result<()> {
         with_error_logging(|| self.write_schemas_inner(batch), "write_schemas")
     }
 
     #[tracing::instrument(skip_all, level = "error")]
     /// Writes a group of records wrapped in a [`SchemaBatch`] asynchronously.
-    pub async fn write_schemas_async(&self, batch: SchemaBatch) -> anyhow::Result<()> {
+    pub async fn write_schemas_async(&self, batch: &SchemaBatch) -> anyhow::Result<()> {
         tokio::task::block_in_place(|| {
             with_error_logging(|| self.write_schemas_inner(batch), "write_schemas_async")
         })

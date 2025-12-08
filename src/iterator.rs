@@ -266,7 +266,7 @@ impl<Item> Iterator for RawDbIter<'_, Item> {
         // Have to allocate to fix lifetime issue
         // If next item is larger than upper bound, we're done
         if let std::ops::Bound::Included(upper) = self.upper_bound.as_ref() {
-            if next_item.0 > upper {
+            if next_item.0 > upper.as_slice() {
                 // That we're moving forward!!!
                 assert_eq!(
                     &ScanDirection::Forward,

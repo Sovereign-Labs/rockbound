@@ -29,7 +29,6 @@ pub(crate) struct VersionMetadata;
 
 impl Schema for VersionMetadata {
     const COLUMN_FAMILY_NAME: ColumnFamilyName = "version_metadata";
-    const SHOULD_CACHE: bool = false;
 
     type Key = VersionedTableMetadataKey;
     type Value = u64;
@@ -256,10 +255,18 @@ impl<S: SchemaWithVersion> PrunableKey<S> {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 /// A batch of writes to a versioned schema.
 pub struct VersionedSchemaBatch<S: Schema> {
     versioned_table_writes: BTreeMap<S::Key, Option<S::Value>>,
+}
+
+impl<S: Schema> Default for VersionedSchemaBatch<S> {
+    fn default() -> Self {
+        Self {
+            versioned_table_writes: BTreeMap::new(),
+        }
+    }
 }
 
 impl<S: Schema, T: IntoIterator<Item = (S::Key, Option<S::Value>)>> From<T>
