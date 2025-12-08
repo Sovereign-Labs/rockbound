@@ -503,7 +503,6 @@ where
         Some(value)
     }
 
-
     /// Commits a batch of versioned writes to the database.
     pub fn commit(&self, batch: &VersionedSchemaBatch<V>, version: u64) -> anyhow::Result<()>
     where
