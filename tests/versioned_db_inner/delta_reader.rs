@@ -143,7 +143,7 @@ fn make_key(key: usize) -> TestKey {
     let value: u8 = (key / 1000)
         .try_into()
         .expect("Key is too large; update the make_key function to handle larger keys");
-    let key: Vec<u8> = std::iter::repeat(value).take(length).collect();
+    let key: Vec<u8> = std::iter::repeat_n(value, length).collect();
     TestKey::from(key)
 }
 
@@ -206,7 +206,7 @@ fn test_delta_reader_behavior_under_concurrency() {
     // Spawn the writer
     let writer = std::thread::spawn(move || {
         for (idx, batch) in batches.into_iter().enumerate() {
-            println!("Committing generation {}", idx);
+            println!("Committing generation {idx}");
             versioned_db.commit(&batch, idx as u64).unwrap();
             std::thread::sleep(std::time::Duration::from_millis(100));
         }

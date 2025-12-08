@@ -55,7 +55,7 @@ fn make_key(key: usize) -> TestKey {
     let value: u8 = (key / 1000)
         .try_into()
         .expect("Key is too large; update the make_key function to handle larger keys");
-    let key: Vec<u8> = std::iter::repeat(value).take(length).collect();
+    let key: Vec<u8> = std::iter::repeat_n(value, length).collect();
     TestKey::from(key)
 }
 
@@ -144,7 +144,7 @@ fn test_cache_behavior_under_concurrency() {
                 let value = TestField::new(generation);
                 batch.put_versioned(key, value);
             }
-            println!("Committing generation {}", generation);
+            println!("Committing generation {generation}");
             versioned_db.commit(&batch, generation as u64).unwrap();
             // Sleep for a bit to let the readers churn. This helps ensure that both cached and non-cached keys are read.
             std::thread::sleep(Duration::from_millis(100));
