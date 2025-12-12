@@ -2,23 +2,27 @@ use std::collections::{btree_map, BTreeMap, HashMap};
 
 use crate::metrics::SCHEMADB_BATCH_PUT_LATENCY_SECONDS;
 use crate::schema::{ColumnFamilyName, KeyCodec, KeyEncoder, ValueCodec};
-use crate::{Operation, Schema, SchemaKey, SeekKeyEncoder};
+use crate::{Operation, Schema, SchemaKey, SchemaValue, SeekKeyEncoder};
 
 // [`SchemaBatch`] holds a collection of updates that can be applied to a DB
 /// ([`Schema`]) atomically. The updates will be applied in the order in which
 /// they are added to the [`SchemaBatch`].
-#[derive(Debug, Default, Clone)]
-pub struct SchemaBatch {
-    pub(crate) last_writes: HashMap<ColumnFamilyName, BTreeMap<SchemaKey, Operation>>,
-    pub(crate) range_ops: HashMap<ColumnFamilyName, Vec<Operation>>,
+#[derive(Debug, Clone)]
+pub struct SchemaBatch<K = SchemaKey, V = SchemaValue> {
+    pub(crate) last_writes: HashMap<ColumnFamilyName, BTreeMap<K, Operation<K, V>>>,
+    pub(crate) range_ops: HashMap<ColumnFamilyName, Vec<Operation<K, V>>>,
+}
+
+impl<K, V> Default for SchemaBatch<K, V> {
+    fn default() -> Self {
+        Self {
+            last_writes: HashMap::new(),
+            range_ops: HashMap::new(),
+        }
+    }
 }
 
 impl SchemaBatch {
-    /// Creates an empty batch.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Adds an insert/update operation to the batch.
     pub fn put<S: Schema>(
         &mut self,
@@ -30,21 +34,8 @@ impl SchemaBatch {
             .start_timer();
 
         let key = key.encode_key()?;
-        self.put_raw(key, value)?;
+        self.put_raw::<S>(key, value.encode_value()?)?;
 
-        Ok(())
-    }
-
-    /// Put a pre-encoded key and its value into the batch.
-    pub fn put_raw<S: Schema>(
-        &mut self,
-        key: Vec<u8>,
-        value: &impl ValueCodec<S>,
-    ) -> anyhow::Result<()> {
-        let put_operation = Operation::Put {
-            value: value.encode_value()?,
-        };
-        self.insert_operation::<S>(key, put_operation);
         Ok(())
     }
 
@@ -53,12 +44,6 @@ impl SchemaBatch {
         let key = key.encode_key()?;
         self.delete_raw::<S>(key)?;
 
-        Ok(())
-    }
-
-    /// Delete a pre-encoded key from the batch. A schema must be provided to ensure the key is deleted from the correct column family.
-    pub fn delete_raw<S: Schema>(&mut self, key: Vec<u8>) -> anyhow::Result<()> {
-        self.insert_operation::<S>(key, Operation::Delete);
         Ok(())
     }
 
@@ -79,23 +64,13 @@ impl SchemaBatch {
         Ok(())
     }
 
-    fn insert_operation<S: Schema>(&mut self, key: SchemaKey, operation: Operation) {
-        let column_writes = self.last_writes.entry(S::COLUMN_FAMILY_NAME).or_default();
-        column_writes.insert(key, operation);
-    }
-
     /// Getting the operation from current schema batch if present
     pub(crate) fn get_operation<S: Schema>(
         &self,
         key: &impl KeyCodec<S>,
     ) -> anyhow::Result<Option<&Operation>> {
         let key = key.encode_key()?;
-
-        if let Some(column_writes) = self.last_writes.get(&S::COLUMN_FAMILY_NAME) {
-            Ok(column_writes.get(&key))
-        } else {
-            Ok(None)
-        }
+        self.get_operation_raw::<S>(&key)
     }
 
     /// Getting value by key if it was written in this batch.
@@ -108,9 +83,46 @@ impl SchemaBatch {
         }
         Ok(None)
     }
+}
+
+impl<K: Ord, V> SchemaBatch<K, V> {
+    /// Creates an empty batch.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Put a pre-encoded key and its value into the batch.
+    pub fn put_raw<S: Schema>(&mut self, key: K, value: V) -> anyhow::Result<()> {
+        let put_operation = Operation::Put { value };
+        self.insert_operation::<S>(key, put_operation);
+        Ok(())
+    }
+
+    /// Delete a pre-encoded key from the batch. A schema must be provided to ensure the key is deleted from the correct column family.
+    pub fn delete_raw<S: Schema>(&mut self, key: K) -> anyhow::Result<()> {
+        self.insert_operation::<S>(key, Operation::Delete);
+        Ok(())
+    }
+
+    fn insert_operation<S: Schema>(&mut self, key: K, operation: Operation<K, V>) {
+        let column_writes = self.last_writes.entry(S::COLUMN_FAMILY_NAME).or_default();
+        column_writes.insert(key, operation);
+    }
+
+    /// Getting the operation from current schema batch if present
+    pub(crate) fn get_operation_raw<S: Schema>(
+        &self,
+        key: &K,
+    ) -> anyhow::Result<Option<&Operation<K, V>>> {
+        if let Some(column_writes) = self.last_writes.get(&S::COLUMN_FAMILY_NAME) {
+            Ok(column_writes.get(key))
+        } else {
+            Ok(None)
+        }
+    }
 
     /// Iterator over all values in lexicographic order.
-    pub fn iter<S: Schema>(&self) -> btree_map::Iter<'_, SchemaKey, Operation> {
+    pub fn iter<S: Schema>(&self) -> btree_map::Iter<'_, K, Operation<K, V>> {
         self.last_writes
             .get(&S::COLUMN_FAMILY_NAME)
             .map(BTreeMap::iter)
@@ -120,8 +132,8 @@ impl SchemaBatch {
     /// Iterator in given range in lexicographic order.
     pub fn iter_range<S: Schema>(
         &self,
-        range: impl std::ops::RangeBounds<SchemaKey>,
-    ) -> btree_map::Range<'_, SchemaKey, Operation> {
+        range: impl std::ops::RangeBounds<K>,
+    ) -> btree_map::Range<'_, K, Operation<K, V>> {
         self.last_writes
             .get(&S::COLUMN_FAMILY_NAME)
             .map(|column_writes| column_writes.range(range))
@@ -130,7 +142,7 @@ impl SchemaBatch {
 
     /// Merge other [`SchemaBatch`] on top of this one.
     /// Keys from other will overwrite keys in self.
-    pub fn merge(&mut self, other: SchemaBatch) {
+    pub fn merge(&mut self, other: SchemaBatch<K, V>) {
         for (cf_name, other_cf_map) in other.last_writes {
             let cf_map = self.last_writes.entry(cf_name).or_default();
             cf_map.extend(other_cf_map);
@@ -245,7 +257,7 @@ mod tests {
 
         #[test]
         fn empty_schema_batch_iterator() {
-            let batch = SchemaBatch::new();
+            let batch = SchemaBatch::<SchemaKey, SchemaValue>::new();
             let mut iter_forward = batch.iter::<TestSchema1>();
             assert_eq!(None, iter_forward.next());
             let mut iter_backward = batch.iter::<TestSchema1>().rev();

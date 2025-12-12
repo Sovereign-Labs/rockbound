@@ -1,33 +1,41 @@
 use std::{
     collections::{btree_map, BTreeMap},
+    hash::Hash,
     iter::Peekable,
     marker::PhantomData,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 use anyhow::bail;
-use parking_lot::RwLockReadGuard;
+use parking_lot::{RwLock, RwLockReadGuard};
+use quick_cache::sync::Cache;
 use rocksdb::ColumnFamilyDescriptor;
 
 use crate::{
-    default_cf_descriptor,
+    default_cf_descriptor, default_write_options,
     iterator::{RawDbIter, ScanDirection},
-    schema::{ColumnFamilyName, KeyCodec, KeyDecoder, KeyEncoder, ValueCodec},
-    CodecError, DbCache, Schema, SchemaBatch, DB,
+    metrics::{
+        SCHEMADB_BATCH_COMMIT_BYTES, SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS, SCHEMADB_DELETES,
+        SCHEMADB_PUT_BYTES,
+    },
+    schema::{ColumnFamilyName, KeyDecoder, KeyEncoder, ValueCodec},
+    with_error_logging, BasicWeighter, CodecError, Schema, DB,
 };
 #[derive(Debug, Default)]
 pub(crate) struct VersionMetadata;
 
 impl Schema for VersionMetadata {
     const COLUMN_FAMILY_NAME: ColumnFamilyName = "version_metadata";
-    const SHOULD_CACHE: bool = false;
 
     type Key = VersionedTableMetadataKey;
     type Value = u64;
 }
 
 /// A singleton key. Encodes to the empty vec.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Ord, PartialOrd, Eq, Copy)]
 pub enum VersionedTableMetadataKey {
     /// The latest version that has been committed.
     CommittedVersion,
@@ -35,13 +43,21 @@ pub enum VersionedTableMetadataKey {
     PrunedVersion,
 }
 
+const COMMITTED_VERSION: [u8; 1] = [0];
+const PRUNED_VERSION: [u8; 1] = [1];
+
 impl VersionedTableMetadataKey {
+    /// Converts the key into a byte slice.
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            VersionedTableMetadataKey::CommittedVersion => &COMMITTED_VERSION,
+            VersionedTableMetadataKey::PrunedVersion => &PRUNED_VERSION,
+        }
+    }
+
     /// Encodes the key into a byte vector.
     pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
-        Ok(match self {
-            VersionedTableMetadataKey::CommittedVersion => vec![0],
-            VersionedTableMetadataKey::PrunedVersion => vec![1],
-        })
+        Ok(self.as_bytes().to_vec())
     }
 
     /// Decodes the key from a byte vector.
@@ -53,8 +69,8 @@ impl VersionedTableMetadataKey {
             });
         }
         Ok(match data[0] {
-            0 => VersionedTableMetadataKey::CommittedVersion,
-            1 => VersionedTableMetadataKey::PrunedVersion,
+            val if val == COMMITTED_VERSION[0] => VersionedTableMetadataKey::CommittedVersion,
+            val if val == PRUNED_VERSION[0] => VersionedTableMetadataKey::PrunedVersion,
             _ => {
                 return Err(CodecError::Wrapped(anyhow::anyhow!(
                     "Invalid versioned table metadata key: {}",
@@ -123,7 +139,7 @@ impl ValueCodec<VersionMetadata> for u64 {
 ///
 /// On each read, the implementation will:
 /// - Read from the live column family
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct VersionedDB<S: SchemaWithVersion> {
     /// Holds the live state and the committed versions metadata.
     ///
@@ -136,23 +152,58 @@ pub struct VersionedDB<S: SchemaWithVersion> {
     live_db: Arc<DB>,
     /// Holds *only* the archival and pruning data, inluding pruned version metadata.
     archival_db: Arc<DB>,
+    cache: RwLock<Cache<S::Key, Option<S::Value>, BasicWeighter>>,
+    // The number of the *lowest* version that is guaranteed to be available in the live db. We increment this value when we *start* committing to the database,
+    // so the cache may not be valid for versions below this value.
+    committed_archival_version: AtomicU64,
     _schema: S,
+}
+
+fn decode_version_metadata_value(data: &[u8]) -> Result<u64, CodecError> {
+    Ok(u64::from_be_bytes(data.try_into().map_err(|_| {
+        CodecError::InvalidKeyLength {
+            expected: 8,
+            got: data.len(),
+        }
+    })?))
 }
 
 impl<S: SchemaWithVersion> VersionedDB<S>
 // This where clause shouldn't be needed since it's implied by the Schema trait, but Rust intentionally doesn't elaborate these bounds.
-where
-    VersionedTableMetadataKey: KeyEncoder<S::VersionMetadatacolumn>,
 {
     /// Returns the oldest version that is available in the database.
     pub fn get_pruned_version(&self) -> anyhow::Result<Option<u64>> {
-        self.archival_db
-            .get::<S::VersionMetadatacolumn>(&VersionedTableMetadataKey::PrunedVersion)
+        self.archival_db.get_raw_with_cf_and_decoder::<u64>(
+            S::VERSION_METADATA_COLUMN_FAMILY_NAME,
+            VersionedTableMetadataKey::PrunedVersion.as_bytes(),
+            &decode_version_metadata_value,
+        )
     }
     /// Returns the latest committed version in the database.
     pub fn get_committed_version(&self) -> anyhow::Result<Option<u64>> {
-        self.live_db
-            .get::<S::VersionMetadatacolumn>(&VersionedTableMetadataKey::CommittedVersion)
+        self.live_db.get_raw_with_cf_and_decoder::<u64>(
+            S::VERSION_METADATA_COLUMN_FAMILY_NAME,
+            VersionedTableMetadataKey::CommittedVersion.as_bytes(),
+            &decode_version_metadata_value,
+        )
+    }
+
+    /// Sets the cache size for the DB.
+    #[cfg(feature = "test-utils")]
+    pub fn set_cache_size(&self, estimated_size: usize, weight_capacity: u64) {
+        *self.cache.write() = Cache::with_weighter(estimated_size, weight_capacity, BasicWeighter);
+    }
+
+    /// Returns the number of cache hits.
+    #[cfg(feature = "test-utils")]
+    pub fn cache_hits(&self) -> u64 {
+        self.cache.read().hits()
+    }
+
+    /// Returns the number of cache misses.
+    #[cfg(feature = "test-utils")]
+    pub fn cache_misses(&self) -> u64 {
+        self.cache.read().misses()
     }
 }
 
@@ -167,99 +218,23 @@ impl<S: SchemaWithVersion> VersionedDB<S> {
     }
 }
 
-#[derive(Debug)]
-/// A key suffixed with a version number
-pub struct VersionedKey<S: SchemaWithVersion, T>(pub T, pub u64, PhantomData<S>);
-impl<S: SchemaWithVersion, T> VersionedKey<S, T> {
-    /// Creates a new versioned key.
-    pub fn new(key: T, version: u64) -> Self {
-        Self(key, version, PhantomData)
-    }
-}
-
-impl<S: SchemaWithVersion, T: KeyEncoder<S>> KeyEncoder<S::HistoricalColumnFamily>
-    for VersionedKey<S, T>
-{
-    fn encode_key(&self) -> Result<Vec<u8>, CodecError> {
-        let mut key = self.0.encode_key()?;
-        key.extend_from_slice(&self.1.to_be_bytes());
-        Ok(key)
-    }
-}
-
-#[derive(Debug)]
-/// A key suffixed with a version number
-pub struct EncodedVersionedKey<S: SchemaWithVersion>(pub Vec<u8>, pub u64, PhantomData<S>);
-impl<S: SchemaWithVersion> EncodedVersionedKey<S> {
-    /// Creates a new versioned key.
-    pub fn new(key: Vec<u8>, version: u64) -> Self {
-        Self(key, version, PhantomData)
-    }
-}
-
-impl<S: SchemaWithVersion> KeyEncoder<S::HistoricalColumnFamily> for EncodedVersionedKey<S> {
-    fn encode_key(&self) -> Result<Vec<u8>, CodecError> {
-        let mut key = self.0.clone();
-        key.extend_from_slice(&self.1.to_be_bytes());
-        Ok(key)
-    }
-}
-
-impl<S: SchemaWithVersion> KeyDecoder<S::HistoricalColumnFamily> for VersionedKey<S, S::Key> {
-    fn decode_key(data: &[u8]) -> Result<Self, CodecError> {
-        let len = data.len();
-        let key_len = len.checked_sub(8).ok_or(CodecError::InvalidKeyLength {
-            expected: 8,
-            got: len,
-        })?;
-        let key = S::Key::decode_key(&data[..key_len])?;
-        let version =
-            u64::from_be_bytes(data[key_len..].try_into().expect(
-                "key length was just checked to be 8 bytes but no longer is. This is a bug.",
-            ));
-        Ok(Self::new(key, version))
-    }
-}
-
 /// A key *prefixed* with a version number for easy iteration by version.
 #[derive(Debug)]
-pub struct PrunableKey<S: SchemaWithVersion, T>(u64, T, PhantomData<S>);
-impl<S: SchemaWithVersion, T> PrunableKey<S, T> {
+pub struct PrunableKey<S: SchemaWithVersion>(
+    #[allow(unused)]
+    // This is used internally by rocksdb for ordering - we just never look at it in rust code.
+    u64,
+    S::Key,
+    PhantomData<S>,
+);
+impl<S: SchemaWithVersion> PrunableKey<S> {
     /// Creates a new prunable key.
-    pub fn new(version: u64, key: T) -> Self {
+    pub fn new(version: u64, key: S::Key) -> Self {
         Self(version, key, PhantomData)
     }
 }
 
-impl<S: SchemaWithVersion, T: KeyEncoder<S>> KeyEncoder<S::PruningColumnFamily>
-    for PrunableKey<S, T>
-{
-    fn encode_key(&self) -> Result<Vec<u8>, CodecError> {
-        let mut key = self.0.to_be_bytes().to_vec();
-        key.extend_from_slice(&self.1.encode_key()?);
-        Ok(key)
-    }
-}
-
-/// An encoded key *prefixed* with a version number for easy iteration by version.
-#[derive(Debug)]
-pub struct EncodedPrunableKey<S: SchemaWithVersion>(Vec<u8>, u64, PhantomData<S>);
-impl<S: SchemaWithVersion> EncodedPrunableKey<S> {
-    /// Creates a new prunable key.
-    pub fn new(version: u64, key: Vec<u8>) -> Self {
-        Self(key, version, PhantomData)
-    }
-}
-
-impl<S: SchemaWithVersion> KeyEncoder<S::PruningColumnFamily> for EncodedPrunableKey<S> {
-    fn encode_key(&self) -> Result<Vec<u8>, CodecError> {
-        let mut key = self.0.clone();
-        key.extend_from_slice(&self.1.to_be_bytes());
-        Ok(key)
-    }
-}
-
-impl<S: SchemaWithVersion> KeyDecoder<S::PruningColumnFamily> for PrunableKey<S, S::Key> {
+impl<S: SchemaWithVersion> PrunableKey<S> {
     fn decode_key(data: &[u8]) -> Result<Self, CodecError> {
         let len = data.len();
         if len < 8 {
@@ -276,21 +251,25 @@ impl<S: SchemaWithVersion> KeyDecoder<S::PruningColumnFamily> for PrunableKey<S,
         Ok(Self::new(version, key))
     }
 }
-impl<S: SchemaWithVersion, T> PrunableKey<S, T> {
-    /// Converts a prunable key into a versioned key.
-    pub fn into_versioned_key(self) -> VersionedKey<S, T> {
-        VersionedKey::new(self.1, self.0)
+
+#[derive(Debug, Clone)]
+/// A batch of writes to a versioned schema.
+pub struct VersionedSchemaBatch<S: Schema> {
+    versioned_table_writes: BTreeMap<S::Key, Option<S::Value>>,
+}
+
+impl<S: Schema> Default for VersionedSchemaBatch<S> {
+    fn default() -> Self {
+        Self {
+            versioned_table_writes: BTreeMap::new(),
+        }
     }
 }
 
-#[derive(Debug, Clone, Default)]
-/// A batch of writes to a versioned schema.
-pub struct VersionedSchemaBatch<S: Schema> {
-    versioned_table_writes: BTreeMap<Vec<u8>, Option<S::Value>>,
-}
-
-impl<S: Schema, T: IntoIterator<Item = (Vec<u8>, Option<S::Value>)>> From<T>
+impl<S: Schema, T: IntoIterator<Item = (S::Key, Option<S::Value>)>> From<T>
     for VersionedSchemaBatch<S>
+where
+    S::Key: Ord,
 {
     fn from(iter: T) -> Self {
         Self {
@@ -299,17 +278,18 @@ impl<S: Schema, T: IntoIterator<Item = (Vec<u8>, Option<S::Value>)>> From<T>
     }
 }
 
-impl<S: Schema> VersionedSchemaBatch<S> {
+impl<S: Schema> VersionedSchemaBatch<S>
+where
+    S::Key: Ord,
+{
     /// Puts a key-value pair into the batch.
     pub fn put_versioned(&mut self, key: S::Key, value: S::Value) {
-        let key = key.encode_key().expect("failed to encode key");
         self.versioned_table_writes.insert(key, Some(value));
     }
 
     /// Deletes a key from the batch.
     pub fn delete_versioned(&mut self, key: S::Key) {
-        self.versioned_table_writes
-            .insert(key.encode_key().expect("failed to encode key"), None);
+        self.versioned_table_writes.insert(key, None);
     }
 }
 
@@ -321,41 +301,87 @@ fn live_versioned_column_family_descriptor(name: &str) -> ColumnFamilyDescriptor
     rocksdb::ColumnFamilyDescriptor::new(name, cf_opts)
 }
 
-/// A marker trait showing that a type implements `Clone` and `AsRef<[u8]>` and is cheaply cloneable.
-pub trait ArcBytes: Clone + Ord {}
-
-impl ArcBytes for std::sync::Arc<Vec<u8>> {}
+/// A marker trait showing that a type **HAS NOOP SERIALIZATION** implements `Clone` and `AsRef<[u8]>`, is cheaply cloneable.
+/// No-op serialization means that key.encode_key() is the same as key.as_ref().to_vec()
+pub trait VersionedSchemaKeyMarker: Clone + Ord + Hash + AsRef<[u8]> {}
 
 /// A specialized schema for values which have one "live" version and wish to automatically store a
 /// (possibly truncated) history of all versions over time.
-pub trait SchemaWithVersion: Schema<Key: ArcBytes> {
-    /// A column family for storing the historical values of the schema.
-    type HistoricalColumnFamily: Schema<Key = VersionedKey<Self, Self::Key>, Value = Self::Value>;
-    /// A column family for storing the pruning keys of the schema.
-    type PruningColumnFamily: Schema<Key = PrunableKey<Self, Self::Key>, Value = ()>;
-    /// A column family for storing the committed version of storage and the latest pruned version.
-    /// For backwards compatibility, we make the slightly awkward choice of storing a column family of this name in both the live and archival DBs
-    /// where the archival DB only stores the pruned version metadata and the live DB stores only the committed version metadata.
-    /// (This way, the behavior of the split DBs is identical to the old behavior of a single DB.)
-    type VersionMetadatacolumn: Schema<Key = VersionedTableMetadataKey, Value = u64>;
+pub trait SchemaWithVersion:
+    Clone + Schema<Key: VersionedSchemaKeyMarker, Value: Clone + AsRef<[u8]>>
+{
+    /// The name of the column family for storing the historical values of the schema.
+    const HISTORICAL_COLUMN_FAMILY_NAME: ColumnFamilyName;
+    /// The name of the column family for storing the pruning keys of the schema.
+    const PRUNING_COLUMN_FAMILY_NAME: ColumnFamilyName;
+    /// The name of the column family for storing the version metadata of the schema.
+    const VERSION_METADATA_COLUMN_FAMILY_NAME: ColumnFamilyName;
+}
+
+/// A value for a versioned schema.
+#[derive(Debug, Clone)]
+pub enum VersionedValue<V: SchemaWithVersion> {
+    /// A value that is currently live
+    Live(V::Value),
+    /// A value that was written at a given version
+    Historical(V::Value),
+    /// A key was written at a given version and is to be pruned
+    Pruning,
+    /// Metadata about the versioned schema
+    VersionMetadata(u64),
+}
+
+struct KeyWithVersionPrefixAndSuffix {
+    version: u64,
+    contents: Vec<u8>,
+}
+
+impl KeyWithVersionPrefixAndSuffix {
+    pub fn new(version: u64) -> Self {
+        Self {
+            version,
+            contents: version.to_be_bytes().to_vec(),
+        }
+    }
+
+    pub fn set_key(&mut self, key: &[u8]) {
+        self.contents.truncate(8);
+        self.contents.extend_from_slice(key);
+        self.contents.extend_from_slice(&self.version.to_be_bytes());
+    }
+
+    pub fn live_key(&self) -> &[u8] {
+        let len = self.contents.len();
+        &self.contents[8..len - 8]
+    }
+
+    pub fn archival_key(&self) -> &[u8] {
+        let len = self.contents.len();
+        &self.contents[8..len]
+    }
+
+    pub fn pruning_key(&self) -> &[u8] {
+        let len = self.contents.len();
+        &self.contents[0..len - 8]
+    }
 }
 
 impl<V: SchemaWithVersion> VersionedDB<V>
 where
-    VersionedTableMetadataKey: KeyCodec<V::VersionMetadatacolumn>,
-    (): ValueCodec<V::PruningColumnFamily>,
-    V::Value: ValueCodec<V::HistoricalColumnFamily>,
-    u64: ValueCodec<V::VersionMetadatacolumn>,
+    // VersionedTableMetadataKey: KeyCodec<V::VersionMetadatacolumn>,
+    V::Key: Ord + Clone + std::hash::Hash + AsRef<[u8]>,
+    V::Value: Clone + AsRef<[u8]>,
+    V: Ord,
 {
     /// Adds the column families for the versioned schema to the existing column families.
     pub fn add_column_families(
         existing_column_families: &mut Vec<ColumnFamilyDescriptor>,
         separate_archival_and_pruning: bool,
     ) -> anyhow::Result<()> {
-        let historical_versioned_column_family = V::HistoricalColumnFamily::COLUMN_FAMILY_NAME;
-        let pruning_column_family = V::PruningColumnFamily::COLUMN_FAMILY_NAME;
+        let historical_versioned_column_family = V::HISTORICAL_COLUMN_FAMILY_NAME;
+        let pruning_column_family = V::PRUNING_COLUMN_FAMILY_NAME;
         let live_column_family = V::COLUMN_FAMILY_NAME;
-        let metadata_column_family = V::VersionMetadatacolumn::COLUMN_FAMILY_NAME;
+        let metadata_column_family = V::VERSION_METADATA_COLUMN_FAMILY_NAME;
         for column in existing_column_families.iter() {
             if column.name() == metadata_column_family
                 || column.name() == historical_versioned_column_family
@@ -377,10 +403,26 @@ where
     }
 
     /// Creates a new versioned DB from an existing DB.
-    pub fn from_dbs(live_db: Arc<DB>, archival_db: Arc<DB>) -> anyhow::Result<Self> {
+    // Cache size estimation: we want to allocate about 1GB for cache. Estimate that slot keys are about 80 bytes and slot values
+    // are around 400 bytes + 56 bytes of overhead on the stack (see weighter). Multiply by 1.5 to account for overhead (per quick-cache docs).
+    // That gives estimated item capacity of 1GB / (80 + 400 + 56) * 1.5 ~= 1.2M.
+    pub fn from_dbs(
+        live_db: Arc<DB>,
+        archival_db: Arc<DB>,
+        cache_size: usize,
+    ) -> anyhow::Result<Self> {
+        let cache = RwLock::new(Cache::with_weighter(
+            cache_size / (80 + 400 + 56),
+            cache_size as u64,
+            BasicWeighter,
+        ));
+        let version = Self::load_committed_version_from_disk(&live_db)?;
+        let committed_archival_version = AtomicU64::new(version.unwrap_or(u64::MAX));
         Ok(Self {
             live_db,
             archival_db,
+            cache,
+            committed_archival_version,
             _schema: Default::default(),
         })
     }
@@ -389,16 +431,34 @@ where
     pub fn iter_pruning_keys_up_to_version(
         &self,
         version: u64,
-    ) -> anyhow::Result<
-        impl Iterator<Item = Result<<V::PruningColumnFamily as Schema>::Key, CodecError>> + use<'_, V>,
-    > {
+    ) -> anyhow::Result<impl Iterator<Item = PrunableKey<V>> + use<'_, V>> {
         // Because some keys are longer than 8 bytes, we use an exclusive range
         let first_version_to_keep = version.saturating_add(1);
         let range = ..first_version_to_keep.to_be_bytes().to_vec();
-        let iterator = self
-            .archival_db
-            .raw_iter_range::<V::PruningColumnFamily>(range, ScanDirection::Forward)?;
-        Ok(iterator.map(|(key, _value)| <V::PruningColumnFamily as Schema>::Key::decode_key(&key)))
+        self.archival_db
+            .raw_iter_range_with_decode_fn::<V, PrunableKey<V>>(
+                range,
+                ScanDirection::Forward,
+                &|(key, _value)| {
+                    PrunableKey::decode_key(key)
+                        .expect("DB Corruption: Failed to decode pruning key")
+                },
+            )
+    }
+
+    fn load_committed_version_from_disk(live_db: &DB) -> anyhow::Result<Option<u64>> {
+        live_db.get_raw_with_cf_and_decoder::<u64>(
+            V::VERSION_METADATA_COLUMN_FAMILY_NAME,
+            VersionedTableMetadataKey::CommittedVersion.as_bytes(),
+            &|data| {
+                Ok(u64::from_be_bytes(data.try_into().map_err(|_| {
+                    CodecError::InvalidKeyLength {
+                        expected: 8,
+                        got: data.len(),
+                    }
+                })?))
+            },
+        )
     }
 
     /// Name of the database that can be used for logging or metrics or tracing.
@@ -408,49 +468,165 @@ where
     }
 
     /// Returns the value of a key in the live column family.
-    pub fn get_live_value(&self, encoded_schema_key: &[u8]) -> anyhow::Result<Option<V::Value>> {
-        self.live_db.get_raw::<V>(encoded_schema_key)
-    }
-
-    /// Returns the latest committed version in the database.
-    pub fn load_latest_committed_version(&self) -> anyhow::Result<Option<u64>> {
-        self.live_db
-            .get::<V::VersionMetadatacolumn>(&VersionedTableMetadataKey::CommittedVersion)
-    }
-
-    /// Materializes a batch of writes to the database.
-    pub fn materialize(
-        &self,
-        batch: &VersionedSchemaBatch<V>,
-        live_batch: &mut SchemaBatch,
-        archival_batch: &mut SchemaBatch,
-        version: u64,
-    ) -> anyhow::Result<()> {
-        for (key, value) in batch.versioned_table_writes.iter() {
-            // Write to the Live keys table
-            if let Some(value) = value {
-                live_batch.put_raw::<V>(key.clone(), value)?;
-                archival_batch.put_raw::<V::HistoricalColumnFamily>(
-                    EncodedVersionedKey::<V>::new(key.clone(), version).encode_key()?,
-                    value,
-                )?;
-            } else {
-                live_batch.delete_raw::<V>(key.clone())?;
-                archival_batch.delete_raw::<V::HistoricalColumnFamily>(
-                    EncodedVersionedKey::<V>::new(key.clone(), version).encode_key()?,
-                )?;
+    pub fn get_live_value(&self, key: &V::Key) -> anyhow::Result<Option<V::Value>> {
+        let lock = self.cache.try_read();
+        if let Some(cache) = lock.as_ref() {
+            let cache_result = cache.get(key);
+            if let Some(result) = cache_result {
+                return Ok(result);
             }
-            // Write to the pruning table
-            archival_batch.put_raw::<V::PruningColumnFamily>(
-                EncodedPrunableKey::<V>::new(version, key.clone()).encode_key()?,
-                &(),
-            )?;
         }
-        // Write to the historical table
-        live_batch.put::<V::VersionMetadatacolumn>(
-            &VersionedTableMetadataKey::CommittedVersion,
-            &version,
+        let result = self.live_db.get_raw::<V>(key.as_ref())?;
+        // We can safely modify the cache while holding a read lock because we always hold a *write* lock while committing to the DB.
+        // Since we're currently holding a read lock, that means that the DB is not currently changing - so the value we just read cannot
+        // be invalidated by a concurrent write. This makes it safe to insert.
+        //
+        // Note that this analysis only holds because we've held the lock since the beginning of `get_live_value`. If we were to drop
+        // the lock while we read from disk, this would not be sound.
+        if let Some(cache) = lock {
+            cache.insert(key.clone(), result.clone());
+        }
+        Ok(result)
+    }
+
+    /// Returns the latest committed version in the database from an atomic.
+    pub fn fetch_latest_committed_archival_version(&self) -> Option<u64> {
+        let value = self.committed_archival_version.load(Ordering::Acquire);
+        // We use u64::MAX as a placeholder on startup to indicate that no version has been committed yet.
+        if value == u64::MAX {
+            return None;
+        }
+        Some(value)
+    }
+
+    /// Commits a batch of versioned writes to the database.
+    pub fn commit(&self, batch: &VersionedSchemaBatch<V>, version: u64) -> anyhow::Result<()>
+    where
+        V::Value: AsRef<[u8]>,
+        V::Key: AsRef<[u8]>,
+    {
+        let _timer = SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS
+            .with_label_values(&[self.live_db.name()])
+            .start_timer();
+        // Update the next version to commit if relevant.
+        // Block any readers while the DB isn't fully consistent
+        let cache = self.cache.write();
+        // Optimization:
+        // At various times we need the key *prefixed* with the version (for pruning), on its own (for live reads), and suffixed with the version (for archival reads).
+        // To reduce allocations and memcopies, we create a single vector [version || key || version] and use it for all three cases, simply slicing the relevant subset.
+        //
+        // As a further optimization, we reuse a single `Vec` for all keys.
+
+        let mut key_with_version = KeyWithVersionPrefixAndSuffix::new(version);
+
+        // Create batches and column families
+        let mut live_db_batch = rocksdb::WriteBatch::default();
+        let mut archival_db_batch = rocksdb::WriteBatch::default();
+        let live_cf_handle = self.live_db.get_cf_handle(V::COLUMN_FAMILY_NAME)?;
+        let archival_cf_handle = self
+            .archival_db
+            .get_cf_handle(V::HISTORICAL_COLUMN_FAMILY_NAME)?;
+        let pruning_cf_handle = self
+            .archival_db
+            .get_cf_handle(V::PRUNING_COLUMN_FAMILY_NAME)?;
+        let metadata_cf_handle = self
+            .live_db
+            .get_cf_handle(V::VERSION_METADATA_COLUMN_FAMILY_NAME)?;
+
+        //  Keys for metrics
+        let mut live_put_bytes = 0;
+        let mut deletes = 0;
+        let mut archival_puts_bytes = 0;
+        let mut pruning_puts_bytes = 0;
+
+        // TODO: Assert version consistency before writing
+        for (key, value) in batch.versioned_table_writes.iter() {
+            key_with_version.set_key(key.as_ref());
+            // println!("Writing live key with version: {}. {:?}", version, key.as_ref());
+            match value {
+                Some(value) => {
+                    assert!(!key_with_version.live_key().is_empty(), "Live values may not have zero-length. This prevents confusion with placholders for deleted values.");
+                    // println!("Inserting live key: {:?}", key_with_version.live_key());
+                    live_put_bytes += key_with_version.live_key().len() + value.as_ref().len();
+                    live_db_batch.put_cf(live_cf_handle, key_with_version.live_key(), value);
+                    archival_puts_bytes +=
+                        key_with_version.archival_key().len() + value.as_ref().len();
+                    archival_db_batch.put_cf(
+                        archival_cf_handle,
+                        key_with_version.archival_key(),
+                        value,
+                    );
+                    cache.insert(key.clone(), Some(value.clone()));
+                }
+                None => {
+                    // println!("Deleting live key: {:?}", key_with_version.live_key());
+                    deletes += 1;
+                    archival_puts_bytes += key_with_version.archival_key().len();
+                    live_db_batch.delete_cf(live_cf_handle, key);
+                    archival_db_batch.put_cf(
+                        archival_cf_handle,
+                        key_with_version.archival_key(),
+                        [],
+                    );
+                    cache.insert(key.clone(), None);
+                }
+            }
+            archival_db_batch.put_cf(pruning_cf_handle, key_with_version.pruning_key(), []);
+            pruning_puts_bytes += key_with_version.pruning_key().len();
+        }
+        live_db_batch.put_cf(
+            metadata_cf_handle,
+            VersionedTableMetadataKey::CommittedVersion.as_bytes(),
+            version.to_be_bytes(),
+        );
+
+        let serialized_size = live_db_batch.size_in_bytes() + archival_db_batch.size_in_bytes();
+        let archival_serialized_size = archival_db_batch.size_in_bytes();
+        with_error_logging(
+            || {
+                self.archival_db
+                    .write_opt(archival_db_batch, &default_write_options())
+            },
+            "write_versioned_schemas::write_archival_opt",
         )?;
+
+        // Danger: This function is coupled with `get_historical_value`. That function assumes that if hte
+        self.committed_archival_version
+            .store(version, Ordering::Release);
+
+        with_error_logging(
+            || {
+                self.live_db
+                    .write_opt(live_db_batch, &default_write_options())
+            },
+            "write_versioned_schemas::write_live_opt",
+        )?;
+        // Drop the write lock on the cache.
+        drop(cache);
+
+        // Track metrics after the writes succeed
+        {
+            SCHEMADB_PUT_BYTES
+                .with_label_values(&[V::COLUMN_FAMILY_NAME])
+                .observe(live_put_bytes as f64);
+            SCHEMADB_DELETES
+                .with_label_values(&[V::COLUMN_FAMILY_NAME])
+                .inc_by(deletes);
+            SCHEMADB_PUT_BYTES
+                .with_label_values(&[V::HISTORICAL_COLUMN_FAMILY_NAME])
+                .observe(archival_puts_bytes as f64);
+            SCHEMADB_PUT_BYTES
+                .with_label_values(&[V::PRUNING_COLUMN_FAMILY_NAME])
+                .observe(pruning_puts_bytes as f64);
+
+            SCHEMADB_BATCH_COMMIT_BYTES
+                .with_label_values(&[self.live_db.name()])
+                .observe(serialized_size as f64);
+            SCHEMADB_BATCH_COMMIT_BYTES
+                .with_label_values(&[self.archival_db.name()])
+                .observe(archival_serialized_size as f64);
+        }
+
         Ok(())
     }
 
@@ -465,6 +641,9 @@ where
         else {
             return Ok(None);
         };
+        if value_bytes.is_empty() {
+            return Ok(None);
+        }
         let value = V::Value::decode_value(&value_bytes)?;
         Ok(Some(value))
     }
@@ -480,6 +659,9 @@ where
         else {
             return Ok(None);
         };
+        if value_bytes.is_empty() {
+            return Ok(None);
+        }
         let value = V::Value::decode_value(&value_bytes)?;
         Ok(Some(value))
     }
@@ -505,9 +687,15 @@ where
     ) -> anyhow::Result<Option<(Vec<u8>, u64)>> {
         key_to_get.extend_from_slice(&max_version.to_be_bytes());
         let range = ..=&key_to_get;
+        // TODO(non-blocking): Make this more efficient eventually
         let mut iterator = self
             .archival_db
-            .raw_iter_range::<V::HistoricalColumnFamily>(range, ScanDirection::Backward)?;
+            .raw_iter_cf_with_decode_fn::<(Vec<u8>, Vec<u8>)>(
+                V::HISTORICAL_COLUMN_FAMILY_NAME,
+                range,
+                ScanDirection::Backward,
+                &|(key, value)| (key.to_vec(), value.to_vec()),
+            )?;
         if let Some((key, value_bytes)) = iterator.next() {
             // Safety: All keys are suffixed with an 8-byte version.
             let (key_bytes, version_bytes) = key.split_at(key.len() - 8);
@@ -531,7 +719,7 @@ where
 #[derive(Debug, Clone)]
 /// A reader for a versioned schema.
 pub struct VersionedDeltaReader<V: SchemaWithVersion> {
-    db: VersionedDB<V>,
+    db: Arc<VersionedDB<V>>,
     // The version of the underlying DB at the time this snapshot was taken.
     base_version: Option<u64>,
     // The snapshots to include in the reader, ordered from newest to oldest.
@@ -541,20 +729,19 @@ pub struct VersionedDeltaReader<V: SchemaWithVersion> {
 impl<V: SchemaWithVersion> VersionedDeltaReader<V>
 where
     V::Key: Eq,
-    VersionedTableMetadataKey: KeyCodec<V::VersionMetadatacolumn>,
     V::Value: Clone,
-    (): ValueCodec<V::PruningColumnFamily>,
-    V::Value: ValueCodec<V::HistoricalColumnFamily>,
-    u64: ValueCodec<V::VersionMetadatacolumn>,
 {
     /// Creates a new versioned delta reader.
     ///
-    /// Note that the snapshots are ordered from newest to oldest.
+    /// Note that the snapshots are ordered from oldest to newest
     pub fn new(
-        db: VersionedDB<V>,
+        db: Arc<VersionedDB<V>>,
         base_version: Option<u64>,
-        snapshots: Vec<Arc<VersionedSchemaBatch<V>>>,
+        mut snapshots: Vec<Arc<VersionedSchemaBatch<V>>>,
     ) -> Self {
+        // We keep the API consistent across the codebase (snapshots should be chronological),
+        // But use reverse order internally so that iteration can always be done from newest to oldest.
+        snapshots.reverse();
         Self {
             snapshots,
             db,
@@ -587,11 +774,12 @@ pub struct VersionedDbIterator<'a, V: SchemaWithVersion> {
     //  - Concurrent thread writes:: Key1 -> B, Key2 -> B
     //  - Iterator reads: Key2 -> B,
     // Now the caller sees a state of the world which never existed where Key1 -> A and Key2 -> B.
-    _read_lock: RwLockReadGuard<'a, DbCache>,
+    _read_lock: RwLockReadGuard<'a, Cache<V::Key, Option<V::Value>, BasicWeighter>>,
     // Borrow the snapshots to keep the lifetimes tied together. We could clone, but this makes it easier to reason about.
-    snapshots: Vec<MaybePeekableBtreeMapRange<'a, Vec<u8>, Option<V::Value>>>,
+    snapshots: Vec<MaybePeekableBtreeMapRange<'a, V::Key, Option<V::Value>>>,
     db_iterator: Option<Peekable<RawDbIter<'a>>>,
-    prefix: Vec<u8>,
+    prefix: V::Key,
+    encoded_prefix: Vec<u8>,
 }
 
 enum LocationOfSmallestKey {
@@ -599,16 +787,30 @@ enum LocationOfSmallestKey {
     Db,
 }
 
-impl<'a, V: SchemaWithVersion<Key = Arc<K>>, K> Iterator for VersionedDbIterator<'a, V>
+/// A trait for types that can be checked for a prefix.
+pub trait HasPrefix<T = Self> {
+    /// Checks if the current item has the given prefix.
+    fn has_prefix(&self, prefix: &T) -> bool;
+}
+
+impl HasPrefix for Vec<u8> {
+    fn has_prefix(&self, prefix: &Self) -> bool {
+        self.starts_with(prefix)
+    }
+}
+
+impl HasPrefix for Arc<Vec<u8>> {
+    fn has_prefix(&self, prefix: &Self) -> bool {
+        self.starts_with(prefix)
+    }
+}
+
+impl<'a, V: SchemaWithVersion<Key = K>, K> Iterator for VersionedDbIterator<'a, V>
 where
-    K: Eq + std::hash::Hash + KeyEncoder<V> + KeyDecoder<V>,
-    VersionedTableMetadataKey: KeyCodec<V::VersionMetadatacolumn>,
+    K: Eq + std::hash::Hash + KeyEncoder<V> + KeyDecoder<V> + HasPrefix + Ord,
     V::Value: Clone,
-    (): ValueCodec<V::PruningColumnFamily>,
-    V::Value: ValueCodec<V::HistoricalColumnFamily>,
-    u64: ValueCodec<V::VersionMetadatacolumn>,
 {
-    type Item = (Arc<K>, Option<V::Value>);
+    type Item = (K, Option<V::Value>);
 
     // Return the next key/value pair from the iterator.
     fn next(&mut self) -> Option<Self::Item> {
@@ -628,7 +830,7 @@ where
             for (idx, snapshot) in self.snapshots.iter_mut().enumerate() {
                 if let Some((key, _value)) = snapshot.as_mut().and_then(|s| s.peek()) {
                     // If the next key from this snapsot doesn't match our prefix, ignore it
-                    if !key.starts_with(&self.prefix) {
+                    if !key.has_prefix(&self.prefix) {
                         continue;
                     }
                     // If this key is smaller than the current smallest key, update our view of the smallest key and remember which snapshot it came from.
@@ -646,15 +848,20 @@ where
             let mut is_done_with_db = false;
             if let Some((key, _value)) = next_from_db {
                 // If the next key from the Db doesn't match our prefix, ignore it
-                if !key.starts_with(&self.prefix) {
+                if !key.starts_with(&self.encoded_prefix) {
                     is_done_with_db = true;
                 // If this key is smaller than the current smallest key, update our view of the smallest key and remember that it came from the Db.
-                } else if smallest_key
-                    .as_ref()
-                    .map(|(_smallest_idx, smallest_key)| key < smallest_key)
-                    .unwrap_or(true)
-                {
-                    smallest_key = Some((LocationOfSmallestKey::Db, key.clone()));
+                } else {
+                    let key = K::decode_key(key).expect(
+                        "Failed to decode key from db during iteration. This is a type safety bug.",
+                    );
+                    if smallest_key
+                        .as_ref()
+                        .map(|(_smallest_idx, smallest_key)| key < *smallest_key)
+                        .unwrap_or(true)
+                    {
+                        smallest_key = Some((LocationOfSmallestKey::Db, key));
+                    }
                 }
             }
 
@@ -666,11 +873,11 @@ where
             let (key_to_return, value_to_return) = match smallest_idx {
                 LocationOfSmallestKey::Snapshot(idx) => {
                     let (raw_key, value )= self.snapshots[idx].as_mut().and_then(|s| s.next()).expect("key went missing from snapshot while iterating. We just checked that `peek` returned a key and `next` failed. This is a bug.");
-                    (Arc::new(K::decode_key(raw_key).expect("Failed to decode value from db during iteration. This is a type safety bug.")),  value.clone())
+                    (raw_key, value.clone())
                 }
                 LocationOfSmallestKey::Db => {
-                    let (raw_key, value) = self.db_iterator.as_mut().and_then(|iter| iter.next()).expect("key went missing from DB while iterating. We just checked that `peek` returned a key and `next` failed. This is a bug.");
-                    (Arc::new(K::decode_key(&raw_key).expect("Failed to decode value from db during iteration. This is a type safety bug.")), Some(V::Value::decode_value(&value).expect("Failed to decode value from db during iteration. This is a type safety bug.")))
+                    let (_raw_key, value) = self.db_iterator.as_mut().and_then(|iter| iter.next()).expect("key went missing from DB while iterating. We just checked that `peek` returned a key and `next` failed. This is a bug.");
+                    (&smallest_key, Some(V::Value::decode_value(&value).expect("Failed to decode value from db during iteration. This is a type safety bug.")))
                 }
             };
             if is_done_with_db {
@@ -689,14 +896,17 @@ where
             }
             // Step 3.1 advance the db iterator
             if let Some((key, _value)) = self.db_iterator.as_mut().and_then(|iter| iter.peek()) {
-                if *key == smallest_key {
+                if K::decode_key(key).expect(
+                    "Failed to decode key from db during iteration. This is a type safety bug.",
+                ) == smallest_key
+                {
                     let _ = self.db_iterator.as_mut().and_then(|iter| iter.next());
                 }
             }
 
             if value_to_return.is_some() {
                 // Return the value
-                return Some((key_to_return, value_to_return));
+                return Some((key_to_return.clone(), value_to_return));
             }
         }
     }
@@ -704,24 +914,20 @@ where
 
 impl<V: SchemaWithVersion> VersionedDeltaReader<V>
 where
-    VersionedTableMetadataKey: KeyCodec<V::VersionMetadatacolumn>,
-    V::Value: Clone,
-    (): ValueCodec<V::PruningColumnFamily>,
-    V::Value: ValueCodec<V::HistoricalColumnFamily>,
-    u64: ValueCodec<V::VersionMetadatacolumn>,
-    V::Key: Ord,
+    V::Value: Clone + AsRef<[u8]>,
+    V: Ord,
+    V::Key: Eq + std::hash::Hash + KeyEncoder<V> + KeyDecoder<V> + HasPrefix + Ord + AsRef<[u8]>,
 {
     /// Construct an iterator over the versioned DB with a given prefix.
     ///
     /// Note that the returned iterator holds a read lock over the DB, so no writes can complete while it is active.
-    pub fn iter_with_prefix(
-        &self,
-        prefix: impl KeyEncoder<V>,
-    ) -> anyhow::Result<VersionedDbIterator<'_, V>> {
-        let read_lock = self.db.live_db.cache.read();
+    pub fn iter_with_prefix(&self, prefix: V::Key) -> anyhow::Result<VersionedDbIterator<'_, V>> {
+        let read_lock = self.db.cache.read();
         let version_on_disk = self.db.get_committed_version()?;
-        let prefix = prefix.encode_key()?;
-        let range = prefix.clone()..;
+        // println!("Version on disk: {:?}", version_on_disk);
+        let raw_prefix = prefix.clone()..;
+        let encoded_prefix = prefix.encode_key()?;
+        let range = encoded_prefix.clone()..;
         let latest_version = self.latest_version();
         if version_on_disk.is_some_and(|v| v > latest_version.unwrap_or(0)) {
             return Err(anyhow::anyhow!("Version on disk is newer than the latest version in the reader. Cannot create an iterator which is guaranteed to be consistent with the version of this storage."));
@@ -747,7 +953,7 @@ where
                 Some(
                     snapshot
                         .versioned_table_writes
-                        .range(range.clone())
+                        .range(raw_prefix.clone())
                         .peekable(),
                 )
             })
@@ -764,40 +970,47 @@ where
             snapshots,
             db_iterator,
             prefix,
+            encoded_prefix,
         })
     }
 
     /// Returns the latest value of a key in the reader.
-    pub fn get_latest_borrowed(&self, key: impl AsRef<[u8]>) -> anyhow::Result<Option<V::Value>> {
-        for snapshot in self.snapshots.iter().rev() {
-            if let Some(value) = snapshot.versioned_table_writes.get(key.as_ref()) {
+    pub fn get_latest_borrowed(
+        &self,
+        key: &<V as Schema>::Key,
+    ) -> anyhow::Result<Option<V::Value>> {
+        for snapshot in self.snapshots.iter() {
+            if let Some(value) = snapshot.versioned_table_writes.get(key) {
                 return Ok(value.clone());
             }
         }
         // The live value for any key is None if the DB is empty.
-        let Some(latest_version) = self.latest_version() else {
+        let Some(own_version) = self.latest_version() else {
             return Ok(None);
         };
         // If the DB mutated underneath us such that the live version is now newer than this snapshot's version, we need to fetch from the historical table. This is much slower than fetching from the live table, but it should be a rare case.
         // Note that the data that was committed could come from a different fork even if it's at the same height as our snapshot. This is intentionally allowed for compatibiltiy with pre-existing
         // behavior of the system.
-        let loaded_version = self.db.get_committed_version()?;
-        if loaded_version.is_some_and(|v| v > latest_version) {
-            tracing::trace!(?loaded_version, "DB is out of date, fetching 'live' values from historical table. Using latest version {:?}", latest_version);
+        let min_safe_db_version = self.db.fetch_latest_committed_archival_version();
+        // If the value in the archival DB is newer than the version of this snapshot, then...
+        // - It's not safe to fetch from the live table (that is probably also newer)
+        // - The value we want is guaranteed to be in the archival DB, so we can fetch it from there.
+        if min_safe_db_version.is_some_and(|v| v > own_version) {
+            tracing::trace!(?min_safe_db_version, "DB is out of date, fetching 'live' values from historical table. Using latest version {:?}", own_version);
             // The data from the base version is guaranteed to match our data - but data from the latest version could be from a different fork that was committed
-            return Ok(self.get_historical_borrowed(key, latest_version)?);
+            return Ok(self.get_historical_borrowed(key, own_version)?);
         }
 
-        let live_value = self.db.get_live_value(key.as_ref())?;
+        let live_value = self.db.get_live_value(key)?;
         // If the DB has no committed version or if its latest version is less than the latest version we know about, then it hasn't changed underneath us in a way that would invalidate the read.
-        let loaded_version = self.db.get_committed_version()?;
-        if loaded_version.is_some_and(|v| v > latest_version) {
-            // Coherency - check that the DB is still in date before returning the value. If not, we need to retry from the historical table.
+        let safe_db_version = self.db.fetch_latest_committed_archival_version();
+        // If a write happened while we were fetching from the db, the results are unknown. Now that the state we want is guaranteed to be in the archival DB, we can fetch it safely from there.
+        if safe_db_version.is_some_and(|v| v > own_version) {
             tracing::trace!(
-                ?loaded_version, "DB became out of date during a read. Fetching 'live' values from historical table. Using latest version {:?}",
-                latest_version
+                ?safe_db_version, "DB became out of date during a read. Fetching 'live' values from historical table. Using latest version {:?}",
+                own_version
             );
-            Ok(self.get_historical_borrowed(key, latest_version)?)
+            Ok(self.get_historical_borrowed(key, own_version)?)
         } else {
             Ok(live_value)
         }
@@ -806,19 +1019,19 @@ where
     /// Returns the global latest value for the given key.
     pub fn get_latest_borrowed_unbound(
         &self,
-        key: impl AsRef<[u8]>,
+        key: &<V as Schema>::Key,
     ) -> anyhow::Result<Option<V::Value>> {
         let live_table_version = self.db.get_committed_version()?;
         let latest_version = self.latest_version();
         // If the "live" table is ahead of this storage, fetch directly from the live table.
         let Some(latest_version) = latest_version else {
-            return self.db.get_live_value(key.as_ref());
+            return self.db.get_live_value(key);
         };
         if live_table_version.is_some_and(|v| v > latest_version) {
-            return self.db.get_live_value(key.as_ref());
+            return self.db.get_live_value(key);
         }
         // Otherwise, look through the snapshots
-        for (idx, snapshot) in self.snapshots.iter().rev().enumerate() {
+        for (idx, snapshot) in self.snapshots.iter().enumerate() {
             let snapshot_version = latest_version.saturating_sub(idx as u64);
             // If the snapshot is older than (or the same age as) the live table, we can stop looking.
             if live_table_version.is_some_and(|live_db_version| live_db_version >= snapshot_version)
@@ -827,18 +1040,18 @@ where
             }
 
             // Check the snapshot
-            if let Some(value) = snapshot.versioned_table_writes.get(key.as_ref()) {
+            if let Some(value) = snapshot.versioned_table_writes.get(key) {
                 return Ok(value.clone());
             }
         }
-        // If we've looked through all the snapshots and the live table is still ahead, fetch from the live table.
-        self.db.get_live_value(key.as_ref())
+        // If we've looked through all the snapshots and not found the value, then the one in the db is newest. Take it.
+        self.db.get_live_value(key)
     }
 
     /// Returns the value of a key in the historical column family as of the given version.
     pub fn get_historical_borrowed(
         &self,
-        key: impl AsRef<[u8]>,
+        key: &<V as Schema>::Key,
         version: u64,
     ) -> Result<Option<V::Value>, HistoricalValueError> {
         let Some(newest_version) = self.latest_version() else {
@@ -855,15 +1068,26 @@ where
         }
 
         let mut version_of_current_snapshot = newest_version;
-        for snapshot in self.snapshots.iter().rev() {
+        let mut must_have_been_last_iter = false;
+        for snapshot in self.snapshots.iter() {
+            assert!(
+                !must_have_been_last_iter,
+                "The number of snapshots is greater than the latest version + 1. This is a bug."
+            );
             if version_of_current_snapshot > version {
                 version_of_current_snapshot -= 1;
                 continue;
             }
-            if let Some(value) = snapshot.versioned_table_writes.get(key.as_ref()) {
+            if let Some(value) = snapshot.versioned_table_writes.get(key) {
                 return Ok(value.clone());
             }
-            version_of_current_snapshot -= 1;
+            version_of_current_snapshot = match version_of_current_snapshot.checked_sub(1) {
+                Some(v) => v,
+                None => {
+                    must_have_been_last_iter = true;
+                    0
+                }
+            };
         }
         let historical_value = self
             .db

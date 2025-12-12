@@ -471,7 +471,7 @@ mod tests {
         schema_batch_0.put::<S>(&FIELD_4, &TestField(4)).unwrap();
         schema_batch_0.put::<S>(&FIELD_5, &TestField(5)).unwrap();
         schema_batch_0.put::<S>(&FIELD_7, &TestField(7)).unwrap();
-        db.write_schemas(schema_batch_0).unwrap();
+        db.write_schemas(&schema_batch_0).unwrap();
 
         let mut snapshot_1 = SchemaBatch::new();
         snapshot_1.put::<S>(&FIELD_6, &TestField(60)).unwrap();
@@ -800,7 +800,7 @@ mod tests {
             db_batch.put::<S>(key, value).unwrap();
             all_kv.insert(key.clone(), *value);
         }
-        db.write_schemas(db_batch).unwrap();
+        db.write_schemas(&db_batch).unwrap();
 
         let mut schema_batches = Vec::new();
         for snapshot in snapshots {
@@ -831,7 +831,7 @@ mod tests {
             db_batch.put::<S>(&key, &value).unwrap();
             latest_schema_batch.delete::<S>(&key).unwrap();
         }
-        db.write_schemas(db_batch).unwrap();
+        db.write_schemas(&db_batch).unwrap();
 
         let mut schema_batches = Vec::new();
         for snapshot in snapshots {

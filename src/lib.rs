@@ -28,7 +28,7 @@ pub mod test;
 
 pub use config::{gen_rocksdb_options, RocksdbConfig};
 
-use std::{borrow::Borrow, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 use anyhow::format_err;
 use iterator::ScanDirection;
@@ -37,8 +37,7 @@ use metrics::{
     SCHEMADB_BATCH_COMMIT_BYTES, SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS, SCHEMADB_DELETES,
     SCHEMADB_DELETE_RANGE, SCHEMADB_GET_BYTES, SCHEMADB_GET_LATENCY_SECONDS, SCHEMADB_PUT_BYTES,
 };
-use parking_lot::RwLock;
-use quick_cache::{sync::Cache, Equivalent, Weighter};
+use quick_cache::{sync::Cache, Weighter};
 pub use rocksdb;
 use rocksdb::ReadOptions;
 pub use rocksdb::DEFAULT_COLUMN_FAMILY_NAME;
@@ -46,46 +45,34 @@ use thiserror::Error;
 use tracing::{info, warn};
 
 pub use crate::schema::Schema;
-use crate::schema::{ColumnFamilyName, KeyCodec, ValueCodec};
 pub use crate::schema_batch::SchemaBatch;
+use crate::{
+    iterator::DecodeFn,
+    schema::{KeyCodec, ValueCodec},
+};
 use crate::{iterator::RawDbIter, schema::KeyEncoder};
+
+type CacheForSchema<S> = Cache<<S as Schema>::Key, Option<<S as Schema>::Value>, BasicWeighter>;
 
 #[derive(Clone, Debug)]
 struct BasicWeighter;
 
-impl<T: Borrow<SchemaKey>> Weighter<(ColumnFamilyName, T), Option<SchemaValue>> for BasicWeighter {
-    fn weight(&self, key: &(ColumnFamilyName, T), value: &Option<SchemaValue>) -> u64 {
-        // 8 bytes for the pointer to the ColumnFamilyName (a 'static str) plus the key and value lengths
-        // 3 words (24 bytes) each on the stack for the Vec<u8>s, plus their capacity
-        8 + 24
-            + 24
-            + key.1.borrow().capacity() as u64
-            + value.as_ref().map_or(0, |v| v.capacity()) as u64
+impl<K: AsRef<[u8]>, V: AsRef<[u8]>> Weighter<K, Option<V>> for BasicWeighter {
+    fn weight(&self, key: &K, value: &Option<V>) -> u64 {
+        // Slot keys take 70 bytes on the stack pluse an optional heap allocation. Values are heap allocated. Assume 24 bytes for each Vec on the stack, pluse the lengths.
+        std::cmp::max(key.as_ref().len() as u64, 70)
+            + value.as_ref().map_or(0, |v| v.as_ref().len()) as u64
+            + 48
     }
 }
-
-/// A newtype for tuple to allow implementing `Equivalent` for it.
-#[derive(Debug, Hash)]
-struct Pair<A, B>(pub A, pub B);
-impl Equivalent<(ColumnFamilyName, SchemaKey)> for Pair<ColumnFamilyName, &[u8]> {
-    fn equivalent(&self, rhs: &(ColumnFamilyName, SchemaKey)) -> bool {
-        self.0 == rhs.0 && self.1 == rhs.1
-    }
-}
-
-pub(crate) type DbCache = Cache<(ColumnFamilyName, SchemaKey), Option<SchemaValue>, BasicWeighter>;
 
 /// This DB is a schematized RocksDB wrapper where all data passed in and out are typed according to
 /// [`Schema`]s.
 #[derive(Debug)]
 pub struct DB {
     name: &'static str, // for logging
-    // We use an RwLock to ensure consistency between the cache and the DB. Writes to the DB also grab the write lock.
-    // on the cache.
-    cache: RwLock<DbCache>,
     // All iteration circumvents the lock on the DB. This is fine, since we enforce that iterable column families are not cachable.
     db: Arc<rocksdb::DB>,
-    cacheable_column_families: Vec<String>,
 }
 
 /// Returns the default column family descriptor. Includes LZ4 compression.
@@ -110,7 +97,7 @@ impl DB {
         let descriptors = column_families
             .into_iter()
             .map(|cf| default_cf_descriptor(cf.into()));
-        let db = DB::open_with_cfds(db_opts, path, name, descriptors, vec![], 0)?;
+        let db = DB::open_with_cfds(db_opts, path, name, descriptors)?;
         Ok(db)
     }
 
@@ -122,40 +109,22 @@ impl DB {
         path: impl AsRef<Path>,
         name: &'static str,
         cfds: impl IntoIterator<Item = rocksdb::ColumnFamilyDescriptor>,
-        cacheable_column_families: Vec<String>,
-        cache_size: usize,
     ) -> anyhow::Result<DB> {
         let inner = with_error_logging(
             || rocksdb::DB::open_cf_descriptors(db_opts, path, cfds),
             "open_with_cfds",
         )?;
-        Ok(Self::log_construct(
-            name,
-            inner,
-            cache_size,
-            cacheable_column_families,
-        ))
+        Ok(Self::log_construct(name, inner))
     }
 
     // Cache size estimation: we want to allocate about 1GB for cache. Estimate that slot keys are about 80 bytes and slot values
     // are around 400 bytes + 56 bytes of overhead on the stack (see weighter). Multiply by 1.5 to account for overhead (per quick-cache docs).
     // That gives estimated item capacity of 1GB / (80 + 400 + 56) * 1.5 ~= 1.2M.
-    fn log_construct(
-        name: &'static str,
-        inner: rocksdb::DB,
-        cache_size: usize,
-        cacheable_column_families: Vec<String>,
-    ) -> DB {
+    fn log_construct(name: &'static str, inner: rocksdb::DB) -> DB {
         info!(rocksdb_name = name, path = %inner.path().display(), "Opened RocksDB");
         DB {
             name,
-            cache: RwLock::new(Cache::with_weighter(
-                ((cache_size / (80 + 400 + 56)) * 3) / 2,
-                cache_size as u64,
-                BasicWeighter,
-            )),
             db: Arc::new(inner),
-            cacheable_column_families,
         }
     }
 
@@ -180,56 +149,34 @@ impl DB {
         &self,
         encoded_schema_key: &[u8],
     ) -> anyhow::Result<Option<S::Value>> {
+        self.get_raw_with_cf_and_decoder::<S::Value>(
+            S::COLUMN_FAMILY_NAME,
+            encoded_schema_key,
+            &<S::Value as ValueCodec<S>>::decode_value,
+        )
+    }
+
+    /// Reads single record by key.
+    #[tracing::instrument(skip_all, level = "error")]
+    pub fn get_raw_with_cf_and_decoder<V>(
+        &self,
+        cf_name: &'static str,
+        encoded_schema_key: &[u8],
+        decoder: &impl Fn(&[u8]) -> Result<V, CodecError>,
+    ) -> anyhow::Result<Option<V>> {
         with_error_logging::<_, _, anyhow::Error>(
             || {
                 let _timer = SCHEMADB_GET_LATENCY_SECONDS
-                    .with_label_values(&[S::COLUMN_FAMILY_NAME])
+                    .with_label_values(&[cf_name])
                     .start_timer();
 
-                let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
-
-                // Only grab the read lock if we're accessing a cached column family.
-                if S::SHOULD_CACHE {
-                    let lock = self.cache.try_read();
-                    // If the cache is locked for writing, just fall back to the DB. It provides consistency without locking
-                    // Otherwise, we'll hold the lock until we've finished reading and (if necessary) modifying the cache.
-                    // This will block any commits to the DB during this critical section, which is what we need; otherwise,
-                    // a bad thread interleaving could cause us to read from the DB, get pre-empted while another thread writes, and then write
-                    // the stale value to the cache
-                    if let Some(cache) = lock.as_ref() {
-                        let cache_result =
-                            cache.get(&Pair(S::COLUMN_FAMILY_NAME, encoded_schema_key));
-                        if let Some(result) = cache_result {
-                            return result
-                                .map(|v| <S::Value as ValueCodec<S>>::decode_value(&v))
-                                .transpose()
-                                .map_err(|err| err.into());
-                        }
-                    }
-
-                    let result = self.db.get_pinned_cf(cf_handle, encoded_schema_key)?;
-                    // If the cache is locked for writing, don't try to put the value, just return
-                    if let Some(cache) = lock {
-                        // Note: We have to deserialize the value while holding the read lock because the lifetime of the borrow is tied to `inner`.
-                        // This prevents us from unifying the two branches.
-                        // Note: We don't count bytes read from the cache
-                        cache.insert(
-                            (S::COLUMN_FAMILY_NAME, encoded_schema_key.to_vec()),
-                            result.as_ref().map(|v| v.to_vec()),
-                        );
-                    }
-                    return result
-                        .map(|raw_value| <S::Value as ValueCodec<S>>::decode_value(&raw_value))
-                        .transpose()
-                        .map_err(|err| err.into());
-                }
-
+                let cf_handle = self.get_cf_handle(cf_name)?;
                 let result = self.db.get_pinned_cf(cf_handle, encoded_schema_key)?;
                 SCHEMADB_GET_BYTES
-                    .with_label_values(&[S::COLUMN_FAMILY_NAME])
+                    .with_label_values(&[cf_name])
                     .observe(result.as_ref().map_or(0.0, |v| v.len() as f64));
                 result
-                    .map(|raw_value| <S::Value as ValueCodec<S>>::decode_value(&raw_value))
+                    .map(|raw_value| decoder(&raw_value))
                     .transpose()
                     .map_err(|err| err.into())
             },
@@ -259,7 +206,7 @@ impl DB {
             || {
                 let mut batch = SchemaBatch::new();
                 batch.put::<S>(key, value)?;
-                self.write_schemas_inner(batch)
+                self.write_schemas_inner(&batch)
             },
             "put",
         )
@@ -284,7 +231,7 @@ impl DB {
             || {
                 let mut batch = SchemaBatch::new();
                 batch.delete::<S>(key)?;
-                self.write_schemas_inner(batch)
+                self.write_schemas_inner(&batch)
             },
             "delete",
         )
@@ -312,10 +259,6 @@ impl DB {
             || {
                 let from = from.encode_seek_key()?;
                 let to = to.encode_seek_key()?;
-                assert!(
-                    !S::SHOULD_CACHE,
-                    "Range deletes are incompatible with caching!"
-                );
                 self.db.delete_range_cf(cf_handle, from, to)?;
                 Ok(())
             },
@@ -342,11 +285,6 @@ impl DB {
         opts: ReadOptions,
         direction: ScanDirection,
     ) -> anyhow::Result<SchemaIterator<'_, S>> {
-        assert!(
-            !S::SHOULD_CACHE,
-            "Caching is incompatible with iterators! Cannot iterate over {}",
-            S::COLUMN_FAMILY_NAME
-        );
         let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
         Ok(SchemaIterator::new(
             self.db.raw_iterator_cf_opt(cf_handle, opts),
@@ -382,11 +320,6 @@ impl DB {
         &self,
         direction: ScanDirection,
     ) -> anyhow::Result<RawDbIter<'_>> {
-        assert!(
-            !S::SHOULD_CACHE,
-            "Caching is incompatible with iterators! Cannot iterate over {}",
-            S::COLUMN_FAMILY_NAME
-        );
         let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
         Ok(RawDbIter::new(&self.db, cf_handle, .., direction))
     }
@@ -397,23 +330,45 @@ impl DB {
         range: impl std::ops::RangeBounds<SchemaKey>,
         direction: ScanDirection,
     ) -> anyhow::Result<RawDbIter<'_>> {
-        assert!(
-            !S::SHOULD_CACHE,
-            "Caching is incompatible with iterators! Cannot iterate over {}",
-            S::COLUMN_FAMILY_NAME
-        );
+        self.raw_iter_range_with_decode_fn::<S, (SchemaKey, SchemaValue)>(
+            range,
+            direction,
+            &|(key, value)| (key.to_vec(), value.to_vec()),
+        )
+    }
+
+    /// Get a [`RawDbIter`] in given range and direction.
+    pub(crate) fn raw_iter_range_with_decode_fn<S: Schema, Item>(
+        &self,
+        range: impl std::ops::RangeBounds<SchemaKey>,
+        direction: ScanDirection,
+        decode_fn: DecodeFn<Item>,
+    ) -> anyhow::Result<RawDbIter<'_, Item>> {
+        self.raw_iter_cf_with_decode_fn::<Item>(S::COLUMN_FAMILY_NAME, range, direction, decode_fn)
+    }
+
+    /// Get a [`RawDbIter`] in given range and direction.
+    pub(crate) fn raw_iter_cf_with_decode_fn<Item>(
+        &self,
+        cf_name: &str,
+        range: impl std::ops::RangeBounds<SchemaKey>,
+        direction: ScanDirection,
+        decode_fn: DecodeFn<Item>,
+    ) -> anyhow::Result<RawDbIter<'_, Item>> {
         if is_range_bounds_inverse(&range) {
             tracing::error!("[Rockbound]: error in raw_iter_range: lower_bound > upper_bound");
             anyhow::bail!("[Rockbound]: error in raw_iter_range: lower_bound > upper_bound");
         }
-        let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
-        Ok(RawDbIter::new(&self.db, cf_handle, range, direction))
+        let cf_handle = self.get_cf_handle(cf_name)?;
+        Ok(RawDbIter::new_with_decode_fn(
+            &self.db, cf_handle, range, direction, decode_fn,
+        ))
     }
 
     /// Iterator over a range of keys in a schema, allowing iteration over cached column families. This is only correct if a lock is held to ensure consistency.
     pub(crate) fn iter_range_allow_cached<'a, S: Schema>(
         &'a self,
-        _guard: &parking_lot::RwLockReadGuard<'a, DbCache>,
+        _guard: &parking_lot::RwLockReadGuard<'a, CacheForSchema<S>>,
         range: impl std::ops::RangeBounds<SchemaKey>,
         direction: ScanDirection,
     ) -> anyhow::Result<RawDbIter<'a>> {
@@ -433,21 +388,16 @@ impl DB {
         self.iter_with_direction::<S>(opts, ScanDirection::Forward)
     }
 
-    fn write_schemas_inner(&self, batch: SchemaBatch) -> anyhow::Result<()> {
+    fn write_schemas_inner(&self, batch: &SchemaBatch) -> anyhow::Result<()> {
         let _timer = SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS
             .with_label_values(&[self.name])
             .start_timer();
         // Update the next version to commit if relevant.
         // Block any readers while the DB isn't fully consistent
-        let cache = self.cache.write();
 
         let mut db_batch = rocksdb::WriteBatch::default();
         let mut columns_written = Vec::with_capacity(batch.last_writes.len());
-        for (cf_name, rows) in batch.last_writes.into_iter() {
-            let should_cache = self
-                .cacheable_column_families
-                .iter()
-                .any(|cf| cf == cf_name);
+        for (cf_name, rows) in batch.last_writes.iter() {
             let cf_handle = self.get_cf_handle(cf_name)?;
             let mut write_sizes = Vec::with_capacity(rows.len());
             let mut deletes_for_cf = 0;
@@ -455,16 +405,10 @@ impl DB {
                 match operation {
                     Operation::Put { value } => {
                         write_sizes.push(key.len() + value.len());
-                        db_batch.put_cf(cf_handle, &key, &value);
-                        if should_cache {
-                            cache.insert((cf_name, key), Some(value));
-                        }
+                        db_batch.put_cf(cf_handle, key, value);
                     }
                     Operation::Delete => {
-                        db_batch.delete_cf(cf_handle, &key);
-                        if should_cache {
-                            cache.insert((cf_name, key), None);
-                        }
+                        db_batch.delete_cf(cf_handle, key);
                         deletes_for_cf += 1;
                     }
                     Operation::DeleteRange { .. } => {
@@ -494,8 +438,6 @@ impl DB {
             || self.db.write_opt(db_batch, &default_write_options()),
             "write_schemas::write_opt",
         )?;
-        // Drop the write lock on the cache.
-        drop(cache);
 
         // Bump counters only after DB write succeeds.
         for (cf_name, bytes, deletes) in columns_written {
@@ -524,13 +466,19 @@ impl DB {
 
     #[tracing::instrument(skip_all, level = "error")]
     /// Writes a group of records wrapped in a [`SchemaBatch`].
-    pub fn write_schemas(&self, batch: SchemaBatch) -> anyhow::Result<()> {
+    pub fn write_schemas(&self, batch: &SchemaBatch) -> anyhow::Result<()> {
+        with_error_logging(|| self.write_schemas_inner(batch), "write_schemas")
+    }
+
+    #[tracing::instrument(skip_all, level = "error")]
+    /// Writes a group of records wrapped in a [`SchemaBatch`].
+    pub fn write_versioned_schemas<K, V>(&self, batch: &SchemaBatch) -> anyhow::Result<()> {
         with_error_logging(|| self.write_schemas_inner(batch), "write_schemas")
     }
 
     #[tracing::instrument(skip_all, level = "error")]
     /// Writes a group of records wrapped in a [`SchemaBatch`] asynchronously.
-    pub async fn write_schemas_async(&self, batch: SchemaBatch) -> anyhow::Result<()> {
+    pub async fn write_schemas_async(&self, batch: &SchemaBatch) -> anyhow::Result<()> {
         tokio::task::block_in_place(|| {
             with_error_logging(|| self.write_schemas_inner(batch), "write_schemas_async")
         })
@@ -601,22 +549,12 @@ impl DB {
         tokio::task::block_in_place(|| self.create_checkpoint(path))
     }
 
-    /// Sets the cache size for the DB.
-    #[cfg(feature = "test-utils")]
-    pub fn set_cache_size(&self, estimated_size: usize, weight_capacity: u64) {
-        *self.cache.write() = Cache::with_weighter(estimated_size, weight_capacity, BasicWeighter);
-    }
-
-    /// Returns the number of cache hits.
-    #[cfg(feature = "test-utils")]
-    pub fn cache_hits(&self) -> u64 {
-        self.cache.read().hits()
-    }
-
-    /// Returns the number of cache misses.
-    #[cfg(feature = "test-utils")]
-    pub fn cache_misses(&self) -> u64 {
-        self.cache.read().misses()
+    pub(crate) fn write_opt(
+        &self,
+        batch: rocksdb::WriteBatch,
+        options: &rocksdb::WriteOptions,
+    ) -> Result<(), rocksdb::Error> {
+        self.db.write_opt(batch, options)
     }
 }
 
@@ -639,29 +577,29 @@ pub type SchemaValue = Vec<u8>;
 /// Represents operation written to the database.
 #[cfg_attr(feature = "arbitrary", derive(proptest_derive::Arbitrary))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub enum Operation {
+pub enum Operation<K = SchemaKey, V = SchemaValue> {
     /// Writing a value to the DB.
     Put {
         /// Value to write
-        value: SchemaValue,
+        value: V,
     },
     /// Deleting a value
     Delete,
     /// Deleting a range of values
     DeleteRange {
         /// Start of the range to delete
-        from: SchemaKey,
+        from: K,
         /// End of the range to delete
-        to: SchemaKey,
+        to: K,
     },
 }
 
-impl Operation {
+impl<K, V: AsRef<[u8]>> Operation<K, V> {
     /// Returns [`S::Value`] if the operation is [`Operation::Put`] and `None` if [`Operation::Delete`].
     fn decode_value<S: Schema>(&self) -> anyhow::Result<Option<S::Value>> {
         match self {
             Operation::Put { value } => {
-                let value = S::Value::decode_value(value)?;
+                let value = S::Value::decode_value(value.as_ref())?;
                 Ok(Some(value))
             }
             Operation::Delete | Operation::DeleteRange { .. } => Ok(None),

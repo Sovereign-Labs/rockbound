@@ -8,6 +8,8 @@ use crate::metrics::{SCHEMADB_ITER_BYTES, SCHEMADB_ITER_LATENCY_SECONDS};
 use crate::schema::{KeyDecoder, Schema, ValueCodec};
 use crate::{SchemaKey, SchemaValue};
 
+pub(crate) type DecodeFn<Item> = &'static dyn Fn((&[u8], &[u8])) -> Item;
+
 /// This defines a type that can be used to seek a [`SchemaIterator`], via
 /// interfaces like [`SchemaIterator::seek`]. Mind you, not all
 /// [`KeyEncoder`](crate::schema::KeyEncoder)s shall be [`SeekKeyEncoder`]s, and
@@ -166,10 +168,14 @@ where
 impl<S> FusedIterator for SchemaIterator<'_, S> where S: Schema {}
 
 /// Iterates over given column in [`rocksdb::DB`] using raw types.
-pub(crate) struct RawDbIter<'a> {
+pub(crate) struct RawDbIter<'a, Item = (SchemaKey, SchemaValue)>
+where
+    Item: 'static,
+{
     db_iter: rocksdb::DBRawIterator<'a>,
     direction: ScanDirection,
     upper_bound: std::ops::Bound<SchemaKey>,
+    decode_fn: DecodeFn<Item>,
 }
 
 impl<'a> RawDbIter<'a> {
@@ -178,6 +184,20 @@ impl<'a> RawDbIter<'a> {
         cf_handle: &ColumnFamily,
         range: impl std::ops::RangeBounds<SchemaKey>,
         direction: ScanDirection,
+    ) -> Self {
+        Self::new_with_decode_fn(inner, cf_handle, range, direction, &|(key, value)| {
+            (key.to_vec(), value.to_vec())
+        })
+    }
+}
+
+impl<'a, Item> RawDbIter<'a, Item> {
+    pub(crate) fn new_with_decode_fn(
+        inner: &'a rocksdb::DB,
+        cf_handle: &ColumnFamily,
+        range: impl std::ops::RangeBounds<SchemaKey>,
+        direction: ScanDirection,
+        decode_fn: DecodeFn<Item>,
     ) -> Self {
         if let std::ops::Bound::Excluded(_) = range.start_bound() {
             panic!("Excluded start_bound is not supported");
@@ -230,12 +250,13 @@ impl<'a> RawDbIter<'a> {
             db_iter,
             direction,
             upper_bound: range.end_bound().cloned(),
+            decode_fn,
         }
     }
 }
 
-impl Iterator for RawDbIter<'_> {
-    type Item = (SchemaKey, SchemaValue);
+impl<Item> Iterator for RawDbIter<'_, Item> {
+    type Item = Item;
 
     fn next(&mut self) -> Option<Self::Item> {
         if !self.db_iter.valid() {
@@ -245,11 +266,9 @@ impl Iterator for RawDbIter<'_> {
 
         let next_item = self.db_iter.item().expect("db_iter.key() failed.");
         // Have to allocate to fix lifetime issue
-        let next_item = (next_item.0.to_vec(), next_item.1.to_vec());
-
         // If next item is larger than upper bound, we're done
         if let std::ops::Bound::Included(upper) = self.upper_bound.as_ref() {
-            if &next_item.0 > upper {
+            if next_item.0 > upper.as_slice() {
                 // That we're moving forward!!!
                 assert_eq!(
                     &ScanDirection::Forward,
@@ -259,6 +278,7 @@ impl Iterator for RawDbIter<'_> {
                 return None;
             }
         }
+        let next_item = (self.decode_fn)(next_item);
 
         match self.direction {
             ScanDirection::Forward => self.db_iter.next(),
