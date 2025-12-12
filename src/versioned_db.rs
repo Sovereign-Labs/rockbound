@@ -57,10 +57,7 @@ impl VersionedTableMetadataKey {
 
     /// Encodes the key into a byte vector.
     pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
-        Ok(match self {
-            VersionedTableMetadataKey::CommittedVersion => COMMITTED_VERSION.to_vec(),
-            VersionedTableMetadataKey::PrunedVersion => PRUNED_VERSION.to_vec(),
-        })
+        Ok(self.as_bytes().to_vec())
     }
 
     /// Decodes the key from a byte vector.

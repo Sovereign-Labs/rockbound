@@ -169,7 +169,6 @@ impl DB {
                 let _timer = SCHEMADB_GET_LATENCY_SECONDS
                     .with_label_values(&[cf_name])
                     .start_timer();
-                // println!("Getting raw value for key: {:?} from cf: {}", encoded_schema_key, cf_name);
 
                 let cf_handle = self.get_cf_handle(cf_name)?;
                 let result = self.db.get_pinned_cf(cf_handle, encoded_schema_key)?;
