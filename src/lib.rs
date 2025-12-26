@@ -388,17 +388,18 @@ impl DB {
         self.iter_with_direction::<S>(opts, ScanDirection::Forward)
     }
 
-    fn write_schemas_inner(&self, batch: &SchemaBatch) -> anyhow::Result<()> {
-        let _timer = SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS
-            .with_label_values(&[self.name])
-            .start_timer();
+    /// TODO
+    pub fn update_db_batch_no_metrics(
+        db_batch: &mut rocksdb::WriteBatch,
+        batch: &SchemaBatch,
+        db: &DB,
+    ) -> anyhow::Result<Vec<(&'static str, Vec<usize>, u64)>> {
         // Update the next version to commit if relevant.
         // Block any readers while the DB isn't fully consistent
 
-        let mut db_batch = rocksdb::WriteBatch::default();
         let mut columns_written = Vec::with_capacity(batch.last_writes.len());
         for (cf_name, rows) in batch.last_writes.iter() {
-            let cf_handle = self.get_cf_handle(cf_name)?;
+            let cf_handle = db.get_cf_handle(cf_name)?;
             let mut write_sizes = Vec::with_capacity(rows.len());
             let mut deletes_for_cf = 0;
             for (key, operation) in rows {
@@ -416,10 +417,10 @@ impl DB {
                     }
                 }
             }
-            columns_written.push((cf_name, write_sizes, deletes_for_cf));
+            columns_written.push((*cf_name, write_sizes, deletes_for_cf));
         }
         for (cf_name, operations) in batch.range_ops.iter() {
-            let cf_handle = self.get_cf_handle(cf_name)?;
+            let cf_handle = db.get_cf_handle(cf_name)?;
             for operation in operations {
                 match operation {
                     Operation::DeleteRange { from, to } => {
@@ -432,6 +433,18 @@ impl DB {
                 }
             }
         }
+
+        Ok(columns_written)
+    }
+
+    fn write_schemas_inner(&self, batch: &SchemaBatch) -> anyhow::Result<()> {
+        let _timer = SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS
+            .with_label_values(&[self.name])
+            .start_timer();
+
+        let mut db_batch = rocksdb::WriteBatch::default();
+        let columns_written = Self::update_db_batch_no_metrics(&mut db_batch, batch, self)?;
+
         let serialized_size = db_batch.size_in_bytes();
 
         with_error_logging(
