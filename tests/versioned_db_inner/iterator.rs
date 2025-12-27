@@ -7,12 +7,12 @@ use std::sync::Arc;
 
 use rockbound::versioned_db::{VersionedDB, VersionedDeltaReader, VersionedSchemaBatch};
 
-use crate::versioned_db_inner::{commit_batch, put_keys, TestDB};
+use crate::versioned_db_inner::{commit_batch, put_keys, TestDB, VersionedDbCache};
 
 use super::{LiveKeys, TestField, TestKey};
 
 fn check_iterator(
-    delta_reader: &VersionedDeltaReader<LiveKeys>,
+    delta_reader: &VersionedDeltaReader<LiveKeys, VersionedDbCache<LiveKeys>>,
     prefix: &[u8],
     expected_values: &[(&[u8], u32)],
 ) {
@@ -52,13 +52,25 @@ fn check_iterator(
 fn test_iteration() {
     let test_db = TestDB::new();
     let db = Arc::new(test_db.db);
-    let versioned_db =
-        Arc::new(VersionedDB::<LiveKeys>::from_dbs(db.clone(), db.clone(), 10_000).unwrap());
+
+    let versioned_db_cache = VersionedDbCache::new(10_000);
+    let versioned_db = Arc::new(
+        VersionedDB::<LiveKeys, VersionedDbCache<LiveKeys>>::from_dbs(
+            db.clone(),
+            db.clone(),
+            versioned_db_cache,
+        )
+        .unwrap(),
+    );
 
     // Check iteration against an empty DB.
     let version = versioned_db.get_committed_version().unwrap();
     assert_eq!(version, None);
-    let delta_reader = VersionedDeltaReader::<LiveKeys>::new(versioned_db.clone(), None, vec![]);
+    let delta_reader = VersionedDeltaReader::<LiveKeys, VersionedDbCache<LiveKeys>>::new(
+        versioned_db.clone(),
+        None,
+        vec![],
+    );
     let mut iter = delta_reader
         .iter_with_prefix(TestKey::from(b"key".to_vec()))
         .unwrap();
@@ -72,7 +84,11 @@ fn test_iteration() {
     );
 
     // Check iteration against prefixes "key". and key1
-    let delta_reader = VersionedDeltaReader::<LiveKeys>::new(versioned_db.clone(), Some(0), vec![]);
+    let delta_reader = VersionedDeltaReader::<LiveKeys, VersionedDbCache<LiveKeys>>::new(
+        versioned_db.clone(),
+        Some(0),
+        vec![],
+    );
     check_iterator(
         &delta_reader,
         b"key",
@@ -86,8 +102,11 @@ fn test_iteration() {
 
     let snapshot_1 = Arc::new(snapshot);
     let mut snapshots = vec![snapshot_1.clone()];
-    let delta_reader =
-        VersionedDeltaReader::<LiveKeys>::new(versioned_db.clone(), Some(0), snapshots.clone());
+    let delta_reader = VersionedDeltaReader::<LiveKeys, VersionedDbCache<LiveKeys>>::new(
+        versioned_db.clone(),
+        Some(0),
+        snapshots.clone(),
+    );
     check_iterator(
         &delta_reader,
         b"key",
@@ -105,8 +124,11 @@ fn test_iteration() {
     let snapshot_2 = Arc::new(snapshot_2);
     snapshots.push(snapshot_2.clone());
 
-    let delta_reader =
-        VersionedDeltaReader::<LiveKeys>::new(versioned_db.clone(), Some(0), snapshots.clone());
+    let delta_reader = VersionedDeltaReader::<LiveKeys, VersionedDbCache<LiveKeys>>::new(
+        versioned_db.clone(),
+        Some(0),
+        snapshots.clone(),
+    );
     check_iterator(
         &delta_reader,
         b"key",
@@ -147,10 +169,21 @@ fn test_iteration() {
 fn test_open_iterator_blocks_writes() {
     let test_db = TestDB::new();
     let db = Arc::new(test_db.db);
-    let versioned_db =
-        Arc::new(VersionedDB::<LiveKeys>::from_dbs(db.clone(), db.clone(), 0).unwrap());
+    let versioned_db_cache = VersionedDbCache::new(0);
+    let versioned_db = Arc::new(
+        VersionedDB::<LiveKeys, VersionedDbCache<LiveKeys>>::from_dbs(
+            db.clone(),
+            db.clone(),
+            versioned_db_cache,
+        )
+        .unwrap(),
+    );
 
-    let delta_reader = VersionedDeltaReader::<LiveKeys>::new(versioned_db.clone(), None, vec![]);
+    let delta_reader = VersionedDeltaReader::<LiveKeys, VersionedDbCache<LiveKeys>>::new(
+        versioned_db.clone(),
+        None,
+        vec![],
+    );
 
     let mut iter = delta_reader
         .iter_with_prefix(TestKey::from(b"key".to_vec()))

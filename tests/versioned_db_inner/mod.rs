@@ -4,12 +4,14 @@ mod iterator;
 
 use std::sync::Arc;
 
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rockbound::schema::{ColumnFamilyName, KeyDecoder, KeyEncoder, Schema, ValueCodec};
 use rockbound::versioned_db::{
-    HasPrefix, SchemaWithVersion, VersionedDB, VersionedSchemaBatch, VersionedSchemaKeyMarker,
+    CacheForVersionedDB, HasPrefix, SchemaWithVersion, VersionedDB, VersionedSchemaBatch,
+    VersionedSchemaKeyMarker,
 };
-use rockbound::DB;
-use rockbound::{default_cf_descriptor, CodecError};
+use rockbound::{default_cf_descriptor, new_cache_for_schema, CodecError};
+use rockbound::{CacheForSchema, DB};
 use rocksdb::DEFAULT_COLUMN_FAMILY_NAME;
 use tempfile::TempDir;
 
@@ -178,14 +180,18 @@ impl HasPrefix<TestKey> for TestKey {
 }
 
 fn commit_batch(
-    versioned_db: &VersionedDB<LiveKeys>,
+    versioned_db: &VersionedDB<LiveKeys, VersionedDbCache<LiveKeys>>,
     batch: &VersionedSchemaBatch<LiveKeys>,
     version: u64,
 ) {
     versioned_db.commit(batch, version).unwrap();
 }
 
-fn put_keys(versioned_db: &VersionedDB<LiveKeys>, keys: &[(&[u8], u32)], version: u64) {
+fn put_keys(
+    versioned_db: &VersionedDB<LiveKeys, VersionedDbCache<LiveKeys>>,
+    keys: &[(&[u8], u32)],
+    version: u64,
+) {
     let mut batch = VersionedSchemaBatch::<LiveKeys>::default();
     for (key, value) in keys {
         batch.put_versioned(TestKey::from(key.to_vec()), TestField::new(*value));
@@ -206,7 +212,11 @@ fn put_keys(versioned_db: &VersionedDB<LiveKeys>, keys: &[(&[u8], u32)], version
     }
 }
 
-fn delete_keys(versioned_db: &VersionedDB<LiveKeys>, keys: &[&[u8]], version: u64) {
+fn delete_keys(
+    versioned_db: &VersionedDB<LiveKeys, VersionedDbCache<LiveKeys>>,
+    keys: &[&[u8]],
+    version: u64,
+) {
     let mut batch = VersionedSchemaBatch::<LiveKeys>::default();
     for key in keys {
         batch.delete_versioned(TestKey::from(key.to_vec()));
@@ -221,5 +231,40 @@ fn delete_keys(versioned_db: &VersionedDB<LiveKeys>, keys: &[&[u8]], version: u6
             versioned_db.get_historical_value(&key, version).unwrap(),
             None,
         );
+    }
+}
+
+/// Cache for versioned db;
+#[derive(Debug, Clone)]
+pub struct VersionedDbCache<S: SchemaWithVersion> {
+    cache: Arc<RwLock<CacheForSchema<S>>>,
+}
+
+impl<S: SchemaWithVersion> VersionedDbCache<S>
+where
+    S::Key: Ord + Clone + std::hash::Hash + AsRef<[u8]>,
+    S::Value: Clone + AsRef<[u8]>,
+    S: Ord,
+{
+    pub fn new(cache_size: usize) -> Self {
+        let cache = RwLock::new(new_cache_for_schema::<S>(cache_size));
+        Self {
+            cache: cache.into(),
+        }
+    }
+}
+
+impl CacheForVersionedDB<LiveKeys> for VersionedDbCache<LiveKeys> {
+    fn write(&self) -> parking_lot::MappedRwLockWriteGuard<'_, CacheForSchema<LiveKeys>> {
+        RwLockWriteGuard::map(self.cache.write(), |c| c)
+    }
+
+    fn read(&self) -> parking_lot::MappedRwLockReadGuard<'_, CacheForSchema<LiveKeys>> {
+        RwLockReadGuard::map(self.cache.read(), |c| c)
+    }
+
+    fn try_read(&self) -> Option<parking_lot::MappedRwLockReadGuard<'_, CacheForSchema<LiveKeys>>> {
+        let lock = self.cache.try_read()?;
+        Some(RwLockReadGuard::map(lock, |c| c))
     }
 }

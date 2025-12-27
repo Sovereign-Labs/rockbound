@@ -52,10 +52,26 @@ use crate::{
 };
 use crate::{iterator::RawDbIter, schema::KeyEncoder};
 
-type CacheForSchema<S> = Cache<<S as Schema>::Key, Option<<S as Schema>::Value>, BasicWeighter>;
+/// Cache for `Schema`
+pub type CacheForSchema<S> = Cache<<S as Schema>::Key, Option<<S as Schema>::Value>, BasicWeighter>;
 
+/// Constructor for CacheForSchema.
+pub fn new_cache_for_schema<S>(cache_size: usize) -> CacheForSchema<S>
+where
+    S::Key: Ord + Clone + std::hash::Hash + AsRef<[u8]>,
+    S::Value: Clone + AsRef<[u8]>,
+    S: Schema + Ord,
+{
+    CacheForSchema::<S>::with_weighter(
+        cache_size / (80 + 400 + 56),
+        cache_size as u64,
+        BasicWeighter,
+    )
+}
+
+/// BasicWeighter for CacheForSchema.
 #[derive(Clone, Debug)]
-struct BasicWeighter;
+pub struct BasicWeighter;
 
 impl<K: AsRef<[u8]>, V: AsRef<[u8]>> Weighter<K, Option<V>> for BasicWeighter {
     fn weight(&self, key: &K, value: &Option<V>) -> u64 {
@@ -368,7 +384,7 @@ impl DB {
     /// Iterator over a range of keys in a schema, allowing iteration over cached column families. This is only correct if a lock is held to ensure consistency.
     pub(crate) fn iter_range_allow_cached<'a, S: Schema>(
         &'a self,
-        _guard: &parking_lot::RwLockReadGuard<'a, CacheForSchema<S>>,
+        _guard: &parking_lot::MappedRwLockReadGuard<'a, CacheForSchema<S>>,
         range: impl std::ops::RangeBounds<SchemaKey>,
         direction: ScanDirection,
     ) -> anyhow::Result<RawDbIter<'a>> {
@@ -388,17 +404,17 @@ impl DB {
         self.iter_with_direction::<S>(opts, ScanDirection::Forward)
     }
 
-    /// TODO
-    pub fn update_db_batch_no_metrics(
+    /// Populates the `db_batch` using data from `schema_batch` and returns the associated metrics.
+    pub fn update_db_batch_with_schema_data(
         db_batch: &mut rocksdb::WriteBatch,
-        batch: &SchemaBatch,
+        schema_batch: &SchemaBatch,
         db: &DB,
     ) -> anyhow::Result<Vec<(&'static str, Vec<usize>, u64)>> {
         // Update the next version to commit if relevant.
         // Block any readers while the DB isn't fully consistent
 
-        let mut columns_written = Vec::with_capacity(batch.last_writes.len());
-        for (cf_name, rows) in batch.last_writes.iter() {
+        let mut columns_written = Vec::with_capacity(schema_batch.last_writes.len());
+        for (cf_name, rows) in schema_batch.last_writes.iter() {
             let cf_handle = db.get_cf_handle(cf_name)?;
             let mut write_sizes = Vec::with_capacity(rows.len());
             let mut deletes_for_cf = 0;
@@ -419,7 +435,7 @@ impl DB {
             }
             columns_written.push((*cf_name, write_sizes, deletes_for_cf));
         }
-        for (cf_name, operations) in batch.range_ops.iter() {
+        for (cf_name, operations) in schema_batch.range_ops.iter() {
             let cf_handle = db.get_cf_handle(cf_name)?;
             for operation in operations {
                 match operation {
@@ -437,20 +453,26 @@ impl DB {
         Ok(columns_written)
     }
 
+    /// Writes `db_batch` to disk.
+    pub fn write_db_batch(&self, db_batch: rocksdb::WriteBatch) -> anyhow::Result<()> {
+        with_error_logging(
+            || self.write_opt(db_batch, &default_write_options()),
+            "write_schemas::write_opt",
+        )?;
+
+        Ok(())
+    }
+
     fn write_schemas_inner(&self, batch: &SchemaBatch) -> anyhow::Result<()> {
         let _timer = SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS
             .with_label_values(&[self.name])
             .start_timer();
 
         let mut db_batch = rocksdb::WriteBatch::default();
-        let columns_written = Self::update_db_batch_no_metrics(&mut db_batch, batch, self)?;
+        let columns_written = Self::update_db_batch_with_schema_data(&mut db_batch, batch, self)?;
 
         let serialized_size = db_batch.size_in_bytes();
-
-        with_error_logging(
-            || self.db.write_opt(db_batch, &default_write_options()),
-            "write_schemas::write_opt",
-        )?;
+        Self::write_db_batch(self, db_batch)?;
 
         // Bump counters only after DB write succeeds.
         for (cf_name, bytes, deletes) in columns_written {
