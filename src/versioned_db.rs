@@ -10,7 +10,7 @@ use std::{
 };
 
 use anyhow::bail;
-use parking_lot::{RwLock, RwLockReadGuard};
+use parking_lot::{MappedRwLockReadGuard, MappedRwLockWriteGuard};
 use quick_cache::sync::Cache;
 use rocksdb::ColumnFamilyDescriptor;
 
@@ -22,8 +22,9 @@ use crate::{
         SCHEMADB_PUT_BYTES,
     },
     schema::{ColumnFamilyName, KeyDecoder, KeyEncoder, ValueCodec},
-    with_error_logging, BasicWeighter, CodecError, Schema, DB,
+    with_error_logging, BasicWeighter, CacheForSchema, CodecError, Schema, DB,
 };
+
 #[derive(Debug, Default)]
 pub(crate) struct VersionMetadata;
 
@@ -114,6 +115,18 @@ impl ValueCodec<VersionMetadata> for u64 {
     }
 }
 
+/// Cache for [`VersionedDB`].
+pub trait CacheForVersionedDB<V: SchemaWithVersion> {
+    /// Write lock.
+    fn write(&self) -> MappedRwLockWriteGuard<'_, CacheForSchema<V>>;
+
+    /// Read lock.
+    fn read(&self) -> MappedRwLockReadGuard<'_, CacheForSchema<V>>;
+
+    /// Attempt read lock.
+    fn try_read(&self) -> Option<MappedRwLockReadGuard<'_, CacheForSchema<V>>>;
+}
+
 /// A versioned DB is a DB that stores data in a versioned column family.
 ///
 /// Suppose the caller wants a versioned map from SlotKey to SlotValue. The implementation will generate several tables:
@@ -140,7 +153,7 @@ impl ValueCodec<VersionMetadata> for u64 {
 /// On each read, the implementation will:
 /// - Read from the live column family
 #[derive(Debug)]
-pub struct VersionedDB<S: SchemaWithVersion> {
+pub struct VersionedDB<S: SchemaWithVersion, C: CacheForVersionedDB<S>> {
     /// Holds the live state and the committed versions metadata.
     ///
     /// # Warning
@@ -152,7 +165,7 @@ pub struct VersionedDB<S: SchemaWithVersion> {
     live_db: Arc<DB>,
     /// Holds *only* the archival and pruning data, inluding pruned version metadata.
     archival_db: Arc<DB>,
-    cache: RwLock<Cache<S::Key, Option<S::Value>, BasicWeighter>>,
+    versioned_db_cache: C,
     // The number of the *lowest* version that is guaranteed to be available in the live db. We increment this value when we *start* committing to the database,
     // so the cache may not be valid for versions below this value.
     committed_archival_version: AtomicU64,
@@ -168,7 +181,7 @@ fn decode_version_metadata_value(data: &[u8]) -> Result<u64, CodecError> {
     })?))
 }
 
-impl<S: SchemaWithVersion> VersionedDB<S>
+impl<S: SchemaWithVersion, C: CacheForVersionedDB<S>> VersionedDB<S, C>
 // This where clause shouldn't be needed since it's implied by the Schema trait, but Rust intentionally doesn't elaborate these bounds.
 {
     /// Returns the oldest version that is available in the database.
@@ -191,23 +204,24 @@ impl<S: SchemaWithVersion> VersionedDB<S>
     /// Sets the cache size for the DB.
     #[cfg(feature = "test-utils")]
     pub fn set_cache_size(&self, estimated_size: usize, weight_capacity: u64) {
-        *self.cache.write() = Cache::with_weighter(estimated_size, weight_capacity, BasicWeighter);
+        *self.versioned_db_cache.write() =
+            Cache::with_weighter(estimated_size, weight_capacity, BasicWeighter);
     }
 
     /// Returns the number of cache hits.
     #[cfg(feature = "test-utils")]
     pub fn cache_hits(&self) -> u64 {
-        self.cache.read().hits()
+        self.versioned_db_cache.read().hits()
     }
 
     /// Returns the number of cache misses.
     #[cfg(feature = "test-utils")]
     pub fn cache_misses(&self) -> u64 {
-        self.cache.read().misses()
+        self.versioned_db_cache.read().misses()
     }
 }
 
-impl<S: SchemaWithVersion> VersionedDB<S> {
+impl<S: SchemaWithVersion, C: CacheForVersionedDB<S>> VersionedDB<S, C> {
     /// Returns a reference to the live database.
     pub fn live_db(&self) -> &DB {
         &self.live_db
@@ -366,13 +380,19 @@ impl KeyWithVersionPrefixAndSuffix {
     }
 }
 
-impl<V: SchemaWithVersion> VersionedDB<V>
+impl<V: SchemaWithVersion, C: CacheForVersionedDB<V>> VersionedDB<V, C>
 where
     // VersionedTableMetadataKey: KeyCodec<V::VersionMetadatacolumn>,
     V::Key: Ord + Clone + std::hash::Hash + AsRef<[u8]>,
     V::Value: Clone + AsRef<[u8]>,
     V: Ord,
 {
+    /// Stores version in `committed_archival_version`.
+    pub fn store_committed_archival_version(&self, version: u64) {
+        self.committed_archival_version
+            .store(version, Ordering::Release);
+    }
+
     /// Adds the column families for the versioned schema to the existing column families.
     pub fn add_column_families(
         existing_column_families: &mut Vec<ColumnFamilyDescriptor>,
@@ -403,25 +423,18 @@ where
     }
 
     /// Creates a new versioned DB from an existing DB.
-    // Cache size estimation: we want to allocate about 1GB for cache. Estimate that slot keys are about 80 bytes and slot values
-    // are around 400 bytes + 56 bytes of overhead on the stack (see weighter). Multiply by 1.5 to account for overhead (per quick-cache docs).
-    // That gives estimated item capacity of 1GB / (80 + 400 + 56) * 1.5 ~= 1.2M.
     pub fn from_dbs(
         live_db: Arc<DB>,
         archival_db: Arc<DB>,
-        cache_size: usize,
+        versioned_db_cache: C,
     ) -> anyhow::Result<Self> {
-        let cache = RwLock::new(Cache::with_weighter(
-            cache_size / (80 + 400 + 56),
-            cache_size as u64,
-            BasicWeighter,
-        ));
         let version = Self::load_committed_version_from_disk(&live_db)?;
         let committed_archival_version = AtomicU64::new(version.unwrap_or(u64::MAX));
+
         Ok(Self {
             live_db,
             archival_db,
-            cache,
+            versioned_db_cache,
             committed_archival_version,
             _schema: Default::default(),
         })
@@ -431,7 +444,7 @@ where
     pub fn iter_pruning_keys_up_to_version(
         &self,
         version: u64,
-    ) -> anyhow::Result<impl Iterator<Item = PrunableKey<V>> + use<'_, V>> {
+    ) -> anyhow::Result<impl Iterator<Item = PrunableKey<V>> + use<'_, V, C>> {
         // Because some keys are longer than 8 bytes, we use an exclusive range
         let first_version_to_keep = version.saturating_add(1);
         let range = ..first_version_to_keep.to_be_bytes().to_vec();
@@ -469,7 +482,7 @@ where
 
     /// Returns the value of a key in the live column family.
     pub fn get_live_value(&self, key: &V::Key) -> anyhow::Result<Option<V::Value>> {
-        let lock = self.cache.try_read();
+        let lock = self.versioned_db_cache.try_read();
         if let Some(cache) = lock.as_ref() {
             let cache_result = cache.get(key);
             if let Some(result) = cache_result {
@@ -499,18 +512,16 @@ where
         Some(value)
     }
 
-    /// Commits a batch of versioned writes to the database.
-    pub fn commit(&self, batch: &VersionedSchemaBatch<V>, version: u64) -> anyhow::Result<()>
-    where
-        V::Value: AsRef<[u8]>,
-        V::Key: AsRef<[u8]>,
-    {
-        let _timer = SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS
-            .with_label_values(&[self.live_db.name()])
-            .start_timer();
-        // Update the next version to commit if relevant.
-        // Block any readers while the DB isn't fully consistent
-        let cache = self.cache.write();
+    /// Populates the `live_db_batch & archival_db_batch` using data from `batch` and returns the associated metrics.
+    pub fn update_verioned_db_batch(
+        live_db_batch: &mut rocksdb::WriteBatch,
+        archival_db_batch: &mut rocksdb::WriteBatch,
+        batch: &VersionedSchemaBatch<V>,
+        version: u64,
+        cache: &CacheForSchema<V>,
+        live_db: &DB,
+        archival_db: &DB,
+    ) -> anyhow::Result<VersionedDbMetrics> {
         // Optimization:
         // At various times we need the key *prefixed* with the version (for pruning), on its own (for live reads), and suffixed with the version (for archival reads).
         // To reduce allocations and memcopies, we create a single vector [version || key || version] and use it for all three cases, simply slicing the relevant subset.
@@ -519,19 +530,10 @@ where
 
         let mut key_with_version = KeyWithVersionPrefixAndSuffix::new(version);
 
-        // Create batches and column families
-        let mut live_db_batch = rocksdb::WriteBatch::default();
-        let mut archival_db_batch = rocksdb::WriteBatch::default();
-        let live_cf_handle = self.live_db.get_cf_handle(V::COLUMN_FAMILY_NAME)?;
-        let archival_cf_handle = self
-            .archival_db
-            .get_cf_handle(V::HISTORICAL_COLUMN_FAMILY_NAME)?;
-        let pruning_cf_handle = self
-            .archival_db
-            .get_cf_handle(V::PRUNING_COLUMN_FAMILY_NAME)?;
-        let metadata_cf_handle = self
-            .live_db
-            .get_cf_handle(V::VERSION_METADATA_COLUMN_FAMILY_NAME)?;
+        let live_cf_handle = live_db.get_cf_handle(V::COLUMN_FAMILY_NAME)?;
+        let archival_cf_handle = archival_db.get_cf_handle(V::HISTORICAL_COLUMN_FAMILY_NAME)?;
+        let pruning_cf_handle = archival_db.get_cf_handle(V::PRUNING_COLUMN_FAMILY_NAME)?;
+        let metadata_cf_handle = live_db.get_cf_handle(V::VERSION_METADATA_COLUMN_FAMILY_NAME)?;
 
         //  Keys for metrics
         let mut live_put_bytes = 0;
@@ -580,52 +582,91 @@ where
             version.to_be_bytes(),
         );
 
+        Ok(VersionedDbMetrics {
+            live_put_bytes,
+            deletes,
+            archival_puts_bytes,
+            pruning_puts_bytes,
+        })
+    }
+
+    /// Updates `VersionedDbMetrics`
+    pub fn update_metrics(
+        &self,
+        metrics: VersionedDbMetrics,
+        serialized_size: usize,
+        archival_serialized_size: usize,
+    ) {
+        SCHEMADB_PUT_BYTES
+            .with_label_values(&[V::COLUMN_FAMILY_NAME])
+            .observe(metrics.live_put_bytes as f64);
+        SCHEMADB_DELETES
+            .with_label_values(&[V::COLUMN_FAMILY_NAME])
+            .inc_by(metrics.deletes as u64);
+        SCHEMADB_PUT_BYTES
+            .with_label_values(&[V::HISTORICAL_COLUMN_FAMILY_NAME])
+            .observe(metrics.archival_puts_bytes as f64);
+        SCHEMADB_PUT_BYTES
+            .with_label_values(&[V::PRUNING_COLUMN_FAMILY_NAME])
+            .observe(metrics.pruning_puts_bytes as f64);
+
+        SCHEMADB_BATCH_COMMIT_BYTES
+            .with_label_values(&[self.live_db.name()])
+            .observe(serialized_size as f64);
+
+        SCHEMADB_BATCH_COMMIT_BYTES
+            .with_label_values(&[self.archival_db.name()])
+            .observe(archival_serialized_size as f64);
+    }
+
+    /// Commits a batch of versioned writes to the database.
+    pub fn commit(&self, batch: &VersionedSchemaBatch<V>, version: u64) -> anyhow::Result<()>
+    where
+        V::Value: AsRef<[u8]>,
+        V::Key: AsRef<[u8]>,
+    {
+        let _timer = SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS
+            .with_label_values(&[self.live_db.name()])
+            .start_timer();
+        // Update the next version to commit if relevant.
+        // Block any readers while the DB isn't fully consistent
+        let cache = self.versioned_db_cache.write();
+
+        let mut live_db_batch = rocksdb::WriteBatch::default();
+        let mut archival_db_batch = rocksdb::WriteBatch::default();
+
+        let live_db = &self.live_db;
+        let archival_db = &self.archival_db;
+
+        let metrics = Self::update_verioned_db_batch(
+            &mut live_db_batch,
+            &mut archival_db_batch,
+            batch,
+            version,
+            &cache,
+            live_db,
+            archival_db,
+        )?;
+
         let serialized_size = live_db_batch.size_in_bytes() + archival_db_batch.size_in_bytes();
         let archival_serialized_size = archival_db_batch.size_in_bytes();
         with_error_logging(
-            || {
-                self.archival_db
-                    .write_opt(archival_db_batch, &default_write_options())
-            },
+            || archival_db.write_opt(archival_db_batch, &default_write_options()),
             "write_versioned_schemas::write_archival_opt",
         )?;
 
         // Danger: This function is coupled with `get_historical_value`. That function assumes that if hte
-        self.committed_archival_version
-            .store(version, Ordering::Release);
+        self.store_committed_archival_version(version);
 
         with_error_logging(
-            || {
-                self.live_db
-                    .write_opt(live_db_batch, &default_write_options())
-            },
+            || live_db.write_opt(live_db_batch, &default_write_options()),
             "write_versioned_schemas::write_live_opt",
         )?;
-        // Drop the write lock on the cache.
+
         drop(cache);
 
-        // Track metrics after the writes succeed
-        {
-            SCHEMADB_PUT_BYTES
-                .with_label_values(&[V::COLUMN_FAMILY_NAME])
-                .observe(live_put_bytes as f64);
-            SCHEMADB_DELETES
-                .with_label_values(&[V::COLUMN_FAMILY_NAME])
-                .inc_by(deletes);
-            SCHEMADB_PUT_BYTES
-                .with_label_values(&[V::HISTORICAL_COLUMN_FAMILY_NAME])
-                .observe(archival_puts_bytes as f64);
-            SCHEMADB_PUT_BYTES
-                .with_label_values(&[V::PRUNING_COLUMN_FAMILY_NAME])
-                .observe(pruning_puts_bytes as f64);
-
-            SCHEMADB_BATCH_COMMIT_BYTES
-                .with_label_values(&[self.live_db.name()])
-                .observe(serialized_size as f64);
-            SCHEMADB_BATCH_COMMIT_BYTES
-                .with_label_values(&[self.archival_db.name()])
-                .observe(archival_serialized_size as f64);
-        }
+        // Track metrics after the writes succeed.
+        self.update_metrics(metrics, serialized_size, archival_serialized_size);
 
         Ok(())
     }
@@ -716,17 +757,25 @@ where
     }
 }
 
+#[allow(missing_docs)]
+pub struct VersionedDbMetrics {
+    pub live_put_bytes: usize,
+    pub deletes: usize,
+    pub archival_puts_bytes: usize,
+    pub pruning_puts_bytes: usize,
+}
+
 #[derive(Debug, Clone)]
 /// A reader for a versioned schema.
-pub struct VersionedDeltaReader<V: SchemaWithVersion> {
-    db: Arc<VersionedDB<V>>,
+pub struct VersionedDeltaReader<V: SchemaWithVersion, C: CacheForVersionedDB<V>> {
+    db: Arc<VersionedDB<V, C>>,
     // The version of the underlying DB at the time this snapshot was taken.
     base_version: Option<u64>,
     // The snapshots to include in the reader, ordered from newest to oldest.
     snapshots: Vec<Arc<VersionedSchemaBatch<V>>>,
 }
 
-impl<V: SchemaWithVersion> VersionedDeltaReader<V>
+impl<V: SchemaWithVersion, C: CacheForVersionedDB<V>> VersionedDeltaReader<V, C>
 where
     V::Key: Eq,
     V::Value: Clone,
@@ -735,7 +784,7 @@ where
     ///
     /// Note that the snapshots are ordered from oldest to newest
     pub fn new(
-        db: Arc<VersionedDB<V>>,
+        db: Arc<VersionedDB<V, C>>,
         base_version: Option<u64>,
         mut snapshots: Vec<Arc<VersionedSchemaBatch<V>>>,
     ) -> Self {
@@ -774,7 +823,7 @@ pub struct VersionedDbIterator<'a, V: SchemaWithVersion> {
     //  - Concurrent thread writes:: Key1 -> B, Key2 -> B
     //  - Iterator reads: Key2 -> B,
     // Now the caller sees a state of the world which never existed where Key1 -> A and Key2 -> B.
-    _read_lock: RwLockReadGuard<'a, Cache<V::Key, Option<V::Value>, BasicWeighter>>,
+    _read_lock: MappedRwLockReadGuard<'a, Cache<V::Key, Option<V::Value>, BasicWeighter>>,
     // Borrow the snapshots to keep the lifetimes tied together. We could clone, but this makes it easier to reason about.
     snapshots: Vec<MaybePeekableBtreeMapRange<'a, V::Key, Option<V::Value>>>,
     db_iterator: Option<Peekable<RawDbIter<'a>>>,
@@ -912,7 +961,7 @@ where
     }
 }
 
-impl<V: SchemaWithVersion> VersionedDeltaReader<V>
+impl<V: SchemaWithVersion, C: CacheForVersionedDB<V>> VersionedDeltaReader<V, C>
 where
     V::Value: Clone + AsRef<[u8]>,
     V: Ord,
@@ -922,7 +971,7 @@ where
     ///
     /// Note that the returned iterator holds a read lock over the DB, so no writes can complete while it is active.
     pub fn iter_with_prefix(&self, prefix: V::Key) -> anyhow::Result<VersionedDbIterator<'_, V>> {
-        let read_lock = self.db.cache.read();
+        let read_lock = self.db.versioned_db_cache.read();
         let version_on_disk = self.db.get_committed_version()?;
         // println!("Version on disk: {:?}", version_on_disk);
         let raw_prefix = prefix.clone()..;

@@ -7,12 +7,12 @@ use std::sync::Arc;
 
 use rockbound::versioned_db::{VersionedDB, VersionedDeltaReader, VersionedSchemaBatch};
 
-use crate::versioned_db_inner::{commit_batch, put_keys, TestDB};
+use crate::versioned_db_inner::{commit_batch, put_keys, TestDB, VersionedDbCache};
 
 use super::{LiveKeys, TestField, TestKey};
 
 fn check_keys(
-    delta_reader: &VersionedDeltaReader<LiveKeys>,
+    delta_reader: &VersionedDeltaReader<LiveKeys, VersionedDbCache<LiveKeys>>,
     expected_values: &[(&[u8], Option<u32>)],
 ) {
     for (key, expected_value) in expected_values {
@@ -35,8 +35,15 @@ fn check_keys(
 fn test_delta_reader_consistency_single_threaded() {
     let test_db = TestDB::new();
     let db = Arc::new(test_db.db);
-    let versioned_db =
-        Arc::new(VersionedDB::<LiveKeys>::from_dbs(db.clone(), db.clone(), 10_000).unwrap());
+    let versioned_db_cache = VersionedDbCache::new(10_000);
+    let versioned_db = Arc::new(
+        VersionedDB::<LiveKeys, VersionedDbCache<LiveKeys>>::from_dbs(
+            db.clone(),
+            db.clone(),
+            versioned_db_cache,
+        )
+        .unwrap(),
+    );
 
     // Check iteration against an empty DB.
     let version = versioned_db.get_committed_version().unwrap();
@@ -47,7 +54,11 @@ fn test_delta_reader_consistency_single_threaded() {
         &[(b"key11", 0), (b"key19", 0), (b"key20", 0)],
         0,
     );
-    let delta_reader = VersionedDeltaReader::<LiveKeys>::new(versioned_db.clone(), Some(0), vec![]);
+    let delta_reader = VersionedDeltaReader::<LiveKeys, VersionedDbCache<LiveKeys>>::new(
+        versioned_db.clone(),
+        Some(0),
+        vec![],
+    );
     check_keys(
         &delta_reader,
         &[
@@ -62,7 +73,7 @@ fn test_delta_reader_consistency_single_threaded() {
     snapshot.put_versioned(TestKey::from(b"key19".to_vec()), TestField::new(1));
 
     let snapshot_1 = Arc::new(snapshot);
-    let delta_reader = VersionedDeltaReader::<LiveKeys>::new(
+    let delta_reader = VersionedDeltaReader::<LiveKeys, VersionedDbCache<LiveKeys>>::new(
         versioned_db.clone(),
         Some(0),
         vec![snapshot_1.clone()],
@@ -82,7 +93,7 @@ fn test_delta_reader_consistency_single_threaded() {
     snapshot.delete_versioned(TestKey::from(b"key19".to_vec()));
 
     let snapshot_2 = Arc::new(snapshot);
-    let delta_reader = VersionedDeltaReader::<LiveKeys>::new(
+    let delta_reader = VersionedDeltaReader::<LiveKeys, VersionedDbCache<LiveKeys>>::new(
         versioned_db.clone(),
         Some(0),
         vec![snapshot_1.clone(), snapshot_2.clone()],
@@ -152,8 +163,16 @@ fn make_key(key: usize) -> TestKey {
 fn test_delta_reader_behavior_under_concurrency() {
     let test_db = TestDB::new();
     let db = Arc::new(test_db.db);
-    let versioned_db =
-        Arc::new(VersionedDB::<LiveKeys>::from_dbs(db.clone(), db.clone(), 10_000).unwrap());
+
+    let versioned_db_cache = VersionedDbCache::new(10_000);
+    let versioned_db = Arc::new(
+        VersionedDB::<LiveKeys, VersionedDbCache<LiveKeys>>::from_dbs(
+            db.clone(),
+            db.clone(),
+            versioned_db_cache,
+        )
+        .unwrap(),
+    );
     let num_keys = 500;
     let num_readers = 100;
 
@@ -182,8 +201,11 @@ fn test_delta_reader_behavior_under_concurrency() {
         let done = Arc::clone(&done);
         let batches = batches.clone();
         let handle = std::thread::spawn(move || {
-            let delta_reader =
-                VersionedDeltaReader::<LiveKeys>::new(versioned_db.clone(), None, batches.clone());
+            let delta_reader = VersionedDeltaReader::<LiveKeys, VersionedDbCache<LiveKeys>>::new(
+                versioned_db.clone(),
+                None,
+                batches.clone(),
+            );
             while !done.load(std::sync::atomic::Ordering::Relaxed) {
                 for key in 0..num_keys {
                     let expected_value = 'expected_value: {
@@ -227,8 +249,15 @@ fn test_delta_reader_after_opening_populated_db() {
     let dir = {
         let TestDB { db, tmpdir } = TestDB::new();
         let db = Arc::new(db);
-        let versioned_db =
-            Arc::new(VersionedDB::<LiveKeys>::from_dbs(db.clone(), db.clone(), 10_000).unwrap());
+        let versioned_db_cache = VersionedDbCache::new(10_000);
+        let versioned_db = Arc::new(
+            VersionedDB::<LiveKeys, VersionedDbCache<LiveKeys>>::from_dbs(
+                db.clone(),
+                db.clone(),
+                versioned_db_cache,
+            )
+            .unwrap(),
+        );
 
         // Check iteration against an empty DB.
         let version = versioned_db.get_committed_version().unwrap();
@@ -245,10 +274,21 @@ fn test_delta_reader_after_opening_populated_db() {
     // Reopen the db and check that the delta reader returns the correct values.
     let test_db = TestDB::from_tempdir(dir);
     let db = Arc::new(test_db.db);
-    let versioned_db =
-        Arc::new(VersionedDB::<LiveKeys>::from_dbs(db.clone(), db.clone(), 10_000).unwrap());
+    let versioned_db_cache = VersionedDbCache::new(10_000);
+    let versioned_db = Arc::new(
+        VersionedDB::<LiveKeys, VersionedDbCache<LiveKeys>>::from_dbs(
+            db.clone(),
+            db.clone(),
+            versioned_db_cache,
+        )
+        .unwrap(),
+    );
 
-    let delta_reader = VersionedDeltaReader::<LiveKeys>::new(versioned_db.clone(), Some(0), vec![]);
+    let delta_reader = VersionedDeltaReader::<LiveKeys, VersionedDbCache<LiveKeys>>::new(
+        versioned_db.clone(),
+        Some(0),
+        vec![],
+    );
     check_keys(
         &delta_reader,
         &[
@@ -264,7 +304,7 @@ fn test_delta_reader_after_opening_populated_db() {
     snapshot.put_versioned(TestKey::from(b"key19".to_vec()), TestField::new(1));
 
     let snapshot_1 = Arc::new(snapshot);
-    let delta_reader = VersionedDeltaReader::<LiveKeys>::new(
+    let delta_reader = VersionedDeltaReader::<LiveKeys, VersionedDbCache<LiveKeys>>::new(
         versioned_db.clone(),
         Some(0),
         vec![snapshot_1.clone()],
@@ -284,7 +324,7 @@ fn test_delta_reader_after_opening_populated_db() {
     snapshot.delete_versioned(TestKey::from(b"key19".to_vec()));
 
     let snapshot_2 = Arc::new(snapshot);
-    let delta_reader = VersionedDeltaReader::<LiveKeys>::new(
+    let delta_reader = VersionedDeltaReader::<LiveKeys, VersionedDbCache<LiveKeys>>::new(
         versioned_db.clone(),
         Some(0),
         vec![snapshot_1.clone(), snapshot_2.clone()],
