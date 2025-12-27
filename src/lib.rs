@@ -56,6 +56,10 @@ use crate::{iterator::RawDbIter, schema::KeyEncoder};
 pub type CacheForSchema<S> = Cache<<S as Schema>::Key, Option<<S as Schema>::Value>, BasicWeighter>;
 
 /// Constructor for CacheForSchema.
+// Cache size estimation: we want to allocate about 1GB for cache. Estimate that slot keys are about 80 bytes and slot values
+// are around 400 bytes + 56 bytes of overhead on the stack (see weighter). Multiply by 1.5 to account for overhead (per quick-cache docs).
+// That gives estimated item capacity of 1GB / (80 + 400 + 56) * 1.5 ~= 1.2M.
+
 pub fn new_cache_for_schema<S>(cache_size: usize) -> CacheForSchema<S>
 where
     S::Key: Ord + Clone + std::hash::Hash + AsRef<[u8]>,

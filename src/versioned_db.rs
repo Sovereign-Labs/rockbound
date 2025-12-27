@@ -423,15 +423,11 @@ where
     }
 
     /// Creates a new versioned DB from an existing DB.
-    // Cache size estimation: we want to allocate about 1GB for cache. Estimate that slot keys are about 80 bytes and slot values
-    // are around 400 bytes + 56 bytes of overhead on the stack (see weighter). Multiply by 1.5 to account for overhead (per quick-cache docs).
-    // That gives estimated item capacity of 1GB / (80 + 400 + 56) * 1.5 ~= 1.2M.
     pub fn from_dbs(
         live_db: Arc<DB>,
         archival_db: Arc<DB>,
         versioned_db_cache: C,
     ) -> anyhow::Result<Self> {
-        //let versioned_db_cache = VersionedDbCache::new(cache_size);
         let version = Self::load_committed_version_from_disk(&live_db)?;
         let committed_archival_version = AtomicU64::new(version.unwrap_or(u64::MAX));
 
