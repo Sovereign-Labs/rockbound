@@ -513,7 +513,7 @@ where
     }
 
     /// Populates the `live_db_batch & archival_db_batch` using data from `batch` and returns the associated metrics.
-    pub fn update_verioned_db_batch(
+    pub fn update_versioned_db_batch(
         live_db_batch: &mut rocksdb::WriteBatch,
         archival_db_batch: &mut rocksdb::WriteBatch,
         batch: &VersionedSchemaBatch<V>,
@@ -724,7 +724,7 @@ where
         let live_db = &self.live_db;
         let archival_db = &self.archival_db;
 
-        let metrics = Self::update_verioned_db_batch(
+        let metrics = Self::update_versioned_db_batch(
             &mut live_db_batch,
             &mut archival_db_batch,
             batch,
