@@ -619,58 +619,6 @@ where
             .observe(archival_serialized_size as f64);
     }
 
-    /// Commits a batch of versioned writes to the database.
-    pub fn commit(&self, batch: &VersionedSchemaBatch<V>, version: u64) -> anyhow::Result<()>
-    where
-        V::Value: AsRef<[u8]>,
-        V::Key: AsRef<[u8]>,
-    {
-        let _timer = SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS
-            .with_label_values(&[self.live_db.name()])
-            .start_timer();
-        // Update the next version to commit if relevant.
-        // Block any readers while the DB isn't fully consistent
-        let cache = self.versioned_db_cache.write();
-
-        let mut live_db_batch = rocksdb::WriteBatch::default();
-        let mut archival_db_batch = rocksdb::WriteBatch::default();
-
-        let live_db = &self.live_db;
-        let archival_db = &self.archival_db;
-
-        let metrics = Self::update_verioned_db_batch(
-            &mut live_db_batch,
-            &mut archival_db_batch,
-            batch,
-            version,
-            &cache,
-            live_db,
-            archival_db,
-        )?;
-
-        let serialized_size = live_db_batch.size_in_bytes() + archival_db_batch.size_in_bytes();
-        let archival_serialized_size = archival_db_batch.size_in_bytes();
-        with_error_logging(
-            || archival_db.write_opt(archival_db_batch, &default_write_options()),
-            "write_versioned_schemas::write_archival_opt",
-        )?;
-
-        // Danger: This function is coupled with `get_historical_value`. That function assumes that if hte
-        self.store_committed_archival_version(version);
-
-        with_error_logging(
-            || live_db.write_opt(live_db_batch, &default_write_options()),
-            "write_versioned_schemas::write_live_opt",
-        )?;
-
-        drop(cache);
-
-        // Track metrics after the writes succeed.
-        self.update_metrics(metrics, serialized_size, archival_serialized_size);
-
-        Ok(())
-    }
-
     /// Returns the value of a key in the historical column family as of the given version.
     pub fn get_historical_value(
         &self,
@@ -754,6 +702,59 @@ where
             return Ok(Some((value_bytes, version)));
         }
         Ok(None)
+    }
+
+    /// This method is used nly for integration tests.
+    /// Commits a batch of versioned writes to the database.
+    pub fn commit(&self, batch: &VersionedSchemaBatch<V>, version: u64) -> anyhow::Result<()>
+    where
+        V::Value: AsRef<[u8]>,
+        V::Key: AsRef<[u8]>,
+    {
+        let _timer = SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS
+            .with_label_values(&[self.live_db.name()])
+            .start_timer();
+        // Update the next version to commit if relevant.
+        // Block any readers while the DB isn't fully consistent
+        let cache = self.versioned_db_cache.write();
+
+        let mut live_db_batch = rocksdb::WriteBatch::default();
+        let mut archival_db_batch = rocksdb::WriteBatch::default();
+
+        let live_db = &self.live_db;
+        let archival_db = &self.archival_db;
+
+        let metrics = Self::update_verioned_db_batch(
+            &mut live_db_batch,
+            &mut archival_db_batch,
+            batch,
+            version,
+            &cache,
+            live_db,
+            archival_db,
+        )?;
+
+        let serialized_size = live_db_batch.size_in_bytes() + archival_db_batch.size_in_bytes();
+        let archival_serialized_size = archival_db_batch.size_in_bytes();
+        with_error_logging(
+            || archival_db.write_opt(archival_db_batch, &default_write_options()),
+            "write_versioned_schemas::write_archival_opt",
+        )?;
+
+        // Danger: This function is coupled with `get_historical_value`. That function assumes that if hte
+        self.store_committed_archival_version(version);
+
+        with_error_logging(
+            || live_db.write_opt(live_db_batch, &default_write_options()),
+            "write_versioned_schemas::write_live_opt",
+        )?;
+
+        drop(cache);
+
+        // Track metrics after the writes succeed.
+        self.update_metrics(metrics, serialized_size, archival_serialized_size);
+
+        Ok(())
     }
 }
 
