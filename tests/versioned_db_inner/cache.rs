@@ -5,6 +5,8 @@ use std::{
 
 use rockbound::versioned_db::{VersionedDB, VersionedSchemaBatch};
 
+use crate::versioned_db_inner::VersionedDbCache;
+
 #[cfg(feature = "test-utils")]
 use crate::versioned_db_inner::TestDB;
 use crate::versioned_db_inner::{delete_keys, put_keys, LiveKeys, TestField, TestKey};
@@ -13,8 +15,16 @@ use crate::versioned_db_inner::{delete_keys, put_keys, LiveKeys, TestField, Test
 fn test_basic_cache_consistency() {
     let test_db = TestDB::new();
     let db = Arc::new(test_db.db);
-    let versioned_db =
-        Arc::new(VersionedDB::<LiveKeys>::from_dbs(db.clone(), db.clone(), 10_000).unwrap());
+
+    let versioned_db_cache = VersionedDbCache::new(10_000);
+    let versioned_db = Arc::new(
+        VersionedDB::<LiveKeys, VersionedDbCache<LiveKeys>>::from_dbs(
+            db.clone(),
+            db.clone(),
+            versioned_db_cache,
+        )
+        .unwrap(),
+    );
 
     // Put key1 at version 0
     put_keys(&versioned_db, &[(b"key1", 100)], 0);
@@ -70,8 +80,16 @@ fn make_key(key: usize) -> TestKey {
 fn test_cache_behavior_under_concurrency() {
     let test_db = TestDB::new();
     let db = Arc::new(test_db.db);
-    let versioned_db =
-        Arc::new(VersionedDB::<LiveKeys>::from_dbs(db.clone(), db.clone(), 10_000).unwrap());
+
+    let versioned_db_cache = VersionedDbCache::new(10_000);
+    let versioned_db = Arc::new(
+        VersionedDB::<LiveKeys, VersionedDbCache<LiveKeys>>::from_dbs(
+            db.clone(),
+            db.clone(),
+            versioned_db_cache,
+        )
+        .unwrap(),
+    );
     let num_generations = 20;
     let num_keys = 10000;
     let num_readers = 10;
