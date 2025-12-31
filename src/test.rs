@@ -18,7 +18,7 @@ impl TestCompositeField {
 }
 
 /// Simple wrapper around [`u32`].
-#[derive(Debug, Eq, PartialEq, Clone, Copy, Ord, PartialOrd)]
+#[derive(Debug, Eq, PartialEq, Clone, Copy, Ord, PartialOrd, Default)]
 pub struct TestField(pub u32);
 
 impl<S: Schema> KeyEncoder<S> for TestCompositeField {
