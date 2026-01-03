@@ -459,6 +459,68 @@ where
             )
     }
 
+    /// Returns an iterator over the pruning keys at a specific version.
+    fn iter_pruning_keys_at_version(
+        &self,
+        version: u64,
+    ) -> anyhow::Result<impl Iterator<Item = PrunableKey<V>> + use<'_, V, C>> {
+        let start = version.to_be_bytes().to_vec();
+        let end = (version + 1).to_be_bytes().to_vec();
+        let range = start..end;
+        self.archival_db.raw_iter_cf_with_decode_fn(
+            V::PRUNING_COLUMN_FAMILY_NAME,
+            range,
+            ScanDirection::Forward,
+            &|(key, _value)| {
+                PrunableKey::decode_key(key)
+                    .expect("DB Corruption: Failed to decode pruning key")
+            },
+        )
+    }
+
+    /// Rolls back the last committed version.
+    ///
+    /// This function reverts all changes made in the most recent version by:
+    /// 1. Finding all keys modified in the current version
+    /// 2. Restoring their values from the previous version
+    /// 3. Committing the restored state at version - 1
+    ///
+    /// Returns the new current version after rollback.
+    ///
+    /// # Errors
+    /// - Returns an error if no versions have been committed
+    /// - Returns an error if attempting to rollback version 0
+    pub fn rollback_last_version(&self) -> anyhow::Result<u64> {
+        let current_version = self
+            .get_committed_version()?
+            .ok_or_else(|| anyhow::anyhow!("Cannot rollback: no versions committed"))?;
+
+        if current_version == 0 {
+            bail!("Cannot rollback version 0");
+        }
+
+        let target_version = current_version - 1;
+
+        // Collect all keys modified at current_version
+        let mut batch = VersionedSchemaBatch::default();
+
+        // Get keys modified at current_version
+        for prunable_key in self.iter_pruning_keys_at_version(current_version)? {
+            let key = prunable_key.1; // Extract the actual key from PrunableKey(version, key, _)
+
+            // Get the historical value at target_version
+            match self.get_historical_value(&key, target_version)? {
+                Some(value) => batch.put_versioned(key, value),
+                None => batch.delete_versioned(key),
+            }
+        }
+
+        // Commit the batch at target_version, effectively rolling back
+        self.commit(&batch, target_version)?;
+
+        Ok(target_version)
+    }
+
     fn load_committed_version_from_disk(live_db: &DB) -> anyhow::Result<Option<u64>> {
         live_db.get_raw_with_cf_and_decoder::<u64>(
             V::VERSION_METADATA_COLUMN_FAMILY_NAME,
