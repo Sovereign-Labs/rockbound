@@ -49,6 +49,7 @@ pub use crate::schema_batch::SchemaBatch;
 use crate::{
     iterator::DecodeFn,
     schema::{KeyCodec, ValueCodec},
+    versioned_db::SchemaWithVersion,
 };
 use crate::{iterator::RawDbIter, schema::KeyEncoder};
 
@@ -364,6 +365,20 @@ impl DB {
         decode_fn: DecodeFn<Item>,
     ) -> anyhow::Result<RawDbIter<'_, Item>> {
         self.raw_iter_cf_with_decode_fn::<Item>(S::COLUMN_FAMILY_NAME, range, direction, decode_fn)
+    }
+
+    fn raw_iter_range_with_decode_fn_pruned<S: SchemaWithVersion, Item>(
+        &self,
+        range: impl std::ops::RangeBounds<SchemaKey>,
+        direction: ScanDirection,
+        decode_fn: DecodeFn<Item>,
+    ) -> anyhow::Result<RawDbIter<'_, Item>> {
+        self.raw_iter_cf_with_decode_fn::<Item>(
+            S::PRUNING_COLUMN_FAMILY_NAME,
+            range,
+            direction,
+            decode_fn,
+        )
     }
 
     /// Get a [`RawDbIter`] in given range and direction.
