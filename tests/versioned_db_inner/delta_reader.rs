@@ -46,7 +46,7 @@ fn test_delta_reader_consistency_single_threaded() {
     );
 
     // Check iteration against an empty DB.
-    let version = versioned_db.get_committed_version().unwrap();
+    let version = versioned_db.get_committed_version_live_db().unwrap();
     assert_eq!(version, None);
 
     put_keys(
@@ -260,7 +260,7 @@ fn test_delta_reader_after_opening_populated_db() {
         );
 
         // Check iteration against an empty DB.
-        let version = versioned_db.get_committed_version().unwrap();
+        let version = versioned_db.get_committed_version_live_db().unwrap();
         assert_eq!(version, None);
 
         put_keys(

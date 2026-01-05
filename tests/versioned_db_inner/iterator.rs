@@ -64,7 +64,7 @@ fn test_iteration() {
     );
 
     // Check iteration against an empty DB.
-    let version = versioned_db.get_committed_version().unwrap();
+    let version = versioned_db.get_committed_version_live_db().unwrap();
     assert_eq!(version, None);
     let delta_reader = VersionedDeltaReader::<LiveKeys, VersionedDbCache<LiveKeys>>::new(
         versioned_db.clone(),
