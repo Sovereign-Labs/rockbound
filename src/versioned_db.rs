@@ -1,4 +1,5 @@
 use std::{
+    any,
     collections::{btree_map, BTreeMap},
     hash::Hash,
     iter::Peekable,
@@ -7,6 +8,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    u64,
 };
 
 use anyhow::bail;
@@ -466,7 +468,12 @@ where
         version: u64,
     ) -> anyhow::Result<impl Iterator<Item = PrunableKey<V>> + use<'_, V, C>> {
         let start = version.to_be_bytes().to_vec();
-        let end = (version + 1).to_be_bytes().to_vec();
+        let Some(end) = version.checked_add(1) else {
+            anyhow::bail!("Unable to create iterator: upper bound overflow detected.")
+        };
+
+        let end = end.to_be_bytes().to_vec();
+
         let range = start..end;
         self.archival_db
             .raw_iter_range_with_decode_fn_pruned::<V, PrunableKey<V>>(
