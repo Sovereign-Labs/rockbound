@@ -372,32 +372,54 @@ where
             .store(version, Ordering::Release);
     }
 
-    /// Adds the column families for the versioned schema to the existing column families.
-    pub fn add_column_families(
+    /// Adds the column families for the live db.
+    pub fn add_live_db_column_families(
         existing_column_families: &mut Vec<ColumnFamilyDescriptor>,
-        separate_archival_and_pruning: bool,
+    ) -> anyhow::Result<()> {
+        let live_column_family = V::COLUMN_FAMILY_NAME;
+        let metadata_column_family = V::VERSION_METADATA_COLUMN_FAMILY_NAME;
+
+        Self::validate_column_families(existing_column_families)?;
+
+        existing_column_families.push(live_versioned_column_family_descriptor(live_column_family));
+        existing_column_families.push(default_cf_descriptor(metadata_column_family));
+        Ok(())
+    }
+
+    /// Adds the column families for the archival db.
+    pub fn add_archival_db_column_families(
+        existing_column_families: &mut Vec<ColumnFamilyDescriptor>,
     ) -> anyhow::Result<()> {
         let historical_versioned_column_family = V::HISTORICAL_COLUMN_FAMILY_NAME;
         let pruning_column_family = V::PRUNING_COLUMN_FAMILY_NAME;
         let live_column_family = V::COLUMN_FAMILY_NAME;
         let metadata_column_family = V::VERSION_METADATA_COLUMN_FAMILY_NAME;
-        for column in existing_column_families.iter() {
-            if column.name() == metadata_column_family
-                || column.name() == historical_versioned_column_family
-                || column.name() == live_column_family
-                || column.name() == pruning_column_family
-            {
+
+        Self::validate_column_families(existing_column_families)?;
+
+        existing_column_families.push(default_cf_descriptor(historical_versioned_column_family));
+        existing_column_families.push(default_cf_descriptor(pruning_column_family));
+        existing_column_families.push(live_versioned_column_family_descriptor(live_column_family));
+        existing_column_families.push(default_cf_descriptor(metadata_column_family));
+        Ok(())
+    }
+
+    fn validate_column_families(
+        existing_column_families: &Vec<ColumnFamilyDescriptor>,
+    ) -> anyhow::Result<()> {
+        let reserved = [
+            V::HISTORICAL_COLUMN_FAMILY_NAME,
+            V::PRUNING_COLUMN_FAMILY_NAME,
+            V::COLUMN_FAMILY_NAME,
+            V::VERSION_METADATA_COLUMN_FAMILY_NAME,
+        ];
+
+        for column in existing_column_families {
+            if reserved.contains(&column.name()) {
                 bail!("{} column name is reserved for internal use", column.name());
             }
         }
 
-        if !separate_archival_and_pruning {
-            existing_column_families
-                .push(default_cf_descriptor(historical_versioned_column_family));
-            existing_column_families.push(default_cf_descriptor(pruning_column_family));
-        }
-        existing_column_families.push(live_versioned_column_family_descriptor(live_column_family));
-        existing_column_families.push(default_cf_descriptor(metadata_column_family));
         Ok(())
     }
 
@@ -516,7 +538,6 @@ where
         live_db_batch: &mut rocksdb::WriteBatch,
         archival_db_batch: &mut rocksdb::WriteBatch,
         batch: &VersionedSchemaBatch<V>,
-        prunable_keys_to_remove: Vec<PrunableKey<V>>,
         version: u64,
         cache: &CacheForSchema<V>,
         live_db: &DB,
@@ -527,7 +548,6 @@ where
         // To reduce allocations and memcopies, we create a single vector [version || key || version] and use it for all three cases, simply slicing the relevant subset.
         //
         // As a further optimization, we reuse a single `Vec` for all keys.
-
         let mut key_with_version = KeyWithVersionPrefixAndSuffix::new(version);
 
         let archival_cf_handle = archival_db.get_cf_handle(V::HISTORICAL_COLUMN_FAMILY_NAME)?;
@@ -578,14 +598,6 @@ where
 
             archival_db_batch.put_cf(pruning_cf_handle, key_with_version.pruning_key(), []);
             pruning_puts_bytes += key_with_version.pruning_key().len();
-        }
-
-        // Removes keys from `PRUNING_COLUMN_FAMILY_NAME`
-        for key in prunable_keys_to_remove {
-            let mut key_with_version_to_remove = KeyWithVersionPrefixAndSuffix::new(key.0);
-            key_with_version_to_remove.set_key(key.1.as_ref());
-            archival_db_batch
-                .delete_cf(pruning_cf_handle, key_with_version_to_remove.pruning_key());
         }
 
         live_db_batch.put_cf(
@@ -1172,7 +1184,6 @@ where
             &mut live_db_batch,
             &mut archival_db_batch,
             batch,
-            Default::default(),
             version,
             &cache,
             live_db,
