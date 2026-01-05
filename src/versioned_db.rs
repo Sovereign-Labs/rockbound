@@ -533,7 +533,6 @@ where
     }
 
     /// Populates the `live_db_batch & archival_db_batch` using data from `batch` and returns the associated metrics.
-    #[allow(clippy::too_many_arguments)]
     pub fn update_versioned_db_batch(
         live_db_batch: &mut rocksdb::WriteBatch,
         archival_db_batch: &mut rocksdb::WriteBatch,
