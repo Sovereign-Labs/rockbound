@@ -590,7 +590,6 @@ where
                     deletes += 1;
                     archival_puts_bytes += key_with_version.archival_key().len();
                     live_db_batch.delete_cf(live_cf_handle, key);
-
                     cache.remove(key);
 
                     if is_commit {
