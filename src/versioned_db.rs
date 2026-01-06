@@ -543,6 +543,7 @@ where
         cache: &CacheForSchema<V>,
         live_db: &DB,
         archival_db: &DB,
+        is_commit: bool,
     ) -> anyhow::Result<VersionedDbMetrics> {
         // Optimization:
         // At various times we need the key *prefixed* with the version (for pruning), on its own (for live reads), and suffixed with the version (for archival reads).
@@ -588,16 +589,27 @@ where
                     deletes += 1;
                     archival_puts_bytes += key_with_version.archival_key().len();
                     live_db_batch.delete_cf(live_cf_handle, key);
-                    archival_db_batch.put_cf(
-                        archival_cf_handle,
-                        key_with_version.archival_key(),
-                        [],
-                    );
+
+                    if is_commit {
+                        archival_db_batch.put_cf(
+                            archival_cf_handle,
+                            key_with_version.archival_key(),
+                            [],
+                        );
+                    } else {
+                        archival_db_batch
+                            .delete_cf(archival_cf_handle, key_with_version.archival_key());
+                    }
                     cache.insert(key.clone(), None);
                 }
             }
 
-            archival_db_batch.put_cf(pruning_cf_handle, key_with_version.pruning_key(), []);
+            if is_commit {
+                archival_db_batch.put_cf(pruning_cf_handle, key_with_version.pruning_key(), []);
+            } else {
+                archival_db_batch.delete_cf(pruning_cf_handle, key_with_version.pruning_key());
+            }
+
             pruning_puts_bytes += key_with_version.pruning_key().len();
         }
 
