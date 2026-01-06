@@ -597,17 +597,21 @@ where
                             key_with_version.archival_key(),
                             [],
                         );
+                        cache.insert(key.clone(), None);
                     } else {
+                        // On rollback we remove data from HISTORICAL_COLUMN_FAMILY_NAME
                         archival_db_batch
                             .delete_cf(archival_cf_handle, key_with_version.archival_key());
+
+                        cache.remove(key);
                     }
-                    cache.insert(key.clone(), None);
                 }
             }
 
             if is_commit {
                 archival_db_batch.put_cf(pruning_cf_handle, key_with_version.pruning_key(), []);
             } else {
+                // On rollback we remove data from PRUNING_COLUMN_FAMILY_NAME)
                 archival_db_batch.delete_cf(pruning_cf_handle, key_with_version.pruning_key());
             }
 
