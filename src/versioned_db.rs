@@ -600,7 +600,6 @@ where
                         );
                     } else {
                         // We don't rollback live_db.
-                        cache.remove(key);
                         // On rollback we remove data from HISTORICAL_COLUMN_FAMILY_NAME
                         archival_db_batch
                             .delete_cf(archival_cf_handle, key_with_version.archival_key());
