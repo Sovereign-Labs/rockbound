@@ -535,6 +535,7 @@ where
     }
 
     /// Populates the `live_db_batch & archival_db_batch` using data from `batch` and returns the associated metrics.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_versioned_db_batch(
         live_db_batch: &mut rocksdb::WriteBatch,
         archival_db_batch: &mut rocksdb::WriteBatch,
@@ -543,6 +544,7 @@ where
         cache: &CacheForSchema<V>,
         live_db: &DB,
         archival_db: &DB,
+        is_commit: bool,
     ) -> anyhow::Result<VersionedDbMetrics> {
         // Optimization:
         // At various times we need the key *prefixed* with the version (for pruning), on its own (for live reads), and suffixed with the version (for archival reads).
@@ -587,17 +589,30 @@ where
                     // println!("Deleting live key: {:?}", key_with_version.live_key());
                     deletes += 1;
                     archival_puts_bytes += key_with_version.archival_key().len();
-                    live_db_batch.delete_cf(live_cf_handle, key);
-                    archival_db_batch.put_cf(
-                        archival_cf_handle,
-                        key_with_version.archival_key(),
-                        [],
-                    );
-                    cache.insert(key.clone(), None);
+
+                    if is_commit {
+                        live_db_batch.delete_cf(live_cf_handle, key);
+                        cache.insert(key.clone(), None);
+                        archival_db_batch.put_cf(
+                            archival_cf_handle,
+                            key_with_version.archival_key(),
+                            [],
+                        );
+                    } else {
+                        // We don’t roll back live_db, and we remove data from HISTORICAL_COLUMN_FAMILY_NAME.
+                        archival_db_batch
+                            .delete_cf(archival_cf_handle, key_with_version.archival_key());
+                    }
                 }
             }
 
-            archival_db_batch.put_cf(pruning_cf_handle, key_with_version.pruning_key(), []);
+            if is_commit {
+                archival_db_batch.put_cf(pruning_cf_handle, key_with_version.pruning_key(), []);
+            } else {
+                // On rollback we remove data from PRUNING_COLUMN_FAMILY_NAME)
+                archival_db_batch.delete_cf(pruning_cf_handle, key_with_version.pruning_key());
+            }
+
             pruning_puts_bytes += key_with_version.pruning_key().len();
         }
 
@@ -1189,6 +1204,7 @@ where
             &cache,
             live_db,
             archival_db,
+            true,
         )?;
 
         let serialized_size = live_db_batch.size_in_bytes() + archival_db_batch.size_in_bytes();
