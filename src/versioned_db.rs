@@ -599,8 +599,7 @@ where
                             [],
                         );
                     } else {
-                        // We don't rollback live_db.
-                        // On rollback we remove data from HISTORICAL_COLUMN_FAMILY_NAME
+                        // We don’t roll back live_db, and we remove data from HISTORICAL_COLUMN_FAMILY_NAME.
                         archival_db_batch
                             .delete_cf(archival_cf_handle, key_with_version.archival_key());
                     }
