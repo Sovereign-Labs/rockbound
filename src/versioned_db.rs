@@ -589,9 +589,9 @@ where
                     // println!("Deleting live key: {:?}", key_with_version.live_key());
                     deletes += 1;
                     archival_puts_bytes += key_with_version.archival_key().len();
-                    live_db_batch.delete_cf(live_cf_handle, key);
 
                     if is_commit {
+                        live_db_batch.delete_cf(live_cf_handle, key);
                         cache.insert(key.clone(), None);
                         archival_db_batch.put_cf(
                             archival_cf_handle,
@@ -599,6 +599,7 @@ where
                             [],
                         );
                     } else {
+                        // We don't rollback live_db.
                         cache.remove(key);
                         // On rollback we remove data from HISTORICAL_COLUMN_FAMILY_NAME
                         archival_db_batch
