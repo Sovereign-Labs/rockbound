@@ -590,15 +590,16 @@ where
                     deletes += 1;
                     archival_puts_bytes += key_with_version.archival_key().len();
                     live_db_batch.delete_cf(live_cf_handle, key);
-                    cache.remove(key);
 
                     if is_commit {
+                        cache.insert(key.clone(), None);
                         archival_db_batch.put_cf(
                             archival_cf_handle,
                             key_with_version.archival_key(),
                             [],
                         );
                     } else {
+                        cache.remove(key);
                         // On rollback we remove data from HISTORICAL_COLUMN_FAMILY_NAME
                         archival_db_batch
                             .delete_cf(archival_cf_handle, key_with_version.archival_key());
