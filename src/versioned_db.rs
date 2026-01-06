@@ -1201,6 +1201,7 @@ where
             &cache,
             live_db,
             archival_db,
+            true,
         )?;
 
         let serialized_size = live_db_batch.size_in_bytes() + archival_db_batch.size_in_bytes();
