@@ -1,11 +1,11 @@
 // Copyright (c) Aptos
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::LazyLock;
 use prometheus::{
     exponential_buckets, register_histogram_vec, register_int_counter_vec, HistogramVec,
     IntCounterVec,
 };
+use std::sync::LazyLock;
 
 pub static SCHEMADB_ITER_LATENCY_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
