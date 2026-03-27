@@ -1,13 +1,13 @@
 // Copyright (c) Aptos
 // SPDX-License-Identifier: Apache-2.0
 
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 use prometheus::{
     exponential_buckets, register_histogram_vec, register_int_counter_vec, HistogramVec,
     IntCounterVec,
 };
 
-pub static SCHEMADB_ITER_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+pub static SCHEMADB_ITER_LATENCY_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         // metric name
         "schemadb_iter_latency_seconds",
@@ -20,7 +20,7 @@ pub static SCHEMADB_ITER_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
     .unwrap()
 });
 
-pub static SCHEMADB_ITER_BYTES: Lazy<HistogramVec> = Lazy::new(|| {
+pub static SCHEMADB_ITER_BYTES: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         // metric name
         "schemadb_iter_bytes",
@@ -32,7 +32,7 @@ pub static SCHEMADB_ITER_BYTES: Lazy<HistogramVec> = Lazy::new(|| {
     .unwrap()
 });
 
-pub static SCHEMADB_GET_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+pub static SCHEMADB_GET_LATENCY_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         // metric name
         "schemadb_get_latency_seconds",
@@ -45,7 +45,7 @@ pub static SCHEMADB_GET_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
     .unwrap()
 });
 
-pub static SCHEMADB_GET_BYTES: Lazy<HistogramVec> = Lazy::new(|| {
+pub static SCHEMADB_GET_BYTES: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         // metric name
         "schemadb_get_bytes",
@@ -57,7 +57,7 @@ pub static SCHEMADB_GET_BYTES: Lazy<HistogramVec> = Lazy::new(|| {
     .unwrap()
 });
 
-pub static SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+pub static SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         // metric name
         "schemadb_batch_commit_latency_seconds",
@@ -70,7 +70,7 @@ pub static SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy::new
     .unwrap()
 });
 
-pub static SCHEMADB_BATCH_COMMIT_BYTES: Lazy<HistogramVec> = Lazy::new(|| {
+pub static SCHEMADB_BATCH_COMMIT_BYTES: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         // metric name
         "schemadb_batch_commit_bytes",
@@ -82,7 +82,7 @@ pub static SCHEMADB_BATCH_COMMIT_BYTES: Lazy<HistogramVec> = Lazy::new(|| {
     .unwrap()
 });
 
-pub static SCHEMADB_PUT_BYTES: Lazy<HistogramVec> = Lazy::new(|| {
+pub static SCHEMADB_PUT_BYTES: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         // metric name
         "rockbound_put_bytes",
@@ -94,11 +94,11 @@ pub static SCHEMADB_PUT_BYTES: Lazy<HistogramVec> = Lazy::new(|| {
     .unwrap()
 });
 
-pub static SCHEMADB_DELETES: Lazy<IntCounterVec> = Lazy::new(|| {
+pub static SCHEMADB_DELETES: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!("storage_deletes", "Storage delete calls", &["cf_name"]).unwrap()
 });
 
-pub static SCHEMADB_DELETE_RANGE: Lazy<IntCounterVec> = Lazy::new(|| {
+pub static SCHEMADB_DELETE_RANGE: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "storage_delete_range",
         "Storage delete range calls",
@@ -107,7 +107,7 @@ pub static SCHEMADB_DELETE_RANGE: Lazy<IntCounterVec> = Lazy::new(|| {
     .unwrap()
 });
 
-pub static SCHEMADB_BATCH_PUT_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+pub static SCHEMADB_BATCH_PUT_LATENCY_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         // metric name
         "rockbound_batch_put_latency_seconds",
