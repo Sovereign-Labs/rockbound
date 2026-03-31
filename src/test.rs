@@ -1,7 +1,7 @@
 //! Helpers structures for testing, such as fields
 
 use anyhow::Result;
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use std::io::Read;
 
 use crate::schema::{KeyDecoder, KeyEncoder, ValueCodec};
 use crate::{CodecError, Schema, SeekKeyEncoder};
@@ -24,15 +24,9 @@ pub struct TestField(pub u32);
 impl<S: Schema> KeyEncoder<S> for TestCompositeField {
     fn encode_key(&self) -> Result<Vec<u8>, CodecError> {
         let mut bytes = vec![];
-        bytes
-            .write_u32::<BigEndian>(self.0)
-            .map_err(|e| CodecError::Wrapped(e.into()))?;
-        bytes
-            .write_u32::<BigEndian>(self.1)
-            .map_err(|e| CodecError::Wrapped(e.into()))?;
-        bytes
-            .write_u32::<BigEndian>(self.2)
-            .map_err(|e| CodecError::Wrapped(e.into()))?;
+        bytes.extend_from_slice(&self.0.to_be_bytes());
+        bytes.extend_from_slice(&self.1.to_be_bytes());
+        bytes.extend_from_slice(&self.2.to_be_bytes());
         Ok(bytes)
     }
 }
@@ -40,17 +34,20 @@ impl<S: Schema> KeyEncoder<S> for TestCompositeField {
 impl<S: Schema> KeyDecoder<S> for TestCompositeField {
     fn decode_key(data: &[u8]) -> Result<Self, CodecError> {
         let mut reader = std::io::Cursor::new(data);
-        Ok(TestCompositeField(
-            reader
-                .read_u32::<BigEndian>()
-                .map_err(|e| CodecError::Wrapped(e.into()))?,
-            reader
-                .read_u32::<BigEndian>()
-                .map_err(|e| CodecError::Wrapped(e.into()))?,
-            reader
-                .read_u32::<BigEndian>()
-                .map_err(|e| CodecError::Wrapped(e.into()))?,
-        ))
+        let mut buf = [0u8; 4];
+        reader
+            .read_exact(&mut buf)
+            .map_err(|e| CodecError::Wrapped(e.into()))?;
+        let a = u32::from_be_bytes(buf);
+        reader
+            .read_exact(&mut buf)
+            .map_err(|e| CodecError::Wrapped(e.into()))?;
+        let b = u32::from_be_bytes(buf);
+        reader
+            .read_exact(&mut buf)
+            .map_err(|e| CodecError::Wrapped(e.into()))?;
+        let c = u32::from_be_bytes(buf);
+        Ok(TestCompositeField(a, b, c))
     }
 }
 
@@ -66,12 +63,10 @@ impl TestField {
     }
 
     fn from_bytes(data: &[u8]) -> std::result::Result<Self, CodecError> {
-        let mut reader = std::io::Cursor::new(data);
-        Ok(TestField(
-            reader
-                .read_u32::<BigEndian>()
-                .map_err(|e| CodecError::Wrapped(e.into()))?,
-        ))
+        let bytes: [u8; 4] = data
+            .try_into()
+            .map_err(|e: std::array::TryFromSliceError| CodecError::Wrapped(e.into()))?;
+        Ok(TestField(u32::from_be_bytes(bytes)))
     }
 }
 
@@ -118,12 +113,8 @@ pub struct KeyPrefix2(pub u32, pub u32);
 impl<S: Schema> SeekKeyEncoder<S> for KeyPrefix2 {
     fn encode_seek_key(&self) -> Result<Vec<u8>, CodecError> {
         let mut bytes = vec![];
-        bytes
-            .write_u32::<BigEndian>(self.0)
-            .map_err(|e| CodecError::Wrapped(e.into()))?;
-        bytes
-            .write_u32::<BigEndian>(self.1)
-            .map_err(|e| CodecError::Wrapped(e.into()))?;
+        bytes.extend_from_slice(&self.0.to_be_bytes());
+        bytes.extend_from_slice(&self.1.to_be_bytes());
         Ok(bytes)
     }
 }
