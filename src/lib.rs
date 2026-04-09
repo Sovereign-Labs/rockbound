@@ -102,6 +102,17 @@ pub fn default_cf_descriptor(cf_name: impl Into<String>) -> rocksdb::ColumnFamil
     rocksdb::ColumnFamilyDescriptor::new(cf_name, cf_opts)
 }
 
+/// Returns a column family descriptor using the provided RocksDB options verbatim.
+///
+/// Callers that want full control over column-family configuration can build a single
+/// [`rocksdb::Options`] and reuse it across descriptors through this helper.
+pub fn cf_descriptor_with_options(
+    cf_name: impl Into<String>,
+    cf_opts: &rocksdb::Options,
+) -> rocksdb::ColumnFamilyDescriptor {
+    rocksdb::ColumnFamilyDescriptor::new(cf_name, cf_opts.clone())
+}
+
 impl DB {
     /// Opens a database backed by RocksDB, using the provided column family names and default
     /// column family options. The opened DB does not support caching. If you need caching, use the `open_with_cfds` method instead.
@@ -117,6 +128,25 @@ impl DB {
         let descriptors = column_families
             .into_iter()
             .map(|cf| default_cf_descriptor(cf.into()));
+        let db = DB::open_with_cfds(db_opts, path, name, descriptors)?;
+        Ok(db)
+    }
+
+    /// Opens a database backed by RocksDB using the provided DB options and one shared set of
+    /// column-family options cloned into each column family descriptor.
+    ///
+    /// Callers that need different options per column family should use [`DB::open_with_cfds`].
+    #[tracing::instrument(skip_all, level = "error")]
+    pub fn open_with_cf_opts(
+        path: impl AsRef<Path>,
+        name: &'static str,
+        column_families: impl IntoIterator<Item = impl Into<String>>,
+        db_opts: &rocksdb::Options,
+        cf_opts: &rocksdb::Options,
+    ) -> anyhow::Result<Self> {
+        let descriptors = column_families
+            .into_iter()
+            .map(|cf| cf_descriptor_with_options(cf.into(), cf_opts));
         let db = DB::open_with_cfds(db_opts, path, name, descriptors)?;
         Ok(db)
     }
@@ -727,5 +757,27 @@ mod tests {
         assert!(!is_range_bounds_inverse(&(vec![3]..vec![3])));
         // Not inverse
         assert!(!is_range_bounds_inverse(&(vec![3]..=vec![3])));
+    }
+
+    #[test]
+    fn test_db_open_with_cf_opts() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let column_families = vec![DEFAULT_COLUMN_FAMILY_NAME];
+
+        let mut db_opts = rocksdb::Options::default();
+        db_opts.create_if_missing(true);
+        db_opts.create_missing_column_families(true);
+
+        let mut cf_opts = rocksdb::Options::default();
+        cf_opts.set_compression_type(rocksdb::DBCompressionType::None);
+
+        DB::open_with_cf_opts(
+            tmpdir.path(),
+            "test_db_open_with_cf_opts",
+            column_families,
+            &db_opts,
+            &cf_opts,
+        )
+        .expect("Failed to open DB.");
     }
 }

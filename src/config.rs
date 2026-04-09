@@ -1,39 +1,12 @@
-/// Port selected RocksDB options for tuning underlying rocksdb instance of our state db.
-/// The current default values are taken from Aptos. TODO: tune rocksdb for our workload.
-/// see <https://github.com/facebook/rocksdb/blob/master/include/rocksdb/options.h>
-/// for detailed explanations.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct RocksdbConfig {
-    /// The maximum number of files that can be open concurrently. Defaults to 5000
-    pub max_open_files: i32,
-    /// Once write-ahead logs exceed this size, RocksDB will start forcing the flush of column
-    /// families whose memtables are backed by the oldest live WAL file. Defaults to 1GB
-    pub max_total_wal_size: u64,
-    /// The maximum number of background threads, including threads for flushing and compaction. Defaults to 16.
-    pub max_background_jobs: i32,
-}
-
-impl Default for RocksdbConfig {
-    fn default() -> Self {
-        Self {
-            // Allow db to close old sst files, saving memory.
-            max_open_files: 5000,
-            // For now we set the max total WAL size to be 1G. This config can be useful when column
-            // families are updated at non-uniform frequencies.
-            max_total_wal_size: 1u64 << 30,
-            // This includes threads for flushing and compaction. Rocksdb will decide the # of
-            // threads to use internally.
-            max_background_jobs: 16,
-        }
-    }
-}
+/// Alias for the full RocksDB options surface exposed by the upstream crate.
+///
+/// `rocksdb::Options` contains both DB-wide and column-family-specific settings, so callers can
+/// use any upstream setter before passing the config to [`gen_rocksdb_options`].
+pub type RocksdbConfig = rocksdb::Options;
 
 /// Generate [`rocksdb::Options`] corresponding to the given [`RocksdbConfig`].
 pub fn gen_rocksdb_options(config: &RocksdbConfig, readonly: bool) -> rocksdb::Options {
-    let mut db_opts = rocksdb::Options::default();
-    db_opts.set_max_open_files(config.max_open_files);
-    db_opts.set_max_total_wal_size(config.max_total_wal_size);
-    db_opts.set_max_background_jobs(config.max_background_jobs);
+    let mut db_opts = config.clone();
     if !readonly {
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
@@ -53,4 +26,39 @@ pub fn gen_rocksdb_options(config: &RocksdbConfig, readonly: bool) -> rocksdb::O
     }
 
     db_opts
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{DB, DEFAULT_COLUMN_FAMILY_NAME};
+
+    use super::*;
+
+    #[test]
+    fn gen_rocksdb_options_preserves_full_upstream_options_surface() {
+        let mut config = RocksdbConfig::default();
+        config.set_max_open_files(42);
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let missing_db_path = tmpdir.path().join("missing-db");
+        let writable_db_path = tmpdir.path().join("writable-db");
+        let column_families = vec![DEFAULT_COLUMN_FAMILY_NAME];
+
+        assert!(DB::open(
+            &missing_db_path,
+            "missing-db",
+            column_families.clone(),
+            &config,
+        )
+        .is_err());
+
+        let writable_config = gen_rocksdb_options(&config, false);
+        DB::open(
+            &writable_db_path,
+            "writable-db",
+            column_families,
+            &writable_config,
+        )
+        .unwrap();
+    }
 }
