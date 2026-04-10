@@ -125,6 +125,21 @@ impl CfDescriptorBuilder {
             .get_or_insert_with(rocksdb::BlockBasedOptions::default)
     }
 
+    /// Apply RocksDB's point-lookup tuning while keeping the block-based table options mutable.
+    pub fn optimize_for_point_lookup(&mut self, block_cache_size_mb: u64) {
+        let block_cache_size = usize::try_from(block_cache_size_mb)
+            .ok()
+            .and_then(|mb| mb.checked_mul(1024 * 1024))
+            .expect("point-lookup block cache size must fit in usize");
+        let block_opts = self.block_based_table_options_mut();
+        block_opts.set_data_block_index_type(rocksdb::DataBlockIndexType::BinaryAndHash);
+        block_opts.set_data_block_hash_ratio(0.75);
+        block_opts.set_bloom_filter(10.0, true);
+        block_opts.set_block_cache(&rocksdb::Cache::new_lru_cache(block_cache_size));
+        self.cf_opts.set_memtable_prefix_bloom_ratio(0.02);
+        self.cf_opts.set_memtable_whole_key_filtering(true);
+    }
+
     /// Finalize the builder into a RocksDB column family descriptor.
     pub fn finish(mut self, cf_name: impl Into<String>) -> rocksdb::ColumnFamilyDescriptor {
         if let Some(table_opts) = self.table_opts.take() {

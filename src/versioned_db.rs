@@ -303,7 +303,7 @@ fn live_versioned_column_family_descriptor_with(
 ) -> ColumnFamilyDescriptor {
     default_cf_descriptor_with(name, |cf_name, builder| {
         // Use a 1GB block cache. TODO: Tune this value
-        builder.options_mut().optimize_for_point_lookup(1024);
+        builder.optimize_for_point_lookup(1024);
         customize(cf_name, VersionedColumnFamilyKind::Live, builder);
     })
 }
