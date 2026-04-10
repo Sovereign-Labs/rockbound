@@ -33,4 +33,5 @@ tokio = { version = "1", default-features = false, features = ["macros"] }
 [features]
 default = []
 arbitrary = ["dep:proptest", "dep:proptest-derive", "rockbound/arbitrary"]
+bindgen-runtime = ["rocksdb/bindgen-runtime"]
 test-utils = ["arbitrary", "quick_cache/stats"]
