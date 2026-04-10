@@ -26,7 +26,8 @@ mod config;
 #[cfg(feature = "test-utils")]
 pub mod test;
 
-pub use config::{gen_rocksdb_options, RocksdbConfig};
+pub use config::{gen_rocksdb_options, gen_rocksdb_options_with, RocksdbConfig};
+pub use versioned_db::VersionedColumnFamilyKind;
 
 use std::{path::Path, sync::Arc};
 
@@ -97,9 +98,56 @@ pub struct DB {
 
 /// Returns the default column family descriptor. Includes LZ4 compression.
 pub fn default_cf_descriptor(cf_name: impl Into<String>) -> rocksdb::ColumnFamilyDescriptor {
-    let mut cf_opts = rocksdb::Options::default();
-    cf_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-    rocksdb::ColumnFamilyDescriptor::new(cf_name, cf_opts)
+    default_cf_descriptor_with(cf_name, |_, _| {})
+}
+
+/// Mutable builder for a column family descriptor, including optional block-based table options.
+#[derive(Default)]
+pub struct CfDescriptorBuilder {
+    cf_opts: rocksdb::Options,
+    table_opts: Option<rocksdb::BlockBasedOptions>,
+}
+
+impl CfDescriptorBuilder {
+    /// Create a new builder with default RocksDB options.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Access the mutable RocksDB column family options.
+    pub fn options_mut(&mut self) -> &mut rocksdb::Options {
+        &mut self.cf_opts
+    }
+
+    /// Access block-based table options, creating them if they do not exist yet.
+    pub fn block_based_table_options_mut(&mut self) -> &mut rocksdb::BlockBasedOptions {
+        self.table_opts
+            .get_or_insert_with(rocksdb::BlockBasedOptions::default)
+    }
+
+    /// Finalize the builder into a RocksDB column family descriptor.
+    pub fn finish(mut self, cf_name: impl Into<String>) -> rocksdb::ColumnFamilyDescriptor {
+        if let Some(table_opts) = self.table_opts.take() {
+            self.cf_opts.set_block_based_table_factory(&table_opts);
+        }
+
+        rocksdb::ColumnFamilyDescriptor::new(cf_name, self.cf_opts)
+    }
+}
+
+/// Returns the default column family descriptor and lets callers customize the RocksDB options
+/// before the descriptor is finalized.
+pub fn default_cf_descriptor_with(
+    cf_name: impl Into<String>,
+    customize: impl FnOnce(&str, &mut CfDescriptorBuilder),
+) -> rocksdb::ColumnFamilyDescriptor {
+    let cf_name = cf_name.into();
+    let mut builder = CfDescriptorBuilder::new();
+    builder
+        .options_mut()
+        .set_compression_type(rocksdb::DBCompressionType::Lz4);
+    customize(&cf_name, &mut builder);
+    builder.finish(cf_name)
 }
 
 impl DB {
@@ -117,6 +165,25 @@ impl DB {
         let descriptors = column_families
             .into_iter()
             .map(|cf| default_cf_descriptor(cf.into()));
+        let db = DB::open_with_cfds(db_opts, path, name, descriptors)?;
+        Ok(db)
+    }
+
+    /// Opens a database backed by RocksDB, using one shared callback to customize each default
+    /// column family descriptor before opening the DB.
+    #[tracing::instrument(skip_all, level = "error")]
+    pub fn open_with_default_cfs(
+        path: impl AsRef<Path>,
+        name: &'static str,
+        column_families: impl IntoIterator<Item = impl Into<String>>,
+        db_opts: &rocksdb::Options,
+        mut customize_cf: impl FnMut(&str, &mut CfDescriptorBuilder),
+    ) -> anyhow::Result<Self> {
+        let descriptors = column_families.into_iter().map(|cf| {
+            default_cf_descriptor_with(cf.into(), |cf_name, builder| {
+                customize_cf(cf_name, builder);
+            })
+        });
         let db = DB::open_with_cfds(db_opts, path, name, descriptors)?;
         Ok(db)
     }
