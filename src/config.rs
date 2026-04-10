@@ -6,7 +6,20 @@ pub type RocksdbConfig = rocksdb::Options;
 
 /// Generate [`rocksdb::Options`] corresponding to the given [`RocksdbConfig`].
 pub fn gen_rocksdb_options(config: &RocksdbConfig, readonly: bool) -> rocksdb::Options {
-    let mut db_opts = config.clone();
+    gen_rocksdb_options_with(config, readonly, |_| {})
+}
+
+/// Generate [`rocksdb::Options`] from [`RocksdbConfig`] and then allow callers to apply
+/// additional upstream RocksDB settings without replacing the existing default behavior.
+pub fn gen_rocksdb_options_with(
+    config: &RocksdbConfig,
+    readonly: bool,
+    customize: impl FnOnce(&mut rocksdb::Options),
+) -> rocksdb::Options {
+    let mut db_opts = rocksdb::Options::default();
+    db_opts.set_max_open_files(config.max_open_files);
+    db_opts.set_max_total_wal_size(config.max_total_wal_size);
+    db_opts.set_max_background_jobs(config.max_background_jobs);
     if !readonly {
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
@@ -25,6 +38,8 @@ pub fn gen_rocksdb_options(config: &RocksdbConfig, readonly: bool) -> rocksdb::O
         // Default: false
     }
 
+    customize(&mut db_opts);
+
     db_opts
 }
 
@@ -35,9 +50,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gen_rocksdb_options_preserves_full_upstream_options_surface() {
-        let mut config = RocksdbConfig::default();
-        config.set_max_open_files(42);
+    fn gen_rocksdb_options_with_preserves_existing_defaults_and_allows_customization() {
+        let config = RocksdbConfig::default();
 
         let tmpdir = tempfile::tempdir().unwrap();
         let missing_db_path = tmpdir.path().join("missing-db");
@@ -48,11 +62,13 @@ mod tests {
             &missing_db_path,
             "missing-db",
             column_families.clone(),
-            &config,
+            &gen_rocksdb_options(&config, true),
         )
         .is_err());
 
-        let writable_config = gen_rocksdb_options(&config, false);
+        let writable_config = gen_rocksdb_options_with(&config, false, |opts| {
+            opts.set_keep_log_file_num(7);
+        });
         DB::open(
             &writable_db_path,
             "writable-db",
