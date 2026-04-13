@@ -959,12 +959,33 @@ where
     ///
     /// Note that the returned iterator holds a read lock over the DB, so no writes can complete while it is active.
     pub fn iter_with_prefix(&self, prefix: V::Key) -> anyhow::Result<VersionedDbIterator<'_, V>> {
+        self.iter_with_prefix_and_cursor(prefix, None)
+    }
+
+    /// Construct an iterator over the versioned DB with a given prefix, skipping until the given key is reached. Note that
+    /// any values exactly equal to the cursor *will* be included in the iterator.
+    ///
+    /// Note that the returned iterator holds a read lock over the DB, so no writes can complete while it is active.
+    pub fn iter_with_prefix_and_cursor(
+        &self,
+        prefix: V::Key,
+        skip_until: Option<V::Key>,
+    ) -> anyhow::Result<VersionedDbIterator<'_, V>> {
         let read_lock = self.db.versioned_db_cache.read();
         let version_on_disk = self.db.get_committed_version_live_db()?;
-        // println!("Version on disk: {:?}", version_on_disk);
-        let raw_prefix = prefix.clone()..;
         let encoded_prefix = prefix.encode_key()?;
-        let range = encoded_prefix.clone()..;
+
+        let (encoded_range, raw_range_start): (_, V::Key) = if let Some(skip_until) = skip_until {
+            if !skip_until.has_prefix(&prefix) {
+                return Err(anyhow::anyhow!("cursor must have appropriate prefix"));
+            }
+            let encoded_skip_until = skip_until.encode_key()?;
+            (encoded_skip_until.clone().., skip_until.clone())
+        } else {
+            let encoded_prefix = prefix.encode_key()?;
+            (encoded_prefix.clone().., prefix.clone())
+        };
+
         let latest_version = self.latest_version();
         if version_on_disk.is_some_and(|v| v > latest_version.unwrap_or(0)) {
             return Err(anyhow::anyhow!("Version on disk is newer than the latest version in the reader. Cannot create an iterator which is guaranteed to be consistent with the version of this storage."));
@@ -990,7 +1011,7 @@ where
                 Some(
                     snapshot
                         .versioned_table_writes
-                        .range(raw_prefix.clone())
+                        .range(raw_range_start.clone()..)
                         .peekable(),
                 )
             })
@@ -999,7 +1020,7 @@ where
         let db_iterator = Some(
             self.db
                 .live_db
-                .iter_range_allow_cached::<V>(&read_lock, range, ScanDirection::Forward)?
+                .iter_range_allow_cached::<V>(&read_lock, encoded_range, ScanDirection::Forward)?
                 .peekable(),
         );
         Ok(VersionedDbIterator {
