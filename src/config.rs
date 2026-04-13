@@ -30,6 +30,16 @@ impl Default for RocksdbConfig {
 
 /// Generate [`rocksdb::Options`] corresponding to the given [`RocksdbConfig`].
 pub fn gen_rocksdb_options(config: &RocksdbConfig, readonly: bool) -> rocksdb::Options {
+    gen_rocksdb_options_with(config, readonly, |_| {})
+}
+
+/// Generate [`rocksdb::Options`] from [`RocksdbConfig`] and then allow callers to apply
+/// additional upstream RocksDB settings without replacing the existing default behavior.
+pub fn gen_rocksdb_options_with(
+    config: &RocksdbConfig,
+    readonly: bool,
+    customize: impl FnOnce(&mut rocksdb::Options),
+) -> rocksdb::Options {
     let mut db_opts = rocksdb::Options::default();
     db_opts.set_max_open_files(config.max_open_files);
     db_opts.set_max_total_wal_size(config.max_total_wal_size);
@@ -52,5 +62,43 @@ pub fn gen_rocksdb_options(config: &RocksdbConfig, readonly: bool) -> rocksdb::O
         // Default: false
     }
 
+    customize(&mut db_opts);
+
     db_opts
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{DB, DEFAULT_COLUMN_FAMILY_NAME};
+
+    use super::*;
+
+    #[test]
+    fn gen_rocksdb_options_with_preserves_existing_defaults_and_allows_customization() {
+        let config = RocksdbConfig::default();
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let missing_db_path = tmpdir.path().join("missing-db");
+        let writable_db_path = tmpdir.path().join("writable-db");
+        let column_families = vec![DEFAULT_COLUMN_FAMILY_NAME];
+
+        assert!(DB::open(
+            &missing_db_path,
+            "missing-db",
+            column_families.clone(),
+            &gen_rocksdb_options(&config, true),
+        )
+        .is_err());
+
+        let writable_config = gen_rocksdb_options_with(&config, false, |opts| {
+            opts.set_keep_log_file_num(7);
+        });
+        DB::open(
+            &writable_db_path,
+            "writable-db",
+            column_families,
+            &writable_config,
+        )
+        .unwrap();
+    }
 }
