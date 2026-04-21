@@ -15,11 +15,11 @@ use quick_cache::sync::Cache;
 use rocksdb::ColumnFamilyDescriptor;
 
 use crate::{
-    default_cf_descriptor,
+    default_cf_descriptor_with,
     iterator::{RawDbIter, ScanDirection},
     metrics::{SCHEMADB_BATCH_COMMIT_BYTES, SCHEMADB_DELETES, SCHEMADB_PUT_BYTES},
     schema::{ColumnFamilyName, KeyDecoder, KeyEncoder, ValueCodec},
-    BasicWeighter, CacheForSchema, CodecError, Schema, DB,
+    BasicWeighter, CacheForSchema, CfDescriptorBuilder, CodecError, Schema, DB,
 };
 
 #[derive(Debug, Default)]
@@ -284,12 +284,28 @@ where
     }
 }
 
-fn live_versioned_column_family_descriptor(name: &str) -> ColumnFamilyDescriptor {
-    let mut cf_opts: rocksdb::Options = rocksdb::Options::default();
-    cf_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-    // Use a 1GB block cache. TODO: Tune this value
-    cf_opts.optimize_for_point_lookup(1024);
-    rocksdb::ColumnFamilyDescriptor::new(name, cf_opts)
+/// The role of a versioned column family within a live or archival RocksDB instance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VersionedColumnFamilyKind {
+    /// The live key/value column family.
+    Live,
+    /// The historical versioned values column family.
+    Historical,
+    /// The pruning keys column family.
+    Pruning,
+    /// The version metadata column family.
+    Metadata,
+}
+
+fn live_versioned_column_family_descriptor_with(
+    name: &str,
+    customize: impl FnOnce(&str, VersionedColumnFamilyKind, &mut CfDescriptorBuilder),
+) -> ColumnFamilyDescriptor {
+    default_cf_descriptor_with(name, |cf_name, builder| {
+        // Use a 1GB block cache. TODO: Tune this value
+        builder.optimize_for_point_lookup(1024);
+        customize(cf_name, VersionedColumnFamilyKind::Live, builder);
+    })
 }
 
 /// A marker trait showing that a type **HAS NOOP SERIALIZATION** implements `Clone` and `AsRef<[u8]>`, is cheaply cloneable.
@@ -373,19 +389,41 @@ where
     pub fn add_live_db_column_families(
         existing_column_families: &mut Vec<ColumnFamilyDescriptor>,
     ) -> anyhow::Result<()> {
+        Self::add_live_db_column_families_with(existing_column_families, |_, _, _| {})
+    }
+
+    /// Adds the column families for the live db, allowing callers to customize each descriptor.
+    pub fn add_live_db_column_families_with(
+        existing_column_families: &mut Vec<ColumnFamilyDescriptor>,
+        mut customize: impl FnMut(&str, VersionedColumnFamilyKind, &mut CfDescriptorBuilder),
+    ) -> anyhow::Result<()> {
         let live_column_family = V::COLUMN_FAMILY_NAME;
         let metadata_column_family = V::VERSION_METADATA_COLUMN_FAMILY_NAME;
 
         Self::validate_column_families(existing_column_families)?;
 
-        existing_column_families.push(live_versioned_column_family_descriptor(live_column_family));
-        existing_column_families.push(default_cf_descriptor(metadata_column_family));
+        existing_column_families.push(live_versioned_column_family_descriptor_with(
+            live_column_family,
+            |cf_name, kind, builder| customize(cf_name, kind, builder),
+        ));
+        existing_column_families.push(default_cf_descriptor_with(
+            metadata_column_family,
+            |cf_name, builder| customize(cf_name, VersionedColumnFamilyKind::Metadata, builder),
+        ));
         Ok(())
     }
 
     /// Adds the column families for the archival db.
     pub fn add_archival_db_column_families(
         existing_column_families: &mut Vec<ColumnFamilyDescriptor>,
+    ) -> anyhow::Result<()> {
+        Self::add_archival_db_column_families_with(existing_column_families, |_, _, _| {})
+    }
+
+    /// Adds the column families for the archival db, allowing callers to customize each descriptor.
+    pub fn add_archival_db_column_families_with(
+        existing_column_families: &mut Vec<ColumnFamilyDescriptor>,
+        mut customize: impl FnMut(&str, VersionedColumnFamilyKind, &mut CfDescriptorBuilder),
     ) -> anyhow::Result<()> {
         let historical_versioned_column_family = V::HISTORICAL_COLUMN_FAMILY_NAME;
         let pruning_column_family = V::PRUNING_COLUMN_FAMILY_NAME;
@@ -394,10 +432,22 @@ where
 
         Self::validate_column_families(existing_column_families)?;
 
-        existing_column_families.push(default_cf_descriptor(historical_versioned_column_family));
-        existing_column_families.push(default_cf_descriptor(pruning_column_family));
-        existing_column_families.push(live_versioned_column_family_descriptor(live_column_family));
-        existing_column_families.push(default_cf_descriptor(metadata_column_family));
+        existing_column_families.push(default_cf_descriptor_with(
+            historical_versioned_column_family,
+            |cf_name, builder| customize(cf_name, VersionedColumnFamilyKind::Historical, builder),
+        ));
+        existing_column_families.push(default_cf_descriptor_with(
+            pruning_column_family,
+            |cf_name, builder| customize(cf_name, VersionedColumnFamilyKind::Pruning, builder),
+        ));
+        existing_column_families.push(live_versioned_column_family_descriptor_with(
+            live_column_family,
+            |cf_name, kind, builder| customize(cf_name, kind, builder),
+        ));
+        existing_column_families.push(default_cf_descriptor_with(
+            metadata_column_family,
+            |cf_name, builder| customize(cf_name, VersionedColumnFamilyKind::Metadata, builder),
+        ));
         Ok(())
     }
 
