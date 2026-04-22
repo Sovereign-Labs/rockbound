@@ -127,7 +127,7 @@ impl CfDescriptorBuilder {
 
     /// Apply RocksDB's point-lookup tuning while keeping the block-based table options mutable.
     ///
-    /// These options are taken directly from the rocksdb source
+    /// These options are taken directly from the rocksdb source: https://github.com/facebook/rocksdb/blob/809ed26be58e390d5e4dd271bfd4de5ecd23576b/options/options.cc#L647
     pub fn optimize_for_point_lookup(&mut self, block_cache_size_mb: u64) {
         let block_cache_size = usize::try_from(block_cache_size_mb)
             .ok()
@@ -136,7 +136,7 @@ impl CfDescriptorBuilder {
         let block_opts = self.block_based_table_options_mut();
         block_opts.set_data_block_index_type(rocksdb::DataBlockIndexType::BinaryAndHash);
         block_opts.set_data_block_hash_ratio(0.75);
-        block_opts.set_bloom_filter(10.0, true);
+        block_opts.set_bloom_filter(10.0, false);
         block_opts.set_block_cache(&rocksdb::Cache::new_lru_cache(block_cache_size));
         self.cf_opts.set_memtable_prefix_bloom_ratio(0.02);
         self.cf_opts.set_memtable_whole_key_filtering(true);
