@@ -97,9 +97,9 @@ fn test_cache_behavior_under_concurrency() {
     let barrier = Arc::new(Barrier::new(num_readers + 1));
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // Keys/value pairs have weight between 110 and 140 due to overhead. If we set the weight capacity to 50_000, we'll have some keys
+    // Keys/value pairs have weight between 110 and 1200 due to overhead. If we set the weight capacity to 250_000, we'll have some keys
     // in cache but not all.
-    versioned_db.set_cache_size(1000, 50_000);
+    versioned_db.set_cache_size(1000, 250_000);
 
     let mut handles = vec![];
 

@@ -152,7 +152,7 @@ impl CfDescriptorBuilder {
     }
 }
 
-// Returns the default column family descriptor and lets callers customize the RocksDB options
+/// Returns the default column family descriptor and lets callers customize the RocksDB options
 /// before the descriptor is finalized. LZ4 compression is enabled by default before the customization function is called.
 /// Any overrides to the compression type will supersede the default LZ4 compression.
 pub fn default_cf_descriptor_with(
