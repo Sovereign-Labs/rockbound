@@ -1003,7 +1003,14 @@ impl<V: SchemaWithVersion, C: CacheForVersionedDB<V>> VersionedDeltaReader<V, C>
 where
     V::Value: Clone + AsRef<[u8]>,
     V: Ord,
-    V::Key: Eq + std::hash::Hash + KeyEncoder<V> + KeyDecoder<V> + HasPrefix + Ord + AsRef<[u8]>,
+    V::Key: Eq
+        + std::hash::Hash
+        + KeyEncoder<V>
+        + KeyDecoder<V>
+        + HasPrefix
+        + Ord
+        + AsRef<[u8]>
+        + std::fmt::Debug,
 {
     /// Construct an iterator over the versioned DB with a given prefix.
     ///
@@ -1027,12 +1034,15 @@ where
 
         let (encoded_range, raw_range_start): (_, V::Key) = if let Some(skip_until) = skip_until {
             if !skip_until.has_prefix(&prefix) {
-                return Err(anyhow::anyhow!("cursor must have appropriate prefix"));
+                return Err(anyhow::anyhow!(
+                    "cursor must have appropriate prefix {:?}, got {:?}",
+                    prefix,
+                    skip_until
+                ));
             }
             let encoded_skip_until = skip_until.encode_key()?;
             (encoded_skip_until.clone().., skip_until.clone())
         } else {
-            let encoded_prefix = prefix.encode_key()?;
             (encoded_prefix.clone().., prefix.clone())
         };
 

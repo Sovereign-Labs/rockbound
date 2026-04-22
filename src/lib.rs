@@ -126,6 +126,8 @@ impl CfDescriptorBuilder {
     }
 
     /// Apply RocksDB's point-lookup tuning while keeping the block-based table options mutable.
+    ///
+    /// These options are taken directly from the rocksdb source
     pub fn optimize_for_point_lookup(&mut self, block_cache_size_mb: u64) {
         let block_cache_size = usize::try_from(block_cache_size_mb)
             .ok()
@@ -150,8 +152,9 @@ impl CfDescriptorBuilder {
     }
 }
 
-/// Returns the default column family descriptor and lets callers customize the RocksDB options
-/// before the descriptor is finalized.
+// Returns the default column family descriptor and lets callers customize the RocksDB options
+/// before the descriptor is finalized. LZ4 compression is enabled by default before the customization function is called.
+/// Any overrides to the compression type will supersede the default LZ4 compression.
 pub fn default_cf_descriptor_with(
     cf_name: impl Into<String>,
     customize: impl FnOnce(&str, &mut CfDescriptorBuilder),
