@@ -273,12 +273,33 @@ impl<S: Schema> VersionedSchemaBatch<S>
 where
     S::Key: Ord,
 {
-    /// Puts a key-value pair into the batch.
-    pub fn put_versioned(&mut self, key: S::Key, value: S::Value) {
+    /// Puts a non-empty key-value pair into the batch.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `value` serializes to zero bytes. Empty-byte values collide
+    /// with the tombstone encoding used by the archival column family and
+    /// would be silently dropped on historical reads. If you intend to remove
+    /// the key, call [`Self::delete_versioned`] instead.
+    pub fn put_versioned(&mut self, key: S::Key, value: S::Value)
+    where
+        S::Value: AsRef<[u8]>,
+    {
+        assert!(
+            !value.as_ref().is_empty(),
+            "Versioned values may not be zero-length: empty-byte values collide \
+             with the tombstone encoding used by the archival column family and \
+             would be silently dropped by `get_historical_value_raw`. If you \
+             intend to delete the key, call `delete_versioned` instead.",
+        );
         self.versioned_table_writes.insert(key, Some(value));
     }
 
     /// Deletes a key from the batch.
+    ///
+    /// `put_versioned` rejects zero-length values because they collide with
+    /// the archival tombstone encoding, so deletion must go through this
+    /// method.
     pub fn delete_versioned(&mut self, key: S::Key) {
         self.versioned_table_writes.insert(key, None);
     }
@@ -622,7 +643,13 @@ where
             // println!("Writing live key with version: {}. {:?}", version, key.as_ref());
             match value {
                 Some(value) => {
-                    assert!(!key_with_version.live_key().is_empty(), "Live values may not have zero-length. This prevents confusion with placholders for deleted values.");
+                    assert!(
+                        !value.as_ref().is_empty(),
+                        "Versioned values may not have zero-length: empty-byte values collide \
+                         with the tombstone placeholder used for deleted values. This indicates \
+                         a caller constructed a VersionedSchemaBatch bypassing `put_versioned` \
+                         (e.g. via the `From<IntoIterator>` impl or a future direct-insert helper).",
+                    );
                     // println!("Inserting live key: {:?}", key_with_version.live_key());
                     live_put_bytes += key_with_version.live_key().len() + value.as_ref().len();
                     live_db_batch.put_cf(live_cf_handle, key_with_version.live_key(), value);
