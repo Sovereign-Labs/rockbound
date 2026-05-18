@@ -19,7 +19,7 @@ use crate::{
     iterator::{RawDbIter, ScanDirection},
     metrics::{SCHEMADB_BATCH_COMMIT_BYTES, SCHEMADB_DELETES, SCHEMADB_PUT_BYTES},
     schema::{ColumnFamilyName, KeyDecoder, KeyEncoder, ValueCodec},
-    BasicWeighter, CacheForSchema, CfDescriptorBuilder, CodecError, Schema, DB,
+    BasicWeighter, CacheForSchema, CfDescriptorBuilder, CodecError, Schema, SchemaBatch, DB,
 };
 
 #[derive(Debug, Default)]
@@ -37,7 +37,7 @@ impl Schema for VersionMetadata {
 pub enum VersionedTableMetadataKey {
     /// The latest version that has been committed.
     CommittedVersion,
-    /// The newest version that has been pruned.
+    /// The newest version historical readers should treat as pruned.
     PrunedVersion,
 }
 
@@ -181,7 +181,9 @@ fn decode_version_metadata_value(data: &[u8]) -> Result<u64, CodecError> {
 impl<S: SchemaWithVersion, C: CacheForVersionedDB<S>> VersionedDB<S, C>
 // This where clause shouldn't be needed since it's implied by the Schema trait, but Rust intentionally doesn't elaborate these bounds.
 {
-    /// Returns the oldest version that is available in the database.
+    /// Returns the newest version historical readers should treat as pruned.
+    ///
+    /// Historical reads use `pruned_version + 1` as the oldest available version.
     pub fn get_pruned_version(&self) -> anyhow::Result<Option<u64>> {
         self.archival_db.get_raw_with_cf_and_decoder::<u64>(
             S::VERSION_METADATA_COLUMN_FAMILY_NAME,
@@ -531,6 +533,99 @@ where
             )
     }
 
+    /// Collects a batch of deletes that prunes versioned data older than
+    /// `last_committed - keep_versions`. The returned batch targets the `archival_db`:
+    /// the caller commits it via `archival_db.write_schemas(&output.batch)`.
+    ///
+    /// On commit, the batch:
+    /// - deletes pruning-CF entries `[V|K]` with `V <= cutoff` for every visited key,
+    /// - deletes the historical-CF entry of the *previous* write of each such K (so the
+    ///   most recent write at or before `cutoff` survives, preserving the invariant
+    ///   that every live key has at least one historical entry; see the doc on
+    ///   [`VersionedDB`]),
+    /// - writes [`VersionedTableMetadataKey::PrunedVersion`] = the greatest
+    ///   `version - 1` for which this batch deleted a historical row, if any.
+    ///
+    /// `keep_versions` must be `>= 1`. If the database has no committed version yet,
+    /// or if `last_committed < keep_versions`, the returned batch is empty and
+    /// `last_pruned_version` is `None`.
+    ///
+    /// When `max_batch_size` is set, iteration stops once that many historical-CF
+    /// deletes have been collected; `hit_size_limit` is then `true` and the caller
+    /// should commit the batch and re-invoke to drain the rest.
+    pub fn collect_pruning_batch(
+        &self,
+        keep_versions: u64,
+        max_batch_size: Option<usize>,
+    ) -> anyhow::Result<PruningBatchOutput> {
+        if keep_versions == 0 {
+            anyhow::bail!("keep_versions must be >= 1");
+        }
+
+        let mut batch = SchemaBatch::new();
+        let mut keys_inspected = 0usize;
+        let mut keys_to_prune = 0usize;
+        let mut hit_size_limit = false;
+        let mut last_pruned_version = None;
+
+        let Some(cutoff) = self
+            .get_committed_version_live_db()?
+            .and_then(|last_committed| last_committed.checked_sub(keep_versions))
+        else {
+            return Ok(PruningBatchOutput {
+                batch,
+                hit_size_limit: false,
+                last_pruned_version: None,
+                keys_inspected: 0,
+                keys_to_prune: 0,
+            });
+        };
+
+        for prunable in self.iter_pruning_keys_up_to_version(cutoff)? {
+            keys_inspected += 1;
+            let (version, key) = prunable.version_and_key();
+
+            let mut pruning_key_bytes = version.to_be_bytes().to_vec();
+            pruning_key_bytes.extend_from_slice(key.as_ref());
+            batch.delete_cf_raw(V::PRUNING_COLUMN_FAMILY_NAME, pruning_key_bytes);
+
+            // Look up the previous version of this key and delete that historical entry,
+            // keeping the entry at `version` intact. When `version == 0` or the key has no
+            // earlier write, leave the historical CF alone — preserves the "at least one
+            // entry per live key" invariant.
+            if let Some(query_version) = version.checked_sub(1) {
+                if let Some(prev_version) = self.get_version_for_key(&key, query_version)? {
+                    let mut hist_key_bytes = key.as_ref().to_vec();
+                    hist_key_bytes.extend_from_slice(&prev_version.to_be_bytes());
+                    batch.delete_cf_raw(V::HISTORICAL_COLUMN_FAMILY_NAME, hist_key_bytes);
+                    keys_to_prune += 1;
+                    last_pruned_version = Some(query_version);
+                }
+            }
+
+            if max_batch_size.is_some_and(|m| keys_to_prune >= m) {
+                hit_size_limit = true;
+                break;
+            }
+        }
+
+        if let Some(v) = last_pruned_version {
+            batch.put_cf_raw(
+                V::VERSION_METADATA_COLUMN_FAMILY_NAME,
+                VersionedTableMetadataKey::PrunedVersion.as_bytes().to_vec(),
+                v.to_be_bytes().to_vec(),
+            );
+        }
+
+        Ok(PruningBatchOutput {
+            batch,
+            hit_size_limit,
+            last_pruned_version,
+            keys_inspected,
+            keys_to_prune,
+        })
+    }
+
     fn load_committed_version_from_disk(live_db: &DB) -> anyhow::Result<Option<u64>> {
         live_db.get_raw_with_cf_and_decoder::<u64>(
             V::VERSION_METADATA_COLUMN_FAMILY_NAME,
@@ -801,6 +896,25 @@ pub struct VersionedDbMetrics {
     pub deletes: usize,
     pub archival_puts_bytes: usize,
     pub pruning_puts_bytes: usize,
+}
+
+/// Output of [`VersionedDB::collect_pruning_batch`].
+///
+/// The caller commits `batch` via `archival_db.write_schemas(&output.batch)`.
+#[derive(Debug)]
+pub struct PruningBatchOutput {
+    /// Multi-CF batch of deletes and the metadata write.
+    pub batch: SchemaBatch,
+    /// `true` if iteration stopped because `max_batch_size` was reached. Caller should
+    /// commit and re-invoke until this returns `false`.
+    pub hit_size_limit: bool,
+    /// The value recorded into [`VersionedTableMetadataKey::PrunedVersion`], or `None`
+    /// when this batch deleted no historical rows.
+    pub last_pruned_version: Option<u64>,
+    /// Number of pruning-CF entries the iterator visited. For metrics.
+    pub keys_inspected: usize,
+    /// Number of historical-CF delete operations placed in the batch. For metrics.
+    pub keys_to_prune: usize,
 }
 
 #[derive(Debug, Clone)]

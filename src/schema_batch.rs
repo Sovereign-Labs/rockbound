@@ -104,6 +104,30 @@ impl<K: Ord, V> SchemaBatch<K, V> {
         Ok(())
     }
 
+    /// Add a delete op against a column family known only at runtime.
+    ///
+    /// Use this when the CF name comes from a trait constant or other runtime source
+    /// rather than from a `Schema` impl in scope. Mirrors [`Self::delete_raw`] but takes
+    /// the CF name as an argument instead of inferring it from `S::COLUMN_FAMILY_NAME`.
+    pub(crate) fn delete_cf_raw(&mut self, cf_name: ColumnFamilyName, key: K) {
+        self.last_writes
+            .entry(cf_name)
+            .or_default()
+            .insert(key, Operation::Delete);
+    }
+
+    /// Add a put op against a column family known only at runtime.
+    ///
+    /// Use this when the CF name comes from a trait constant or other runtime source
+    /// rather than from a `Schema` impl in scope. Mirrors [`Self::put_raw`] but takes
+    /// the CF name as an argument instead of inferring it from `S::COLUMN_FAMILY_NAME`.
+    pub(crate) fn put_cf_raw(&mut self, cf_name: ColumnFamilyName, key: K, value: V) {
+        self.last_writes
+            .entry(cf_name)
+            .or_default()
+            .insert(key, Operation::Put { value });
+    }
+
     fn insert_operation<S: Schema>(&mut self, key: K, operation: Operation<K, V>) {
         let column_writes = self.last_writes.entry(S::COLUMN_FAMILY_NAME).or_default();
         column_writes.insert(key, operation);

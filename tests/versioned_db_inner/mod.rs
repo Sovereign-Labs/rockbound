@@ -1,6 +1,7 @@
 mod cache;
 mod delta_reader;
 mod iterator;
+mod pruning;
 
 use std::sync::Arc;
 
