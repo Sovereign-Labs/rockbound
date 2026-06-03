@@ -128,6 +128,19 @@ impl<K: Ord, V> SchemaBatch<K, V> {
             .insert(key, Operation::Put { value });
     }
 
+    /// Add a delete-range op against a column family known only at runtime.
+    ///
+    /// Mirrors [`Self::delete_range`] but takes the CF name as an argument and raw,
+    /// already-encoded bounds instead of inferring the CF from a `Schema` in scope.
+    /// The range is `[from, to)` (inclusive `from`, exclusive `to`), matching RocksDB's
+    /// `delete_range_cf`.
+    pub(crate) fn delete_range_cf_raw(&mut self, cf_name: ColumnFamilyName, from: K, to: K) {
+        self.range_ops
+            .entry(cf_name)
+            .or_default()
+            .push(Operation::DeleteRange { from, to });
+    }
+
     fn insert_operation<S: Schema>(&mut self, key: K, operation: Operation<K, V>) {
         let column_writes = self.last_writes.entry(S::COLUMN_FAMILY_NAME).or_default();
         column_writes.insert(key, operation);

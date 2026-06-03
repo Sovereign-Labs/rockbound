@@ -652,6 +652,20 @@ impl DB {
         Ok(())
     }
 
+    /// Triggers compaction of a single column family by name, over its full key range.
+    /// Drops tombstones and reclaims space. Heavy: rewrites the column family.
+    ///
+    /// Unlike [`Self::trigger_compaction`], this targets a column family that has no
+    /// [`Schema`] type in scope (e.g. a raw, runtime-named CF).
+    #[tracing::instrument(skip_all, level = "error")]
+    pub fn compact_cf(&self, cf_name: &str) -> anyhow::Result<()> {
+        let handle = self.get_cf_handle(cf_name)?;
+        // This has no effect on cache state, so it's safe to call without the lock.
+        self.db
+            .compact_range_cf::<&[u8], &[u8]>(&handle, None, None);
+        Ok(())
+    }
+
     /// Returns the current RocksDB property value for the provided column family name
     /// and property name.
     #[tracing::instrument(skip_all, level = "error")]

@@ -106,6 +106,37 @@ fn basic_prune() {
     assert_eq!(historical(&delta_reader, b"k", 6).unwrap(), Some(6));
 }
 
+/// Smoke test for `VersionedDB::trigger_compaction`: after pruning + compaction the
+/// archival CFs are rewritten (tombstones dropped) and reads are unchanged.
+#[test]
+fn basic_prune_with_compaction() {
+    let (_dir, db) = open_versioned();
+    for v in 0..=9u64 {
+        put_at(&db, &[(b"k", v as u32)], v);
+    }
+    let out = db.collect_pruning_batch(3, None).unwrap();
+    commit_pruning_batch(&db, &out.batch);
+
+    db.trigger_compaction().unwrap();
+
+    for v in 0..=5u64 {
+        assert_eq!(
+            hist(&db, b"k", v),
+            None,
+            "k @ v={v} pruned (post-compaction)"
+        );
+    }
+    for v in 6..=9u64 {
+        assert_eq!(
+            hist(&db, b"k", v),
+            Some(v as u32),
+            "k @ v={v} survives (post-compaction)"
+        );
+    }
+    assert_eq!(db.get_pruned_version().unwrap(), Some(5));
+    assert_eq!(live(&db, b"k"), Some(9));
+}
+
 /// Mirrors the accessory Pruner A..G layout. cutoff = 9 - 3 = 6.
 #[test]
 fn multi_key_layout() {
@@ -317,20 +348,24 @@ fn max_batch_size_split() {
     ));
     assert_eq!(historical(&delta_reader, b"k", 3).unwrap(), Some(3));
 
-    // After commit: pruning entries [0..=3|k] gone, historical k|0,1,2 gone.
-    // Remaining pruning entries ≤ cutoff: [4|k], [5|k], [6|k]. Each produces one historical delete.
+    // After commit: pruning entries [0..=2|k] gone, historical k|0,1,2 gone. The break
+    // entry [3|k] lingers — the range tombstone stops exclusively at it.
+    // Remaining pruning entries ≤ cutoff: [3|k], [4|k], [5|k], [6|k]. [3|k] is re-inspected
+    // (its predecessor is already gone, so it yields no historical delete); [4|k], [5|k],
+    // [6|k] each produce one historical delete.
     let out2 = db.collect_pruning_batch(3, Some(3)).unwrap();
     assert!(out2.hit_size_limit);
     assert_eq!(out2.last_pruned_version, Some(5));
     assert_eq!(out2.keys_to_prune, 3);
-    assert_eq!(out2.keys_inspected, 3);
+    assert_eq!(out2.keys_inspected, 4); // re-inspects [3|k], then [4|k], [5|k], [6|k]
     commit_pruning_batch(&db, &out2.batch);
 
-    // No remaining pruning entries ≤ cutoff.
+    // Only the lingering [6|k] remains ≤ cutoff; out3 re-inspects it (no historical delete,
+    // its predecessor is gone) and the range tombstone retires it.
     let out3 = db.collect_pruning_batch(3, Some(3)).unwrap();
     assert!(!out3.hit_size_limit);
     assert_eq!(out3.keys_to_prune, 0);
-    assert_eq!(out3.keys_inspected, 0);
+    assert_eq!(out3.keys_inspected, 1); // re-inspects the lingering [6|k]
     assert_eq!(out3.last_pruned_version, None);
     commit_pruning_batch(&db, &out3.batch);
 
@@ -342,6 +377,92 @@ fn max_batch_size_split() {
         assert_eq!(hist(&db, b"k", v), Some(v as u32));
     }
     assert_eq!(db.get_pruned_version().unwrap(), Some(5));
+}
+
+/// Draining with a small `max_batch_size` must converge to the exact same final state as a
+/// single uncapped prune, and must fully clear the pruning index — guarding against an
+/// off-by-one in the range bound (a stranded pruning entry) or an over-eager bound (an
+/// orphaned historical row).
+#[test]
+fn capped_prune_converges_to_uncapped() {
+    let workload = |db: &V| {
+        for v in 0..=9u64 {
+            // `k` written every version; `m` only on even versions.
+            if v % 2 == 0 {
+                put_at(db, &[(b"k", v as u32), (b"m", v as u32)], v);
+            } else {
+                put_at(db, &[(b"k", v as u32)], v);
+            }
+        }
+    };
+
+    let (_dir_a, uncapped) = open_versioned();
+    workload(&uncapped);
+    let out = uncapped.collect_pruning_batch(3, None).unwrap();
+    assert!(!out.hit_size_limit);
+    commit_pruning_batch(&uncapped, &out.batch);
+
+    let (_dir_b, capped) = open_versioned();
+    workload(&capped);
+    loop {
+        let out = capped.collect_pruning_batch(3, Some(2)).unwrap();
+        commit_pruning_batch(&capped, &out.batch);
+        if !out.hit_size_limit {
+            break;
+        }
+    }
+
+    // cutoff = 9 - 3 = 6. Both strategies must drain every pruning entry ≤ cutoff.
+    assert_eq!(
+        uncapped.iter_pruning_keys_up_to_version(6).unwrap().count(),
+        0
+    );
+    assert_eq!(
+        capped.iter_pruning_keys_up_to_version(6).unwrap().count(),
+        0
+    );
+
+    // Final historical + live state must be identical between the two strategies.
+    for v in 0..=9u64 {
+        assert_eq!(
+            hist(&capped, b"k", v),
+            hist(&uncapped, b"k", v),
+            "k @ v={v}"
+        );
+        assert_eq!(
+            hist(&capped, b"m", v),
+            hist(&uncapped, b"m", v),
+            "m @ v={v}"
+        );
+    }
+    assert_eq!(live(&capped, b"k"), live(&uncapped, b"k"));
+    assert_eq!(live(&capped, b"m"), live(&uncapped, b"m"));
+    assert_eq!(
+        capped.get_pruned_version().unwrap(),
+        uncapped.get_pruned_version().unwrap()
+    );
+}
+
+/// Locks the exclusive range bound: after a capped pass that breaks on `[3|k]`, that break
+/// entry's pruning index must still be present (it is retired on a later pass). The old
+/// per-key point-delete approach would have left `[4, 5, 6]` here instead.
+#[test]
+fn capped_prune_leaves_break_entry_in_pruning_index_one_pass() {
+    let (_dir, db) = open_versioned();
+    for v in 0..=9u64 {
+        put_at(&db, &[(b"k", v as u32)], v);
+    }
+    let out1 = db.collect_pruning_batch(3, Some(3)).unwrap();
+    assert!(out1.hit_size_limit);
+    assert_eq!(out1.keys_inspected, 4); // visited V=0,1,2,3 — unchanged from point-delete
+    commit_pruning_batch(&db, &out1.batch);
+
+    let remaining: Vec<u64> = db
+        .iter_pruning_keys_up_to_version(6)
+        .unwrap()
+        .map(|p| p.version_and_key().0)
+        .collect();
+    assert_eq!(remaining, vec![3, 4, 5, 6]);
 }
 
 #[test]
