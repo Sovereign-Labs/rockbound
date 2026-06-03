@@ -56,11 +56,11 @@ impl SchemaBatch {
         from: &impl SeekKeyEncoder<S>,
         to: &impl SeekKeyEncoder<S>,
     ) -> anyhow::Result<()> {
-        let ops = self.range_ops.entry(S::COLUMN_FAMILY_NAME).or_default();
-        ops.push(Operation::DeleteRange {
-            from: from.encode_seek_key()?,
-            to: to.encode_seek_key()?,
-        });
+        self.push_range_op_cf(
+            S::COLUMN_FAMILY_NAME,
+            from.encode_seek_key()?,
+            to.encode_seek_key()?,
+        );
         Ok(())
     }
 
@@ -110,10 +110,7 @@ impl<K: Ord, V> SchemaBatch<K, V> {
     /// rather than from a `Schema` impl in scope. Mirrors [`Self::delete_raw`] but takes
     /// the CF name as an argument instead of inferring it from `S::COLUMN_FAMILY_NAME`.
     pub(crate) fn delete_cf_raw(&mut self, cf_name: ColumnFamilyName, key: K) {
-        self.last_writes
-            .entry(cf_name)
-            .or_default()
-            .insert(key, Operation::Delete);
+        self.insert_operation_cf(cf_name, key, Operation::Delete);
     }
 
     /// Add a put op against a column family known only at runtime.
@@ -122,10 +119,7 @@ impl<K: Ord, V> SchemaBatch<K, V> {
     /// rather than from a `Schema` impl in scope. Mirrors [`Self::put_raw`] but takes
     /// the CF name as an argument instead of inferring it from `S::COLUMN_FAMILY_NAME`.
     pub(crate) fn put_cf_raw(&mut self, cf_name: ColumnFamilyName, key: K, value: V) {
-        self.last_writes
-            .entry(cf_name)
-            .or_default()
-            .insert(key, Operation::Put { value });
+        self.insert_operation_cf(cf_name, key, Operation::Put { value });
     }
 
     /// Add a delete-range op against a column family known only at runtime.
@@ -135,15 +129,28 @@ impl<K: Ord, V> SchemaBatch<K, V> {
     /// The range is `[from, to)` (inclusive `from`, exclusive `to`), matching RocksDB's
     /// `delete_range_cf`.
     pub(crate) fn delete_range_cf_raw(&mut self, cf_name: ColumnFamilyName, from: K, to: K) {
+        self.push_range_op_cf(cf_name, from, to);
+    }
+
+    fn insert_operation<S: Schema>(&mut self, key: K, operation: Operation<K, V>) {
+        self.insert_operation_cf(S::COLUMN_FAMILY_NAME, key, operation);
+    }
+
+    fn insert_operation_cf(
+        &mut self,
+        cf_name: ColumnFamilyName,
+        key: K,
+        operation: Operation<K, V>,
+    ) {
+        let column_writes = self.last_writes.entry(cf_name).or_default();
+        column_writes.insert(key, operation);
+    }
+
+    fn push_range_op_cf(&mut self, cf_name: ColumnFamilyName, from: K, to: K) {
         self.range_ops
             .entry(cf_name)
             .or_default()
             .push(Operation::DeleteRange { from, to });
-    }
-
-    fn insert_operation<S: Schema>(&mut self, key: K, operation: Operation<K, V>) {
-        let column_writes = self.last_writes.entry(S::COLUMN_FAMILY_NAME).or_default();
-        column_writes.insert(key, operation);
     }
 
     /// Getting the operation from current schema batch if present

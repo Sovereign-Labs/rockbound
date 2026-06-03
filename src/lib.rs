@@ -645,18 +645,15 @@ impl DB {
     /// Trigger compaction. Primarily used for testing.
     #[tracing::instrument(skip_all, level = "error")]
     pub fn trigger_compaction<S: Schema>(&self) -> anyhow::Result<()> {
-        let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
-        // This has no effect on cache state, so it's safe to call without the lock.
-        self.db
-            .compact_range_cf::<&[u8], &[u8]>(&cf_handle, None, None);
-        Ok(())
+        self.compact_cf(S::COLUMN_FAMILY_NAME)
     }
 
     /// Triggers compaction of a single column family by name, over its full key range.
     /// Drops tombstones and reclaims space. Heavy: rewrites the column family.
     ///
-    /// Unlike [`Self::trigger_compaction`], this targets a column family that has no
-    /// [`Schema`] type in scope (e.g. a raw, runtime-named CF).
+    /// Takes the column family name directly, for callers that have a raw, runtime-named
+    /// CF rather than a [`Schema`] type in scope; [`Self::trigger_compaction`] is the
+    /// `Schema`-typed equivalent.
     #[tracing::instrument(skip_all, level = "error")]
     pub fn compact_cf(&self, cf_name: &str) -> anyhow::Result<()> {
         let handle = self.get_cf_handle(cf_name)?;

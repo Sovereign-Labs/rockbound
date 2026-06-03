@@ -389,6 +389,24 @@ impl KeyWithVersionPrefixAndSuffix {
     }
 }
 
+/// Encodes the historical/archival-CF key layout: `key` followed by the big-endian
+/// `version`. Mirrors `KeyWithVersionPrefixAndSuffix::archival_key`.
+fn encode_archival_key(key: &[u8], version: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(key.len() + 8);
+    buf.extend_from_slice(key);
+    buf.extend_from_slice(&version.to_be_bytes());
+    buf
+}
+
+/// Encodes the pruning-CF key layout: the big-endian `version` followed by `key`.
+/// Mirrors `KeyWithVersionPrefixAndSuffix::pruning_key`.
+fn encode_pruning_key(version: u64, key: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(8 + key.len());
+    buf.extend_from_slice(&version.to_be_bytes());
+    buf.extend_from_slice(key);
+    buf
+}
+
 impl<V: SchemaWithVersion, C: CacheForVersionedDB<V>> VersionedDB<V, C>
 where
     V::Key: Ord + Clone + std::hash::Hash + AsRef<[u8]>,
@@ -565,7 +583,8 @@ where
     /// - writes [`VersionedTableMetadataKey::PrunedVersion`] = the greatest
     ///   `version - 1` for which this batch deleted a historical row, if any.
     ///
-    /// `keep_versions` must be `>= 1`. If the database has no committed version yet,
+    /// `keep_versions` must be `>= 1`. `max_batch_size`, when set, must be `>= 1`;
+    /// use `None` for an uncapped batch. If the database has no committed version yet,
     /// or if `last_committed < keep_versions`, the returned batch is empty and
     /// `last_pruned_version` is `None`.
     ///
@@ -580,6 +599,9 @@ where
         if keep_versions == 0 {
             anyhow::bail!("keep_versions must be >= 1");
         }
+        if max_batch_size == Some(0) {
+            anyhow::bail!("max_batch_size must be >= 1 when set");
+        }
 
         let mut batch = SchemaBatch::new();
         let mut keys_inspected = 0usize;
@@ -593,10 +615,10 @@ where
         else {
             return Ok(PruningBatchOutput {
                 batch,
-                hit_size_limit: false,
-                last_pruned_version: None,
-                keys_inspected: 0,
-                keys_to_prune: 0,
+                hit_size_limit,
+                last_pruned_version,
+                keys_inspected,
+                keys_to_prune,
             });
         };
 
@@ -619,8 +641,7 @@ where
             // entry per live key" invariant.
             if let Some(query_version) = version.checked_sub(1) {
                 if let Some(prev_version) = self.get_version_for_key(&key, query_version)? {
-                    let mut hist_key_bytes = key.as_ref().to_vec();
-                    hist_key_bytes.extend_from_slice(&prev_version.to_be_bytes());
+                    let hist_key_bytes = encode_archival_key(key.as_ref(), prev_version);
                     batch.delete_cf_raw(V::HISTORICAL_COLUMN_FAMILY_NAME, hist_key_bytes);
                     keys_to_prune += 1;
                     last_pruned_version = Some(query_version);
@@ -632,9 +653,7 @@ where
                 // Stop the pruning-CF range at this entry (exclusive): everything strictly
                 // before it was fully processed this pass; this entry and any later ones
                 // keep their pruning index until a subsequent pass re-visits them.
-                let mut bound = version.to_be_bytes().to_vec();
-                bound.extend_from_slice(key.as_ref());
-                pruning_cf_upper = bound;
+                pruning_cf_upper = encode_pruning_key(version, key.as_ref());
                 break;
             }
         }

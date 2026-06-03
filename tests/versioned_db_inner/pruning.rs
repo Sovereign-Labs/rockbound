@@ -493,6 +493,21 @@ fn keep_versions_zero_errors() {
 }
 
 #[test]
+fn max_batch_size_zero_errors() {
+    let (_dir, db) = open_versioned();
+    for v in 0..=9u64 {
+        put_at(&db, &[(b"k", v as u32)], v);
+    }
+
+    let err = db.collect_pruning_batch(3, Some(0)).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("max_batch_size must be >= 1 when set"),
+        "unexpected error: {err}",
+    );
+}
+
+#[test]
 fn cutoff_underflow_returns_empty() {
     // last_committed < keep_versions → checked_sub underflows → empty batch.
     let (_dir, db) = open_versioned();
