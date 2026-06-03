@@ -49,8 +49,9 @@ impl SchemaBatch {
 
     /// Adds a delete range operation to the batch.
     ///
-    /// Note: Range based operations aren't supported by iterators or merging,
-    /// which is consistent with rocksdb `WriteBatch`.
+    /// Note: Range based operations aren't reflected by the batch iterators
+    /// ([`SchemaBatch::iter`] / [`SchemaBatch::iter_range`]), consistent with rocksdb
+    /// `WriteBatch`. They are preserved by [`SchemaBatch::merge`].
     pub fn delete_range<S: Schema>(
         &mut self,
         from: &impl SeekKeyEncoder<S>,
@@ -185,11 +186,18 @@ impl<K: Ord, V> SchemaBatch<K, V> {
     }
 
     /// Merge other [`SchemaBatch`] on top of this one.
-    /// Keys from other will overwrite keys in self.
+    ///
+    /// Point writes are combined per key with last-write-wins (keys from `other` overwrite
+    /// keys in `self`). Range deletes have no key to overwrite, so both batches' range
+    /// tombstones are retained (appended per column family).
     pub fn merge(&mut self, other: SchemaBatch<K, V>) {
         for (cf_name, other_cf_map) in other.last_writes {
             let cf_map = self.last_writes.entry(cf_name).or_default();
             cf_map.extend(other_cf_map);
+        }
+        for (cf_name, other_cf_ops) in other.range_ops {
+            let cf_ops = self.range_ops.entry(cf_name).or_default();
+            cf_ops.extend(other_cf_ops);
         }
     }
 }
@@ -470,6 +478,8 @@ mod tests {
     mod merge {
         use super::*;
 
+        define_schema!(TestSchema2, TestField, TestField, "TestCF2");
+
         #[test]
         fn test_simple_merge() {
             let field_1 = TestField(1);
@@ -507,6 +517,53 @@ mod tests {
             );
             assert_eq!(Some(field_2), get_value(&field_4), "key (4) wasn't added");
             assert_eq!(None, get_value(&field_5), "key (5) wasn't deleted");
+        }
+
+        #[test]
+        fn merge_preserves_range_ops() {
+            let (f1, f2, f3) = (TestField(1), TestField(2), TestField(3));
+
+            // batch1: a range delete on CF1 (e.g. the user namespace's pruning CF).
+            let mut batch1 = SchemaBatch::new();
+            batch1.delete_range::<TestSchema1>(&f1, &f2).unwrap();
+
+            // batch2: a range delete on CF1, one on CF2 (a CF absent from batch1 — a second
+            // namespace's pruning CF), plus a point write.
+            let mut batch2 = SchemaBatch::new();
+            batch2.delete_range::<TestSchema1>(&f2, &f3).unwrap();
+            batch2.delete_range::<TestSchema2>(&f1, &f3).unwrap();
+            batch2.put::<TestSchema2>(&f1, &f2).unwrap();
+
+            batch1.merge(batch2);
+
+            // Same-CF range ops are concatenated (batch1's + batch2's).
+            assert_eq!(
+                batch1
+                    .range_ops
+                    .get(TestSchema1::COLUMN_FAMILY_NAME)
+                    .unwrap()
+                    .len(),
+                2
+            );
+            // The CF2 range op from `other` must NOT be dropped (the regression this guards).
+            assert_eq!(
+                batch1
+                    .range_ops
+                    .get(TestSchema2::COLUMN_FAMILY_NAME)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            // Point ops still merge as before.
+            assert_eq!(
+                Some(f2),
+                batch1
+                    .get_operation::<TestSchema2>(&f1)
+                    .unwrap()
+                    .unwrap()
+                    .decode_value::<TestSchema2>()
+                    .unwrap()
+            );
         }
     }
 }
