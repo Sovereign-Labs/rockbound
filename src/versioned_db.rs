@@ -1543,3 +1543,47 @@ where
         self.versioned_db_cache.read().misses()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Locks the on-disk key layouts: the free `encode_*` helpers used on the pruning
+    /// path must stay byte-identical to `KeyWithVersionPrefixAndSuffix`, which defines
+    /// the canonical archival (`key || version_be`) and pruning (`version_be || key`)
+    /// layouts at write time. If either drifts, historical deletes and pruning-range
+    /// bounds silently target the wrong bytes.
+    #[test]
+    fn encode_helpers_match_key_with_version_layout() {
+        let cases: &[(&[u8], u64)] = &[
+            (b"k", 0),
+            (b"k", 1),
+            (b"k", u64::MAX),
+            (b"multi-byte-key", 42),
+            (&[0xff, 0x00, 0xff], u64::MAX),
+            (&[], 7),
+        ];
+
+        for &(key, version) in cases {
+            let mut key_with_version = KeyWithVersionPrefixAndSuffix::new(version);
+            key_with_version.set_key(key);
+
+            assert_eq!(
+                encode_archival_key(key, version),
+                key_with_version.archival_key(),
+                "archival layout mismatch for key={key:?} version={version}",
+            );
+            assert_eq!(
+                encode_pruning_key(version, key),
+                key_with_version.pruning_key(),
+                "pruning layout mismatch for key={key:?} version={version}",
+            );
+            // `live_key` must round-trip the original key out of the shared buffer.
+            assert_eq!(
+                key_with_version.live_key(),
+                key,
+                "live_key round-trip mismatch for key={key:?} version={version}",
+            );
+        }
+    }
+}
