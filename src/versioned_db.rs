@@ -570,13 +570,12 @@ where
     /// the caller commits it via `archival_db.write_schemas(&output.batch)`.
     ///
     /// On commit, the batch:
-    /// - clears pruning-CF entries `[V|K]` with `V <= cutoff` using a single range
-    ///   tombstone, bounded at the point where this pass stopped (see `max_batch_size`
-    ///   below). The bound never reaches past a pruning entry whose historical predecessor
-    ///   delete wasn't also emitted this pass — otherwise that historical row would be
-    ///   orphaned (its pruning index gone) and never reclaimed.
-    /// - deletes the historical-CF entry of the *previous* write of each visited K (so the
-    ///   most recent write at or before `cutoff` survives, preserving the invariant
+    /// - clears the pruning-CF entries `[V|K]` (`V <= cutoff`) collected this pass using
+    ///   a single range tombstone. Every collected entry has its historical predecessor
+    ///   delete emitted in this same batch, so the tombstone covers all of them; entries
+    ///   beyond the `max_batch_size` cap stay in the pruning index for later passes.
+    /// - deletes the historical-CF entry of the *previous* write of each collected K (so
+    ///   the most recent write at or before `cutoff` survives, preserving the invariant
     ///   that every live key has at least one historical entry; see the doc on
     ///   [`VersionedDB`]). These stay point deletes — they are scattered per-key and not
     ///   safely range-able; their space is reclaimed by [`VersionedDB::trigger_compaction`].
@@ -588,9 +587,20 @@ where
     /// or if `last_committed < keep_versions`, the returned batch is empty and
     /// `last_pruned_version` is `None`.
     ///
-    /// When `max_batch_size` is set, iteration stops once that many historical-CF
-    /// deletes have been collected; `hit_size_limit` is then `true` and the caller
-    /// should commit the batch and re-invoke to drain the rest.
+    /// When `max_batch_size` is set, at most that many pruning entries are collected per
+    /// pass, so the batch holds at most that many historical-CF deletes (each entry
+    /// contributes at most one); `hit_size_limit` is `true` when entries remain beyond
+    /// the cap, and the caller should commit the batch and re-invoke to drain the rest.
+    ///
+    /// # Performance
+    ///
+    /// One sequential scan of the pruning index over the collected entries, plus at most
+    /// one historical-CF seek per *distinct key* in the pass: within a key's group of
+    /// collected versions every predecessor is known from the group itself, and only the
+    /// group's oldest version needs a lookup (for a survivor left by an earlier pass).
+    /// An uncapped pass buffers all prunable entries in memory (the same order of
+    /// magnitude as the returned batch itself); set `max_batch_size` to bound memory and
+    /// commit size when pruning a large backlog.
     pub fn collect_pruning_batch(
         &self,
         keep_versions: u64,
@@ -604,7 +614,6 @@ where
         }
 
         let mut batch = SchemaBatch::new();
-        let mut keys_inspected = 0usize;
         let mut keys_to_prune = 0usize;
         let mut hit_size_limit = false;
         let mut last_pruned_version = None;
@@ -617,48 +626,88 @@ where
                 batch,
                 hit_size_limit,
                 last_pruned_version,
-                keys_inspected,
+                keys_inspected: 0,
                 keys_to_prune,
             });
         };
 
-        // The pruning CF is keyed `[version_be || key]` and every entry we visit has
-        // `version <= cutoff`, so the visited set is one contiguous prefix range that we
-        // clear with a single range tombstone (after the loop) instead of one point delete
-        // per entry. `pruning_cf_upper` is the exclusive upper bound of that range: it
-        // starts at `first_version_to_keep` (covers everything `<= cutoff`) and, if we stop
-        // early on `max_batch_size`, is pulled back to the stopping point so we never drop a
-        // pruning entry whose historical predecessor delete wasn't also emitted this pass.
-        let mut pruning_cf_upper = cutoff.saturating_add(1).to_be_bytes().to_vec();
-
-        for prunable in self.iter_pruning_keys_up_to_version(cutoff)? {
-            keys_inspected += 1;
-            let (version, key) = prunable.version_and_key();
-
-            // Look up the previous version of this key and delete that historical entry,
-            // keeping the entry at `version` intact. When `version == 0` or the key has no
-            // earlier write, leave the historical CF alone — preserves the "at least one
-            // entry per live key" invariant.
-            if let Some(query_version) = version.checked_sub(1) {
-                if let Some(prev_version) = self.get_version_for_key(&key, query_version)? {
-                    let hist_key_bytes = encode_archival_key(key.as_ref(), prev_version);
-                    batch.delete_cf_raw(V::HISTORICAL_COLUMN_FAMILY_NAME, hist_key_bytes);
-                    keys_to_prune += 1;
-                    last_pruned_version = Some(query_version);
-                }
-            }
-
-            if max_batch_size.is_some_and(|m| keys_to_prune >= m) {
-                hit_size_limit = true;
-                // Stop the pruning-CF range at this entry (exclusive): everything strictly
-                // before it was fully processed this pass; this entry and any later ones
-                // keep their pruning index until a subsequent pass re-visits them.
-                pruning_cf_upper = encode_pruning_key(version, key.as_ref());
+        // Phase 1: collect up to `max_batch_size` pruning entries `[V|K]` with
+        // `V <= cutoff`, in `[version_be || key]` order. Bounding the collection bounds
+        // both this pass's memory and the number of deletes emitted below (each entry
+        // contributes at most one historical delete).
+        let mut iter = self.iter_pruning_keys_up_to_version(cutoff)?;
+        let mut collected: Vec<(u64, V::Key)> = Vec::new();
+        for prunable in &mut iter {
+            collected.push(prunable.version_and_key());
+            if max_batch_size.is_some_and(|m| collected.len() >= m) {
+                // Peek whether entries remain so callers know to re-invoke.
+                hit_size_limit = iter.next().is_some();
                 break;
             }
         }
+        let keys_inspected = collected.len();
 
-        // Collapse the per-entry pruning-CF deletes into one range tombstone over
+        // The pruning CF is keyed `[version_be || key]` and every collected entry has
+        // `version <= cutoff`, so the collected set is one contiguous prefix range that we
+        // clear with a single range tombstone instead of one point delete per entry. Every
+        // collected entry is fully processed below (its historical predecessor delete is
+        // emitted in this same batch), so the tombstone may cover all of them: when the
+        // iterator was drained, the exclusive upper bound is `cutoff + 1`; when we stopped
+        // at `max_batch_size`, it is the successor of the last collected entry.
+        let pruning_cf_upper = if hit_size_limit {
+            let (last_version, last_key) = collected
+                .last()
+                .expect("hit_size_limit implies at least one collected entry");
+            let mut upper = encode_pruning_key(*last_version, last_key.as_ref());
+            // Appending 0x00 yields the smallest key strictly greater under bytewise
+            // ordering, making the bound inclusive of the last collected entry.
+            upper.push(0);
+            upper
+        } else {
+            cutoff.saturating_add(1).to_be_bytes().to_vec()
+        };
+
+        // Phase 2: group the collected entries per key, versions ascending within each
+        // group. Sort by key *bytes* to match the column family's ordering.
+        collected
+            .sort_unstable_by(|(va, ka), (vb, kb)| ka.as_ref().cmp(kb.as_ref()).then(va.cmp(vb)));
+
+        // Phase 3: walk each key's group `[V1 < V2 < ... < Vm]` and delete the historical
+        // entry of each version's *previous* write, keeping the entry at `Vm` (the most
+        // recent write at or before `cutoff`) intact — preserves the "at least one entry
+        // per live key" invariant; see the doc on [`VersionedDB`].
+        //
+        // For `Vi` with `i >= 2` the previous write is `V(i-1)`, known from the group
+        // itself. Only `V1` needs a historical-CF lookup: its previous write, if any, is a
+        // survivor kept by an earlier pass. (A pre-redesign capped pass may also have left
+        // `V1` lingering with its predecessor already deleted; the lookup then finds
+        // nothing and emits nothing, so passes of either vintage compose safely.) When
+        // `V1 == 0` there is nothing before it and the lookup is skipped.
+        let mut prev_in_group: Option<(&[u8], u64)> = None;
+        for (version, key) in &collected {
+            // Deleting this entry's predecessor redirects historical queries in
+            // `[predecessor, version - 1]`; `version == 0` has no predecessor.
+            let Some(query_version) = version.checked_sub(1) else {
+                prev_in_group = Some((key.as_ref(), *version));
+                continue;
+            };
+            let prev_version = match prev_in_group {
+                Some((prev_key, prev_version)) if prev_key == key.as_ref() => Some(prev_version),
+                _ => self.get_version_for_key(key, query_version)?,
+            };
+            if let Some(prev_version) = prev_version {
+                batch.delete_cf_raw(
+                    V::HISTORICAL_COLUMN_FAMILY_NAME,
+                    encode_archival_key(key.as_ref(), prev_version),
+                );
+                keys_to_prune += 1;
+                // The watermark must cover the highest redirected query version.
+                last_pruned_version = last_pruned_version.max(Some(query_version));
+            }
+            prev_in_group = Some((key.as_ref(), *version));
+        }
+
+        // Clear the collected pruning entries with one range tombstone over
         // `[start-of-CF, pruning_cf_upper)`. `Vec::new()` sorts before all keys.
         batch.delete_range_cf_raw(V::PRUNING_COLUMN_FAMILY_NAME, Vec::new(), pruning_cf_upper);
 
@@ -958,13 +1007,13 @@ pub struct VersionedDbMetrics {
 pub struct PruningBatchOutput {
     /// Multi-CF batch of deletes and the metadata write.
     pub batch: SchemaBatch,
-    /// `true` if iteration stopped because `max_batch_size` was reached. Caller should
-    /// commit and re-invoke until this returns `false`.
+    /// `true` if `max_batch_size` was reached with pruning entries still remaining.
+    /// Caller should commit and re-invoke until this returns `false`.
     pub hit_size_limit: bool,
     /// The value recorded into [`VersionedTableMetadataKey::PrunedVersion`], or `None`
     /// when this batch deleted no historical rows.
     pub last_pruned_version: Option<u64>,
-    /// Number of pruning-CF entries the iterator visited. For metrics.
+    /// Number of pruning-CF entries collected (and fully processed) this pass. For metrics.
     pub keys_inspected: usize,
     /// Number of historical-CF delete operations placed in the batch. For metrics.
     pub keys_to_prune: usize,

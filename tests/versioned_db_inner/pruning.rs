@@ -324,15 +324,17 @@ fn max_batch_size_split() {
         put_at(&db, &[(b"k", v as u32)], v);
     }
 
-    // 7 pruning entries ≤ cutoff=6 (V=0..=6); V=0 produces no historical delete.
-    // With max_batch_size=3, the first run breaks after the 3rd historical delete (V=3).
+    // 7 pruning entries ≤ cutoff=6 (V=0..=6). With max_batch_size=3, each pass collects
+    // (and fully retires) exactly 3 entries.
+    // Pass 1 collects [0|k], [1|k], [2|k]: V=0 is the group's oldest with nothing before
+    // it (no delete); V=1 and V=2 delete their in-group predecessors k|0 and k|1.
     let out1 = db.collect_pruning_batch(3, Some(3)).unwrap();
     assert!(out1.hit_size_limit);
-    assert_eq!(out1.last_pruned_version, Some(2));
-    assert_eq!(out1.keys_to_prune, 3);
-    assert_eq!(out1.keys_inspected, 4); // V=0,1,2,3
+    assert_eq!(out1.last_pruned_version, Some(1));
+    assert_eq!(out1.keys_to_prune, 2);
+    assert_eq!(out1.keys_inspected, 3); // V=0,1,2
     commit_pruning_batch(&db, &out1.batch);
-    assert_eq!(db.get_pruned_version().unwrap(), Some(2));
+    assert_eq!(db.get_pruned_version().unwrap(), Some(1));
 
     let delta_reader = VersionedDeltaReader::<LiveKeys, VersionedDbCache<LiveKeys>>::new(
         db.clone(),
@@ -340,33 +342,32 @@ fn max_batch_size_split() {
         vec![],
     );
     assert!(matches!(
-        historical(&delta_reader, b"k", 2),
+        historical(&delta_reader, b"k", 1),
         Err(HistoricalValueError::PrunedVersion {
-            requested_version: 2,
-            oldest_available_version: Some(3),
+            requested_version: 1,
+            oldest_available_version: Some(2),
         })
     ));
-    assert_eq!(historical(&delta_reader, b"k", 3).unwrap(), Some(3));
+    assert_eq!(historical(&delta_reader, b"k", 2).unwrap(), Some(2));
 
-    // After commit: pruning entries [0..=2|k] gone, historical k|0,1,2 gone. The break
-    // entry [3|k] lingers — the range tombstone stops exclusively at it.
-    // Remaining pruning entries ≤ cutoff: [3|k], [4|k], [5|k], [6|k]. [3|k] is re-inspected
-    // (its predecessor is already gone, so it yields no historical delete); [4|k], [5|k],
-    // [6|k] each produce one historical delete.
+    // After commit: pruning entries [0..=2|k] gone, historical k|0,k|1 gone. Remaining
+    // pruning entries ≤ cutoff: [3|k], [4|k], [5|k], [6|k].
+    // Pass 2 collects [3|k], [4|k], [5|k]: V=3 is now its group's oldest, so it looks up
+    // its predecessor (the survivor k|2) and deletes it; V=4 and V=5 delete k|3 and k|4.
     let out2 = db.collect_pruning_batch(3, Some(3)).unwrap();
     assert!(out2.hit_size_limit);
-    assert_eq!(out2.last_pruned_version, Some(5));
+    assert_eq!(out2.last_pruned_version, Some(4));
     assert_eq!(out2.keys_to_prune, 3);
-    assert_eq!(out2.keys_inspected, 4); // re-inspects [3|k], then [4|k], [5|k], [6|k]
+    assert_eq!(out2.keys_inspected, 3); // V=3,4,5
     commit_pruning_batch(&db, &out2.batch);
 
-    // Only the lingering [6|k] remains ≤ cutoff; out3 re-inspects it (no historical delete,
-    // its predecessor is gone) and the range tombstone retires it.
+    // Only [6|k] remains ≤ cutoff; the final pass deletes its predecessor (the survivor
+    // k|5) and drains the iterator, so the cap is not hit.
     let out3 = db.collect_pruning_batch(3, Some(3)).unwrap();
     assert!(!out3.hit_size_limit);
-    assert_eq!(out3.keys_to_prune, 0);
-    assert_eq!(out3.keys_inspected, 1); // re-inspects the lingering [6|k]
-    assert_eq!(out3.last_pruned_version, None);
+    assert_eq!(out3.keys_to_prune, 1);
+    assert_eq!(out3.keys_inspected, 1);
+    assert_eq!(out3.last_pruned_version, Some(5));
     commit_pruning_batch(&db, &out3.batch);
 
     // Final state should match the basic_prune outcome.
@@ -443,18 +444,20 @@ fn capped_prune_converges_to_uncapped() {
     );
 }
 
-/// Locks the exclusive range bound: after a capped pass that breaks on `[3|k]`, that break
-/// entry's pruning index must still be present (it is retired on a later pass). The old
-/// per-key point-delete approach would have left `[4, 5, 6]` here instead.
+/// Locks the inclusive range bound: a capped pass fully retires exactly the entries it
+/// collected — `[0|k]`, `[1|k]`, `[2|k]` are cleared from the pruning index (every one had
+/// its predecessor handling emitted in the same batch) while the uncollected `[3..=6|k]`
+/// remain for later passes. An over-eager bound would orphan a historical row; a stranded
+/// collected entry would waste a re-inspection.
 #[test]
-fn capped_prune_leaves_break_entry_in_pruning_index_one_pass() {
+fn capped_prune_clears_exactly_the_collected_prefix() {
     let (_dir, db) = open_versioned();
     for v in 0..=9u64 {
         put_at(&db, &[(b"k", v as u32)], v);
     }
     let out1 = db.collect_pruning_batch(3, Some(3)).unwrap();
     assert!(out1.hit_size_limit);
-    assert_eq!(out1.keys_inspected, 4); // visited V=0,1,2,3 — unchanged from point-delete
+    assert_eq!(out1.keys_inspected, 3); // collected V=0,1,2
     commit_pruning_batch(&db, &out1.batch);
 
     let remaining: Vec<u64> = db
@@ -557,10 +560,12 @@ fn partial_pruned_version_persists_across_reopen() {
         for v in 0..=9u64 {
             put_at(&versioned_db, &[(b"k", v as u32)], v);
         }
+        // The capped pass collects [0|k], [1|k], [2|k]; V=1 and V=2 delete k|0 and k|1,
+        // so the watermark lands on V=2's query version (1).
         let out = versioned_db.collect_pruning_batch(3, Some(3)).unwrap();
-        assert_eq!(out.last_pruned_version, Some(2));
+        assert_eq!(out.last_pruned_version, Some(1));
         commit_pruning_batch(&versioned_db, &out.batch);
-        assert_eq!(versioned_db.get_pruned_version().unwrap(), Some(2));
+        assert_eq!(versioned_db.get_pruned_version().unwrap(), Some(1));
 
         let delta_reader = VersionedDeltaReader::<LiveKeys, VersionedDbCache<LiveKeys>>::new(
             versioned_db.clone(),
@@ -568,13 +573,13 @@ fn partial_pruned_version_persists_across_reopen() {
             vec![],
         );
         assert!(matches!(
-            historical(&delta_reader, b"k", 2),
+            historical(&delta_reader, b"k", 1),
             Err(HistoricalValueError::PrunedVersion {
-                requested_version: 2,
-                oldest_available_version: Some(3),
+                requested_version: 1,
+                oldest_available_version: Some(2),
             })
         ));
-        assert_eq!(historical(&delta_reader, b"k", 3).unwrap(), Some(3));
+        assert_eq!(historical(&delta_reader, b"k", 2).unwrap(), Some(2));
 
         tmpdir
     };
@@ -583,7 +588,7 @@ fn partial_pruned_version_persists_across_reopen() {
     let db = Arc::new(test_db.db);
     let cache = VersionedDbCache::new(10_000);
     let reopened = Arc::new(V::from_dbs(db.clone(), db, cache).unwrap());
-    assert_eq!(reopened.get_pruned_version().unwrap(), Some(2));
+    assert_eq!(reopened.get_pruned_version().unwrap(), Some(1));
 
     let delta_reader = VersionedDeltaReader::<LiveKeys, VersionedDbCache<LiveKeys>>::new(
         reopened,
@@ -591,13 +596,13 @@ fn partial_pruned_version_persists_across_reopen() {
         vec![],
     );
     assert!(matches!(
-        historical(&delta_reader, b"k", 2),
+        historical(&delta_reader, b"k", 1),
         Err(HistoricalValueError::PrunedVersion {
-            requested_version: 2,
-            oldest_available_version: Some(3),
+            requested_version: 1,
+            oldest_available_version: Some(2),
         })
     ));
-    assert_eq!(historical(&delta_reader, b"k", 3).unwrap(), Some(3));
+    assert_eq!(historical(&delta_reader, b"k", 2).unwrap(), Some(2));
 }
 
 #[test]
