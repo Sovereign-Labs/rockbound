@@ -477,10 +477,37 @@ fn empty_db() {
     assert_eq!(out.last_pruned_version, None);
     assert_eq!(out.keys_inspected, 0);
     assert_eq!(out.keys_to_prune, 0);
+    assert!(out.batch.is_empty());
 
     // Committing the empty batch is harmless and doesn't introduce a pruned version.
     commit_pruning_batch(&db, &out.batch);
     assert_eq!(db.get_pruned_version().unwrap(), None);
+}
+
+#[test]
+fn repeated_prune_after_cutoff_drained_returns_empty_batch() {
+    let (_dir, db) = open_versioned();
+    for v in 0..=9u64 {
+        put_at(&db, &[(b"k", v as u32)], v);
+    }
+
+    let out1 = db.collect_pruning_batch(3, None).unwrap();
+    commit_pruning_batch(&db, &out1.batch);
+    assert_eq!(
+        db.iter_pruning_keys_up_to_version(6).unwrap().count(),
+        0,
+        "first prune should drain all pruning entries up to cutoff",
+    );
+
+    let out2 = db.collect_pruning_batch(3, None).unwrap();
+    assert!(!out2.hit_size_limit);
+    assert_eq!(out2.last_pruned_version, None);
+    assert_eq!(out2.keys_inspected, 0);
+    assert_eq!(out2.keys_to_prune, 0);
+    assert!(out2.batch.is_empty());
+
+    commit_pruning_batch(&db, &out2.batch);
+    assert_eq!(db.get_pruned_version().unwrap(), Some(5));
 }
 
 #[test]
@@ -522,6 +549,7 @@ fn cutoff_underflow_returns_empty() {
     assert_eq!(out.last_pruned_version, None);
     assert_eq!(out.keys_inspected, 0);
     assert_eq!(out.keys_to_prune, 0);
+    assert!(out.batch.is_empty());
 }
 
 #[test]

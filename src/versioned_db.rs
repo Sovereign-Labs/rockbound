@@ -584,8 +584,8 @@ where
     ///
     /// `keep_versions` must be `>= 1`. `max_batch_size`, when set, must be `>= 1`;
     /// use `None` for an uncapped batch. If the database has no committed version yet,
-    /// or if `last_committed < keep_versions`, the returned batch is empty and
-    /// `last_pruned_version` is `None`.
+    /// if `last_committed < keep_versions`, or if no pruning entries remain up to the
+    /// cutoff, the returned batch is empty and `last_pruned_version` is `None`.
     ///
     /// When `max_batch_size` is set, at most that many pruning entries are collected per
     /// pass, so the batch holds at most that many historical-CF deletes (each entry
@@ -707,9 +707,11 @@ where
             prev_in_group = Some((key.as_ref(), *version));
         }
 
-        // Clear the collected pruning entries with one range tombstone over
-        // `[start-of-CF, pruning_cf_upper)`. `Vec::new()` sorts before all keys.
-        batch.delete_range_cf_raw(V::PRUNING_COLUMN_FAMILY_NAME, Vec::new(), pruning_cf_upper);
+        if keys_inspected > 0 {
+            // Clear the collected pruning entries with one range tombstone over
+            // `[start-of-CF, pruning_cf_upper)`. `Vec::new()` sorts before all keys.
+            batch.delete_range_cf_raw(V::PRUNING_COLUMN_FAMILY_NAME, Vec::new(), pruning_cf_upper);
+        }
 
         if let Some(v) = last_pruned_version {
             batch.put_cf_raw(

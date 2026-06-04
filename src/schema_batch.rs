@@ -92,6 +92,12 @@ impl<K: Ord, V> SchemaBatch<K, V> {
         Self::default()
     }
 
+    /// Returns `true` if this batch has no point writes and no range operations.
+    pub fn is_empty(&self) -> bool {
+        self.last_writes.values().all(|writes| writes.is_empty())
+            && self.range_ops.values().all(|ops| ops.is_empty())
+    }
+
     /// Put a pre-encoded key and its value into the batch.
     pub fn put_raw<S: Schema>(&mut self, key: K, value: V) -> anyhow::Result<()> {
         let put_operation = Operation::Put { value };
@@ -371,6 +377,23 @@ mod tests {
     use crate::test::TestField;
 
     define_schema!(TestSchema1, TestField, TestField, "TestCF1");
+
+    #[test]
+    fn is_empty_tracks_point_and_range_ops() {
+        let mut batch = SchemaBatch::new();
+        assert!(batch.is_empty());
+
+        batch
+            .put::<TestSchema1>(&TestField(1), &TestField(10))
+            .unwrap();
+        assert!(!batch.is_empty());
+
+        let mut batch = SchemaBatch::new();
+        batch
+            .delete_range::<TestSchema1>(&TestField(1), &TestField(2))
+            .unwrap();
+        assert!(!batch.is_empty());
+    }
 
     mod range {
         use super::*;
