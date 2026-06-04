@@ -189,8 +189,26 @@ impl<K: Ord, V> SchemaBatch<K, V> {
     ///
     /// Point writes are combined per key with last-write-wins (keys from `other` overwrite
     /// keys in `self`). Range deletes have no key to overwrite, so both batches' range
-    /// tombstones are retained (appended per column family).
-    pub fn merge(&mut self, other: SchemaBatch<K, V>) {
+    /// tombstones are retained (appended per column family). Earlier range tombstones are
+    /// split around later puts from `other` so those puts survive the merged write batch.
+    ///
+    /// The split is necessary because a written batch applies all point ops before all
+    /// range ops per column family (see [`crate::DB::update_db_batch_with_schema_data`]),
+    /// so within one batch a range tombstone always wins over an overlapping put. Splitting
+    /// `self`'s earlier ranges around `other`'s later puts restores last-write-wins across
+    /// the merge.
+    ///
+    /// The `K: Clone + Extend<u8>` bound exists only for that split: it lets us compute
+    /// the next key after a preserved put (see `range_delete_key_after`) so the re-emitted
+    /// ranges exclude exactly that key. In practice `K` is always [`SchemaKey`]
+    /// (`Vec<u8>`), which satisfies the bound; it is stated generically only because
+    /// `SchemaBatch` is generic over `K`.
+    pub fn merge(&mut self, other: SchemaBatch<K, V>)
+    where
+        K: Clone + Extend<u8>,
+    {
+        self.preserve_later_puts_from_earlier_range_ops(&other.last_writes);
+
         for (cf_name, other_cf_map) in other.last_writes {
             let cf_map = self.last_writes.entry(cf_name).or_default();
             cf_map.extend(other_cf_map);
@@ -200,6 +218,93 @@ impl<K: Ord, V> SchemaBatch<K, V> {
             cf_ops.extend(other_cf_ops);
         }
     }
+
+    fn preserve_later_puts_from_earlier_range_ops(
+        &mut self,
+        later_writes: &HashMap<ColumnFamilyName, BTreeMap<K, Operation<K, V>>>,
+    ) where
+        K: Clone + Extend<u8>,
+    {
+        for (cf_name, later_writes_for_cf) in later_writes {
+            if !later_writes_for_cf
+                .values()
+                .any(|operation| matches!(operation, Operation::Put { .. }))
+            {
+                continue;
+            }
+
+            let Some(range_ops) = self.range_ops.get_mut(cf_name) else {
+                continue;
+            };
+
+            let mut preserved_range_ops = Vec::with_capacity(range_ops.len());
+            for operation in std::mem::take(range_ops) {
+                match operation {
+                    Operation::DeleteRange { from, to } => {
+                        preserved_range_ops.extend(split_delete_range_around_later_puts(
+                            from,
+                            to,
+                            later_writes_for_cf,
+                        ));
+                    }
+                    operation => preserved_range_ops.push(operation),
+                }
+            }
+            *range_ops = preserved_range_ops;
+        }
+    }
+}
+
+fn split_delete_range_around_later_puts<K, V>(
+    from: K,
+    to: K,
+    later_writes: &BTreeMap<K, Operation<K, V>>,
+) -> Vec<Operation<K, V>>
+where
+    K: Ord + Clone + Extend<u8>,
+{
+    let mut ranges = vec![(from, to)];
+    for (key, operation) in later_writes {
+        if !matches!(operation, Operation::Put { .. }) {
+            continue;
+        }
+
+        let mut next_ranges = Vec::with_capacity(ranges.len() + 1);
+        for (from, to) in ranges {
+            if key < &from || key >= &to {
+                next_ranges.push((from, to));
+                continue;
+            }
+
+            if &from < key {
+                next_ranges.push((from, key.clone()));
+            }
+
+            let key_after = range_delete_key_after(key);
+            if key_after < to {
+                next_ranges.push((key_after, to));
+            }
+        }
+        ranges = next_ranges;
+    }
+
+    ranges
+        .into_iter()
+        .map(|(from, to)| Operation::DeleteRange { from, to })
+        .collect()
+}
+
+/// Returns the smallest key strictly greater than `key` under RocksDB's bytewise key
+/// ordering, computed as `key ++ 0x00`. Used by [`SchemaBatch::merge`] to re-emit a range
+/// delete that resumes just past a later put it must preserve. Requires `K: Extend<u8>`,
+/// which is the substantive reason `merge` carries that bound.
+fn range_delete_key_after<K>(key: &K) -> K
+where
+    K: Clone + Extend<u8>,
+{
+    let mut key_after = key.clone();
+    key_after.extend(std::iter::once(0));
+    key_after
 }
 
 #[cfg(feature = "arbitrary")]
@@ -480,6 +585,10 @@ mod tests {
 
         define_schema!(TestSchema2, TestField, TestField, "TestCF2");
 
+        fn encode_key(field: &TestField) -> SchemaKey {
+            <TestField as KeyEncoder<TestSchema1>>::encode_key(field).unwrap()
+        }
+
         #[test]
         fn test_simple_merge() {
             let field_1 = TestField(1);
@@ -562,6 +671,46 @@ mod tests {
                     .unwrap()
                     .unwrap()
                     .decode_value::<TestSchema2>()
+                    .unwrap()
+            );
+        }
+
+        #[test]
+        fn merge_splits_earlier_range_ops_around_later_puts() {
+            let (f1, f3, f5, f30) = (TestField(1), TestField(3), TestField(5), TestField(30));
+
+            let mut batch1 = SchemaBatch::new();
+            batch1.delete_range::<TestSchema1>(&f1, &f5).unwrap();
+
+            let mut batch2 = SchemaBatch::new();
+            batch2.put::<TestSchema1>(&f3, &f30).unwrap();
+
+            batch1.merge(batch2);
+
+            let f1_key = encode_key(&f1);
+            let f3_key = encode_key(&f3);
+            let f5_key = encode_key(&f5);
+            let expected = vec![
+                Operation::DeleteRange {
+                    from: f1_key,
+                    to: f3_key.clone(),
+                },
+                Operation::DeleteRange {
+                    from: range_delete_key_after(&f3_key),
+                    to: f5_key,
+                },
+            ];
+            assert_eq!(
+                Some(&expected),
+                batch1.range_ops.get(TestSchema1::COLUMN_FAMILY_NAME)
+            );
+            assert_eq!(
+                Some(f30),
+                batch1
+                    .get_operation::<TestSchema1>(&f3)
+                    .unwrap()
+                    .unwrap()
+                    .decode_value::<TestSchema1>()
                     .unwrap()
             );
         }

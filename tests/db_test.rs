@@ -208,6 +208,57 @@ fn test_two_schema_batches() {
 }
 
 #[test]
+fn test_merged_range_delete_preserves_later_put_inside_range() {
+    let db = TestDB::new();
+
+    let mut seed_batch = SchemaBatch::new();
+    for i in 1..5 {
+        seed_batch
+            .put::<TestSchema1>(&TestField(i), &TestField(i))
+            .unwrap();
+    }
+    db.write_schemas(&seed_batch).unwrap();
+
+    let mut db_batch1 = SchemaBatch::new();
+    db_batch1
+        .delete_range::<TestSchema1>(&TestField(1), &TestField(5))
+        .unwrap();
+
+    let mut db_batch2 = SchemaBatch::new();
+    db_batch2
+        .put::<TestSchema1>(&TestField(3), &TestField(30))
+        .unwrap();
+
+    db_batch1.merge(db_batch2);
+    db.write_schemas(&db_batch1).unwrap();
+
+    assert_eq!(
+        collect_values::<TestSchema1>(&db),
+        gen_expected_values(&[(3, 30)]),
+    );
+}
+
+#[test]
+fn test_merged_later_range_delete_removes_earlier_put_inside_range() {
+    let db = TestDB::new();
+
+    let mut db_batch1 = SchemaBatch::new();
+    db_batch1
+        .put::<TestSchema1>(&TestField(3), &TestField(30))
+        .unwrap();
+
+    let mut db_batch2 = SchemaBatch::new();
+    db_batch2
+        .delete_range::<TestSchema1>(&TestField(1), &TestField(5))
+        .unwrap();
+
+    db_batch1.merge(db_batch2);
+    db.write_schemas(&db_batch1).unwrap();
+
+    assert_eq!(collect_values::<TestSchema1>(&db), gen_expected_values(&[]),);
+}
+
+#[test]
 fn test_reopen() {
     let tmpdir = tempfile::tempdir().unwrap();
     {
