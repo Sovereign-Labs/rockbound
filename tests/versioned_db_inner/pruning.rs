@@ -106,6 +106,37 @@ fn basic_prune() {
     assert_eq!(historical(&delta_reader, b"k", 6).unwrap(), Some(6));
 }
 
+#[test]
+fn direct_historical_lookup_can_return_survivor_below_pruned_watermark() {
+    let (_dir, db) = open_versioned();
+    for v in 0..=9u64 {
+        put_at(&db, &[(b"advancer", v as u32)], v);
+        if v == 0 || v >= 7 {
+            put_at(&db, &[(b"survivor", v as u32)], v);
+        }
+    }
+
+    let out = db.collect_pruning_batch(3, None).unwrap();
+    assert_eq!(out.last_pruned_version, Some(5));
+    commit_pruning_batch(&db, &out.batch);
+    assert_eq!(db.get_pruned_version().unwrap(), Some(5));
+
+    assert_eq!(hist(&db, b"survivor", 5), Some(0));
+
+    let delta_reader = VersionedDeltaReader::<LiveKeys, VersionedDbCache<LiveKeys>>::new(
+        db.clone(),
+        Some(9),
+        vec![],
+    );
+    assert!(matches!(
+        historical(&delta_reader, b"survivor", 5),
+        Err(HistoricalValueError::PrunedVersion {
+            requested_version: 5,
+            oldest_available_version: Some(6),
+        })
+    ));
+}
+
 /// Smoke test for `VersionedDB::trigger_compaction`: after pruning + compaction the
 /// archival CFs are rewritten (tombstones dropped) and reads are unchanged.
 #[test]
@@ -169,7 +200,7 @@ fn multi_key_layout() {
     type HistAt = (u64, Option<u32>);
     type HistCase<'a> = (&'a [u8], &'a [HistAt]);
     let cases: &[HistCase] = &[
-        // A written at [6,7,8,9]; V=6 is first → no historical delete → all 4 entries survive.
+        // A written at [6,7,8,9]; V=6 is first, so no historical delete; all 4 entries survive.
         (
             b"A",
             &[
@@ -185,7 +216,7 @@ fn multi_key_layout() {
                 (9, Some(9)),
             ],
         ),
-        // B written at [7,8,9]; no pruning entries ≤ 6.
+        // B written at [7,8,9]; no pruning entries <= 6.
         (
             b"B",
             &[
@@ -265,7 +296,7 @@ fn multi_key_layout() {
                 (9, Some(3)),
             ],
         ),
-        // G written at [0,7,8,9]; V=0 is first → kept. Survivors: G@0,7,8,9.
+        // G written at [0,7,8,9]; V=0 is first and is kept. Survivors: G@0,7,8,9.
         (
             b"G",
             &[
@@ -324,7 +355,7 @@ fn max_batch_size_split() {
         put_at(&db, &[(b"k", v as u32)], v);
     }
 
-    // 7 pruning entries ≤ cutoff=6 (V=0..=6). With max_batch_size=3, each pass collects
+    // 7 pruning entries <= cutoff=6 (V=0..=6). With max_batch_size=3, each pass collects
     // (and fully retires) exactly 3 entries.
     // Pass 1 collects [0|k], [1|k], [2|k]: V=0 is the group's oldest with nothing before
     // it (no delete); V=1 and V=2 delete their in-group predecessors k|0 and k|1.
@@ -351,7 +382,7 @@ fn max_batch_size_split() {
     assert_eq!(historical(&delta_reader, b"k", 2).unwrap(), Some(2));
 
     // After commit: pruning entries [0..=2|k] gone, historical k|0,k|1 gone. Remaining
-    // pruning entries ≤ cutoff: [3|k], [4|k], [5|k], [6|k].
+    // pruning entries <= cutoff: [3|k], [4|k], [5|k], [6|k].
     // Pass 2 collects [3|k], [4|k], [5|k]: V=3 is now its group's oldest, so it looks up
     // its predecessor (the survivor k|2) and deletes it; V=4 and V=5 delete k|3 and k|4.
     let out2 = db.collect_pruning_batch(3, Some(3)).unwrap();
@@ -361,7 +392,7 @@ fn max_batch_size_split() {
     assert_eq!(out2.keys_inspected, 3); // V=3,4,5
     commit_pruning_batch(&db, &out2.batch);
 
-    // Only [6|k] remains ≤ cutoff; the final pass deletes its predecessor (the survivor
+    // Only [6|k] remains <= cutoff; the final pass deletes its predecessor (the survivor
     // k|5) and drains the iterator, so the cap is not hit.
     let out3 = db.collect_pruning_batch(3, Some(3)).unwrap();
     assert!(!out3.hit_size_limit);
@@ -381,7 +412,7 @@ fn max_batch_size_split() {
 }
 
 /// Draining with a small `max_batch_size` must converge to the exact same final state as a
-/// single uncapped prune, and must fully clear the pruning index — guarding against an
+/// single uncapped prune, and must fully clear the pruning index, guarding against an
 /// off-by-one in the range bound (a stranded pruning entry) or an over-eager bound (an
 /// orphaned historical row).
 #[test]
@@ -413,7 +444,7 @@ fn capped_prune_converges_to_uncapped() {
         }
     }
 
-    // cutoff = 9 - 3 = 6. Both strategies must drain every pruning entry ≤ cutoff.
+    // cutoff = 9 - 3 = 6. Both strategies must drain every pruning entry <= cutoff.
     assert_eq!(
         uncapped.iter_pruning_keys_up_to_version(6).unwrap().count(),
         0
@@ -445,7 +476,7 @@ fn capped_prune_converges_to_uncapped() {
 }
 
 /// Locks the inclusive range bound: a capped pass fully retires exactly the entries it
-/// collected — `[0|k]`, `[1|k]`, `[2|k]` are cleared from the pruning index (every one had
+/// collected: `[0|k]`, `[1|k]`, `[2|k]` are cleared from the pruning index (every one had
 /// its predecessor handling emitted in the same batch) while the uncollected `[3..=6|k]`
 /// remain for later passes. An over-eager bound would orphan a historical row; a stranded
 /// collected entry would waste a re-inspection.
@@ -539,7 +570,7 @@ fn max_batch_size_zero_errors() {
 
 #[test]
 fn cutoff_underflow_returns_empty() {
-    // last_committed < keep_versions → checked_sub underflows → empty batch.
+    // last_committed < keep_versions means checked_sub underflows, yielding an empty batch.
     let (_dir, db) = open_versioned();
     put_at(&db, &[(b"k", 0)], 0);
     put_at(&db, &[(b"k", 1)], 1);

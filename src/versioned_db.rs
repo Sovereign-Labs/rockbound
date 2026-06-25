@@ -19,6 +19,7 @@ use crate::{
     iterator::{RawDbIter, ScanDirection},
     metrics::{SCHEMADB_BATCH_COMMIT_BYTES, SCHEMADB_DELETES, SCHEMADB_PUT_BYTES},
     schema::{ColumnFamilyName, KeyDecoder, KeyEncoder, ValueCodec},
+    schema_batch::RangeDeleteKey,
     BasicWeighter, CacheForSchema, CfDescriptorBuilder, CodecError, Schema, SchemaBatch, DB,
 };
 
@@ -214,7 +215,7 @@ impl<S: SchemaWithVersion, C: CacheForVersionedDB<S>> VersionedDB<S, C> {
     /// Triggers full compaction of the archival column families that pruning deletes from
     /// (historical + pruning), dropping the resulting tombstones and reclaiming disk.
     /// Intended to be called after committing a large pruning batch (e.g. a one-time
-    /// startup prune). Heavy — only sensible when there is no live read/write traffic.
+    /// startup prune). Heavy: only sensible when there is no live read/write traffic.
     ///
     /// The metadata CF and the live CF receive ~no deletes from pruning, so they are not
     /// compacted here.
@@ -577,7 +578,7 @@ where
     /// - deletes the historical-CF entry of the *previous* write of each collected K (so
     ///   the most recent write at or before `cutoff` survives, preserving the invariant
     ///   that every live key has at least one historical entry; see the doc on
-    ///   [`VersionedDB`]). These stay point deletes — they are scattered per-key and not
+    ///   [`VersionedDB`]). These stay point deletes; they are scattered per-key and not
     ///   safely range-able; their space is reclaimed by [`VersionedDB::trigger_compaction`].
     /// - writes [`VersionedTableMetadataKey::PrunedVersion`] = the greatest
     ///   `version - 1` for which this batch deleted a historical row, if any.
@@ -646,6 +647,15 @@ where
             }
         }
         let keys_inspected = collected.len();
+        if collected.is_empty() {
+            return Ok(PruningBatchOutput {
+                batch,
+                hit_size_limit,
+                last_pruned_version,
+                keys_inspected,
+                keys_to_prune,
+            });
+        }
 
         // The pruning CF is keyed `[version_be || key]` and every collected entry has
         // `version <= cutoff`, so the collected set is one contiguous prefix range that we
@@ -658,11 +668,7 @@ where
             let (last_version, last_key) = collected
                 .last()
                 .expect("hit_size_limit implies at least one collected entry");
-            let mut upper = encode_pruning_key(*last_version, last_key.as_ref());
-            // Appending 0x00 yields the smallest key strictly greater under bytewise
-            // ordering, making the bound inclusive of the last collected entry.
-            upper.push(0);
-            upper
+            encode_pruning_key(*last_version, last_key.as_ref()).range_delete_key_after()
         } else {
             cutoff.saturating_add(1).to_be_bytes().to_vec()
         };
@@ -674,7 +680,7 @@ where
 
         // Phase 3: walk each key's group `[V1 < V2 < ... < Vm]` and delete the historical
         // entry of each version's *previous* write, keeping the entry at `Vm` (the most
-        // recent write at or before `cutoff`) intact — preserves the "at least one entry
+        // recent write at or before `cutoff`) intact, preserving the "at least one entry
         // per live key" invariant; see the doc on [`VersionedDB`].
         //
         // For `Vi` with `i >= 2` the previous write is `V(i-1)`, known from the group
@@ -909,6 +915,12 @@ where
     }
 
     /// Returns the value of a key in the historical column family as of the given version.
+    ///
+    /// This is a raw archival lookup: it does not enforce
+    /// [`VersionedTableMetadataKey::PrunedVersion`]. After pruning, some survivor rows are
+    /// intentionally retained below the pruning watermark, so this method may return a
+    /// value for a version that strict historical readers should treat as pruned. Use
+    /// [`VersionedDeltaReader::get_historical_borrowed`] for watermark-aware reads.
     pub fn get_historical_value(
         &self,
         key_to_get: &impl KeyEncoder<V>,
@@ -926,7 +938,12 @@ where
         Ok(Some(value))
     }
 
-    /// Returns the value of a key in the historical column family as of the given version.
+    /// Returns the value of a pre-encoded key in the historical column family as of the
+    /// given version.
+    ///
+    /// This has the same raw archival semantics as [`Self::get_historical_value`]: it may
+    /// return retained survivor rows below [`VersionedTableMetadataKey::PrunedVersion`].
+    /// Use [`VersionedDeltaReader::get_historical_borrowed`] for watermark-aware reads.
     pub fn get_historical_value_raw(
         &self,
         pre_encoded_key_to_get: Vec<u8>,
@@ -945,6 +962,10 @@ where
     }
 
     /// Returns the latest version at which the given key was written.
+    ///
+    /// This is a raw archival lookup and does not enforce
+    /// [`VersionedTableMetadataKey::PrunedVersion`]. After pruning, it may report retained
+    /// survivor rows below the pruning watermark.
     pub fn get_version_for_key(
         &self,
         key_to_get: &impl KeyEncoder<V>,
