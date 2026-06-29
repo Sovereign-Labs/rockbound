@@ -1,5 +1,6 @@
 mod cache;
 mod delta_reader;
+mod empty_value;
 mod iterator;
 mod pruning;
 
@@ -131,6 +132,10 @@ fn get_column_families() -> Vec<ColumnFamilyName> {
         LiveKeys::HISTORICAL_COLUMN_FAMILY_NAME,
         LiveKeys::PRUNING_COLUMN_FAMILY_NAME,
         LiveKeys::VERSION_METADATA_COLUMN_FAMILY_NAME,
+        ByteVecSchema::COLUMN_FAMILY_NAME,
+        ByteVecSchema::HISTORICAL_COLUMN_FAMILY_NAME,
+        ByteVecSchema::PRUNING_COLUMN_FAMILY_NAME,
+        ByteVecSchema::VERSION_METADATA_COLUMN_FAMILY_NAME,
     ]
 }
 
@@ -268,4 +273,92 @@ impl CacheForVersionedDB<LiveKeys> for VersionedDbCache<LiveKeys> {
         let lock = self.cache.try_read()?;
         Some(RwLockReadGuard::map(lock, |c| c))
     }
+}
+
+/// Variable-length value type for exercising edge cases in the versioned-db
+/// encoding. Unlike `TestField` (fixed 4 bytes), this can round-trip payloads
+/// of arbitrary length including zero, which is needed to verify that
+/// `put_versioned` rejects empty values.
+#[derive(Debug, Default, Clone, PartialOrd, Ord, PartialEq, Eq)]
+pub struct TestByteVec(pub Vec<u8>);
+
+impl AsRef<[u8]> for TestByteVec {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl<S: Schema> ValueCodec<S> for TestByteVec {
+    fn encode_value(&self) -> Result<Vec<u8>, CodecError> {
+        Ok(self.0.clone())
+    }
+
+    fn decode_value(data: &[u8]) -> Result<Self, CodecError> {
+        Ok(Self(data.to_vec()))
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialOrd, Ord, PartialEq, Eq)]
+pub struct ByteVecSchema;
+
+impl Schema for ByteVecSchema {
+    type Key = TestKey;
+    type Value = TestByteVec;
+    const COLUMN_FAMILY_NAME: ColumnFamilyName = "ByteVecLiveCF";
+}
+
+impl SchemaWithVersion for ByteVecSchema {
+    const HISTORICAL_COLUMN_FAMILY_NAME: ColumnFamilyName = "ByteVecHistoricalCF";
+    const PRUNING_COLUMN_FAMILY_NAME: ColumnFamilyName = "ByteVecPruningCF";
+    const VERSION_METADATA_COLUMN_FAMILY_NAME: ColumnFamilyName = "ByteVecVersionMetadataCF";
+}
+
+impl KeyEncoder<ByteVecSchema> for TestKey {
+    fn encode_key(&self) -> Result<Vec<u8>, CodecError> {
+        Ok(self.0.as_ref().to_vec())
+    }
+}
+
+impl KeyDecoder<ByteVecSchema> for TestKey {
+    fn decode_key(data: &[u8]) -> Result<Self, CodecError> {
+        Ok(TestKey::from(data.to_vec()))
+    }
+}
+
+impl CacheForVersionedDB<ByteVecSchema> for VersionedDbCache<ByteVecSchema> {
+    fn write(&self) -> parking_lot::MappedRwLockWriteGuard<'_, CacheForSchema<ByteVecSchema>> {
+        RwLockWriteGuard::map(self.cache.write(), |c| c)
+    }
+
+    fn read(&self) -> parking_lot::MappedRwLockReadGuard<'_, CacheForSchema<ByteVecSchema>> {
+        RwLockReadGuard::map(self.cache.read(), |c| c)
+    }
+
+    fn try_read(
+        &self,
+    ) -> Option<parking_lot::MappedRwLockReadGuard<'_, CacheForSchema<ByteVecSchema>>> {
+        let lock = self.cache.try_read()?;
+        Some(RwLockReadGuard::map(lock, |c| c))
+    }
+}
+
+/// Creates an on-disk `VersionedDB` backed by `ByteVecSchema`. The returned
+/// `TempDir` must be kept alive for the lifetime of the returned `VersionedDB`;
+/// callers typically bind it to a `_tmpdir` local.
+pub fn setup_bytevec_db() -> (
+    TempDir,
+    Arc<VersionedDB<ByteVecSchema, VersionedDbCache<ByteVecSchema>>>,
+) {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = Arc::new(open_db(&tmpdir));
+    let cache = VersionedDbCache::<ByteVecSchema>::new(1_000);
+    let vdb = Arc::new(
+        VersionedDB::<ByteVecSchema, VersionedDbCache<ByteVecSchema>>::from_dbs(
+            db.clone(),
+            db.clone(),
+            cache,
+        )
+        .unwrap(),
+    );
+    (tmpdir, vdb)
 }
