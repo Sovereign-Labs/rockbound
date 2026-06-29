@@ -19,7 +19,8 @@ use crate::{
     iterator::{RawDbIter, ScanDirection},
     metrics::{SCHEMADB_BATCH_COMMIT_BYTES, SCHEMADB_DELETES, SCHEMADB_PUT_BYTES},
     schema::{ColumnFamilyName, KeyDecoder, KeyEncoder, ValueCodec},
-    BasicWeighter, CacheForSchema, CfDescriptorBuilder, CodecError, Schema, DB,
+    schema_batch::RangeDeleteKey,
+    BasicWeighter, CacheForSchema, CfDescriptorBuilder, CodecError, Schema, SchemaBatch, DB,
 };
 
 #[derive(Debug, Default)]
@@ -37,7 +38,7 @@ impl Schema for VersionMetadata {
 pub enum VersionedTableMetadataKey {
     /// The latest version that has been committed.
     CommittedVersion,
-    /// The newest version that has been pruned.
+    /// The newest version historical readers should treat as pruned.
     PrunedVersion,
 }
 
@@ -181,7 +182,9 @@ fn decode_version_metadata_value(data: &[u8]) -> Result<u64, CodecError> {
 impl<S: SchemaWithVersion, C: CacheForVersionedDB<S>> VersionedDB<S, C>
 // This where clause shouldn't be needed since it's implied by the Schema trait, but Rust intentionally doesn't elaborate these bounds.
 {
-    /// Returns the oldest version that is available in the database.
+    /// Returns the newest version historical readers should treat as pruned.
+    ///
+    /// Historical reads use `pruned_version + 1` as the oldest available version.
     pub fn get_pruned_version(&self) -> anyhow::Result<Option<u64>> {
         self.archival_db.get_raw_with_cf_and_decoder::<u64>(
             S::VERSION_METADATA_COLUMN_FAMILY_NAME,
@@ -207,6 +210,20 @@ impl<S: SchemaWithVersion, C: CacheForVersionedDB<S>> VersionedDB<S, C> {
     /// Returns a reference to the archival database.
     pub fn archival_db(&self) -> &DB {
         &self.archival_db
+    }
+
+    /// Triggers full compaction of the archival column families that pruning deletes from
+    /// (historical + pruning), dropping the resulting tombstones and reclaiming disk.
+    /// Intended to be called after committing a large pruning batch (e.g. a one-time
+    /// startup prune). Heavy: only sensible when there is no live read/write traffic.
+    ///
+    /// The metadata CF and the live CF receive ~no deletes from pruning, so they are not
+    /// compacted here.
+    pub fn trigger_compaction(&self) -> anyhow::Result<()> {
+        self.archival_db
+            .compact_cf(S::HISTORICAL_COLUMN_FAMILY_NAME)?;
+        self.archival_db.compact_cf(S::PRUNING_COLUMN_FAMILY_NAME)?;
+        Ok(())
     }
 }
 
@@ -373,6 +390,24 @@ impl KeyWithVersionPrefixAndSuffix {
     }
 }
 
+/// Encodes the historical/archival-CF key layout: `key` followed by the big-endian
+/// `version`. Mirrors `KeyWithVersionPrefixAndSuffix::archival_key`.
+fn encode_archival_key(key: &[u8], version: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(key.len() + 8);
+    buf.extend_from_slice(key);
+    buf.extend_from_slice(&version.to_be_bytes());
+    buf
+}
+
+/// Encodes the pruning-CF key layout: the big-endian `version` followed by `key`.
+/// Mirrors `KeyWithVersionPrefixAndSuffix::pruning_key`.
+fn encode_pruning_key(version: u64, key: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(8 + key.len());
+    buf.extend_from_slice(&version.to_be_bytes());
+    buf.extend_from_slice(key);
+    buf
+}
+
 impl<V: SchemaWithVersion, C: CacheForVersionedDB<V>> VersionedDB<V, C>
 where
     V::Key: Ord + Clone + std::hash::Hash + AsRef<[u8]>,
@@ -529,6 +564,176 @@ where
                         .expect("DB Corruption: Failed to decode pruning key")
                 },
             )
+    }
+
+    /// Collects a batch of deletes that prunes versioned data older than
+    /// `last_committed - keep_versions`. The returned batch targets the `archival_db`:
+    /// the caller commits it via `archival_db.write_schemas(&output.batch)`.
+    ///
+    /// On commit, the batch:
+    /// - clears the pruning-CF entries `[V|K]` (`V <= cutoff`) collected this pass using
+    ///   a single range tombstone. Every collected entry has its historical predecessor
+    ///   delete emitted in this same batch, so the tombstone covers all of them; entries
+    ///   beyond the `max_batch_size` cap stay in the pruning index for later passes.
+    /// - deletes the historical-CF entry of the *previous* write of each collected K (so
+    ///   the most recent write at or before `cutoff` survives, preserving the invariant
+    ///   that every live key has at least one historical entry; see the doc on
+    ///   [`VersionedDB`]). These stay point deletes; they are scattered per-key and not
+    ///   safely range-able; their space is reclaimed by [`VersionedDB::trigger_compaction`].
+    /// - writes [`VersionedTableMetadataKey::PrunedVersion`] = the greatest
+    ///   `version - 1` for which this batch deleted a historical row, if any.
+    ///
+    /// `keep_versions` must be `>= 1`. `max_batch_size`, when set, must be `>= 1`;
+    /// use `None` for an uncapped batch. If the database has no committed version yet,
+    /// if `last_committed < keep_versions`, or if no pruning entries remain up to the
+    /// cutoff, the returned batch is empty and `last_pruned_version` is `None`.
+    ///
+    /// When `max_batch_size` is set, at most that many pruning entries are collected per
+    /// pass, so the batch holds at most that many historical-CF deletes (each entry
+    /// contributes at most one); `hit_size_limit` is `true` when entries remain beyond
+    /// the cap, and the caller should commit the batch and re-invoke to drain the rest.
+    ///
+    /// # Performance
+    ///
+    /// One sequential scan of the pruning index over the collected entries, plus at most
+    /// one historical-CF seek per *distinct key* in the pass: within a key's group of
+    /// collected versions every predecessor is known from the group itself, and only the
+    /// group's oldest version needs a lookup (for a survivor left by an earlier pass).
+    /// An uncapped pass buffers all prunable entries in memory (the same order of
+    /// magnitude as the returned batch itself); set `max_batch_size` to bound memory and
+    /// commit size when pruning a large backlog.
+    pub fn collect_pruning_batch(
+        &self,
+        keep_versions: u64,
+        max_batch_size: Option<usize>,
+    ) -> anyhow::Result<PruningBatchOutput> {
+        if keep_versions == 0 {
+            anyhow::bail!("keep_versions must be >= 1");
+        }
+        if max_batch_size == Some(0) {
+            anyhow::bail!("max_batch_size must be >= 1 when set");
+        }
+
+        let mut batch = SchemaBatch::new();
+        let mut keys_to_prune = 0usize;
+        let mut hit_size_limit = false;
+        let mut last_pruned_version = None;
+
+        let Some(cutoff) = self
+            .get_committed_version_live_db()?
+            .and_then(|last_committed| last_committed.checked_sub(keep_versions))
+        else {
+            return Ok(PruningBatchOutput {
+                batch,
+                hit_size_limit,
+                last_pruned_version,
+                keys_inspected: 0,
+                keys_to_prune,
+            });
+        };
+
+        // Phase 1: collect up to `max_batch_size` pruning entries `[V|K]` with
+        // `V <= cutoff`, in `[version_be || key]` order. Bounding the collection bounds
+        // both this pass's memory and the number of deletes emitted below (each entry
+        // contributes at most one historical delete).
+        let mut iter = self.iter_pruning_keys_up_to_version(cutoff)?;
+        let mut collected: Vec<(u64, V::Key)> = Vec::new();
+        for prunable in &mut iter {
+            collected.push(prunable.version_and_key());
+            if max_batch_size.is_some_and(|m| collected.len() >= m) {
+                // Peek whether entries remain so callers know to re-invoke.
+                hit_size_limit = iter.next().is_some();
+                break;
+            }
+        }
+        let keys_inspected = collected.len();
+        if collected.is_empty() {
+            return Ok(PruningBatchOutput {
+                batch,
+                hit_size_limit,
+                last_pruned_version,
+                keys_inspected,
+                keys_to_prune,
+            });
+        }
+
+        // The pruning CF is keyed `[version_be || key]` and every collected entry has
+        // `version <= cutoff`, so the collected set is one contiguous prefix range that we
+        // clear with a single range tombstone instead of one point delete per entry. Every
+        // collected entry is fully processed below (its historical predecessor delete is
+        // emitted in this same batch), so the tombstone may cover all of them: when the
+        // iterator was drained, the exclusive upper bound is `cutoff + 1`; when we stopped
+        // at `max_batch_size`, it is the successor of the last collected entry.
+        let pruning_cf_upper = if hit_size_limit {
+            let (last_version, last_key) = collected
+                .last()
+                .expect("hit_size_limit implies at least one collected entry");
+            encode_pruning_key(*last_version, last_key.as_ref()).range_delete_key_after()
+        } else {
+            cutoff.saturating_add(1).to_be_bytes().to_vec()
+        };
+
+        // Phase 2: group the collected entries per key, versions ascending within each
+        // group. Sort by key *bytes* to match the column family's ordering.
+        collected
+            .sort_unstable_by(|(va, ka), (vb, kb)| ka.as_ref().cmp(kb.as_ref()).then(va.cmp(vb)));
+
+        // Phase 3: walk each key's group `[V1 < V2 < ... < Vm]` and delete the historical
+        // entry of each version's *previous* write, keeping the entry at `Vm` (the most
+        // recent write at or before `cutoff`) intact, preserving the "at least one entry
+        // per live key" invariant; see the doc on [`VersionedDB`].
+        //
+        // For `Vi` with `i >= 2` the previous write is `V(i-1)`, known from the group
+        // itself. Only `V1` needs a historical-CF lookup: its previous write, if any, is a
+        // survivor kept by an earlier pass. (A pre-redesign capped pass may also have left
+        // `V1` lingering with its predecessor already deleted; the lookup then finds
+        // nothing and emits nothing, so passes of either vintage compose safely.) When
+        // `V1 == 0` there is nothing before it and the lookup is skipped.
+        let mut prev_in_group: Option<(&[u8], u64)> = None;
+        for (version, key) in &collected {
+            // Deleting this entry's predecessor redirects historical queries in
+            // `[predecessor, version - 1]`; `version == 0` has no predecessor.
+            let Some(query_version) = version.checked_sub(1) else {
+                prev_in_group = Some((key.as_ref(), *version));
+                continue;
+            };
+            let prev_version = match prev_in_group {
+                Some((prev_key, prev_version)) if prev_key == key.as_ref() => Some(prev_version),
+                _ => self.get_version_for_key(key, query_version)?,
+            };
+            if let Some(prev_version) = prev_version {
+                batch.delete_cf_raw(
+                    V::HISTORICAL_COLUMN_FAMILY_NAME,
+                    encode_archival_key(key.as_ref(), prev_version),
+                );
+                keys_to_prune += 1;
+                // The watermark must cover the highest redirected query version.
+                last_pruned_version = last_pruned_version.max(Some(query_version));
+            }
+            prev_in_group = Some((key.as_ref(), *version));
+        }
+
+        if keys_inspected > 0 {
+            // Clear the collected pruning entries with one range tombstone over
+            // `[start-of-CF, pruning_cf_upper)`. `Vec::new()` sorts before all keys.
+            batch.delete_range_cf_raw(V::PRUNING_COLUMN_FAMILY_NAME, Vec::new(), pruning_cf_upper);
+        }
+
+        if let Some(v) = last_pruned_version {
+            batch.put_cf_raw(
+                V::VERSION_METADATA_COLUMN_FAMILY_NAME,
+                VersionedTableMetadataKey::PrunedVersion.as_bytes().to_vec(),
+                v.to_be_bytes().to_vec(),
+            );
+        }
+
+        Ok(PruningBatchOutput {
+            batch,
+            hit_size_limit,
+            last_pruned_version,
+            keys_inspected,
+            keys_to_prune,
+        })
     }
 
     fn load_committed_version_from_disk(live_db: &DB) -> anyhow::Result<Option<u64>> {
@@ -710,6 +915,12 @@ where
     }
 
     /// Returns the value of a key in the historical column family as of the given version.
+    ///
+    /// This is a raw archival lookup: it does not enforce
+    /// [`VersionedTableMetadataKey::PrunedVersion`]. After pruning, some survivor rows are
+    /// intentionally retained below the pruning watermark, so this method may return a
+    /// value for a version that strict historical readers should treat as pruned. Use
+    /// [`VersionedDeltaReader::get_historical_borrowed`] for watermark-aware reads.
     pub fn get_historical_value(
         &self,
         key_to_get: &impl KeyEncoder<V>,
@@ -727,7 +938,12 @@ where
         Ok(Some(value))
     }
 
-    /// Returns the value of a key in the historical column family as of the given version.
+    /// Returns the value of a pre-encoded key in the historical column family as of the
+    /// given version.
+    ///
+    /// This has the same raw archival semantics as [`Self::get_historical_value`]: it may
+    /// return retained survivor rows below [`VersionedTableMetadataKey::PrunedVersion`].
+    /// Use [`VersionedDeltaReader::get_historical_borrowed`] for watermark-aware reads.
     pub fn get_historical_value_raw(
         &self,
         pre_encoded_key_to_get: Vec<u8>,
@@ -746,6 +962,10 @@ where
     }
 
     /// Returns the latest version at which the given key was written.
+    ///
+    /// This is a raw archival lookup and does not enforce
+    /// [`VersionedTableMetadataKey::PrunedVersion`]. After pruning, it may report retained
+    /// survivor rows below the pruning watermark.
     pub fn get_version_for_key(
         &self,
         key_to_get: &impl KeyEncoder<V>,
@@ -801,6 +1021,25 @@ pub struct VersionedDbMetrics {
     pub deletes: usize,
     pub archival_puts_bytes: usize,
     pub pruning_puts_bytes: usize,
+}
+
+/// Output of [`VersionedDB::collect_pruning_batch`].
+///
+/// The caller commits `batch` via `archival_db.write_schemas(&output.batch)`.
+#[derive(Debug)]
+pub struct PruningBatchOutput {
+    /// Multi-CF batch of deletes and the metadata write.
+    pub batch: SchemaBatch,
+    /// `true` if `max_batch_size` was reached with pruning entries still remaining.
+    /// Caller should commit and re-invoke until this returns `false`.
+    pub hit_size_limit: bool,
+    /// The value recorded into [`VersionedTableMetadataKey::PrunedVersion`], or `None`
+    /// when this batch deleted no historical rows.
+    pub last_pruned_version: Option<u64>,
+    /// Number of pruning-CF entries collected (and fully processed) this pass. For metrics.
+    pub keys_inspected: usize,
+    /// Number of historical-CF delete operations placed in the batch. For metrics.
+    pub keys_to_prune: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1325,5 +1564,49 @@ where
     /// Returns the number of cache misses.
     pub fn cache_misses(&self) -> u64 {
         self.versioned_db_cache.read().misses()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Locks the on-disk key layouts: the free `encode_*` helpers used on the pruning
+    /// path must stay byte-identical to `KeyWithVersionPrefixAndSuffix`, which defines
+    /// the canonical archival (`key || version_be`) and pruning (`version_be || key`)
+    /// layouts at write time. If either drifts, historical deletes and pruning-range
+    /// bounds silently target the wrong bytes.
+    #[test]
+    fn encode_helpers_match_key_with_version_layout() {
+        let cases: &[(&[u8], u64)] = &[
+            (b"k", 0),
+            (b"k", 1),
+            (b"k", u64::MAX),
+            (b"multi-byte-key", 42),
+            (&[0xff, 0x00, 0xff], u64::MAX),
+            (&[], 7),
+        ];
+
+        for &(key, version) in cases {
+            let mut key_with_version = KeyWithVersionPrefixAndSuffix::new(version);
+            key_with_version.set_key(key);
+
+            assert_eq!(
+                encode_archival_key(key, version),
+                key_with_version.archival_key(),
+                "archival layout mismatch for key={key:?} version={version}",
+            );
+            assert_eq!(
+                encode_pruning_key(version, key),
+                key_with_version.pruning_key(),
+                "pruning layout mismatch for key={key:?} version={version}",
+            );
+            // `live_key` must round-trip the original key out of the shared buffer.
+            assert_eq!(
+                key_with_version.live_key(),
+                key,
+                "live_key round-trip mismatch for key={key:?} version={version}",
+            );
+        }
     }
 }
