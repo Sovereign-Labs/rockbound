@@ -198,3 +198,20 @@ fn test_cache_behavior_under_concurrency() {
         "Cache misses should be greater than cache hits. Cache size is too large"
     );
 }
+
+#[test]
+fn test_apply_cache_updates_respects_is_commit() {
+    let cache = rockbound::new_cache_for_schema::<LiveKeys>(10_000);
+    let put_key = TestKey::from(b"put".to_vec());
+    let deleted_key = TestKey::from(b"deleted".to_vec());
+    let mut batch = VersionedSchemaBatch::<LiveKeys>::default();
+    batch.put_versioned(put_key.clone(), TestField::new(1));
+    batch.delete_versioned(deleted_key.clone());
+
+    VersionedDB::<LiveKeys, VersionedDbCache<LiveKeys>>::apply_cache_updates(&cache, &batch, false);
+    assert_eq!(cache.get(&put_key), Some(Some(TestField::new(1))));
+    assert_eq!(cache.get(&deleted_key), None);
+
+    VersionedDB::<LiveKeys, VersionedDbCache<LiveKeys>>::apply_cache_updates(&cache, &batch, true);
+    assert_eq!(cache.get(&deleted_key), Some(None));
+}
