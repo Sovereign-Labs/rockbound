@@ -796,7 +796,6 @@ where
         archival_db_batch: &mut rocksdb::WriteBatch,
         batch: &VersionedSchemaBatch<V>,
         version: u64,
-        cache: &CacheForSchema<V>,
         live_db: &DB,
         archival_db: &DB,
         is_commit: bool,
@@ -838,7 +837,6 @@ where
                         key_with_version.archival_key(),
                         value,
                     );
-                    cache.insert(key.clone(), Some(value.clone()));
                 }
                 None => {
                     // println!("Deleting live key: {:?}", key_with_version.live_key());
@@ -847,7 +845,6 @@ where
 
                     if is_commit {
                         live_db_batch.delete_cf(live_cf_handle, key);
-                        cache.insert(key.clone(), None);
                         archival_db_batch.put_cf(
                             archival_cf_handle,
                             key_with_version.archival_key(),
@@ -883,6 +880,22 @@ where
             archival_puts_bytes,
             pruning_puts_bytes,
         })
+    }
+
+    /// Applies `batch` to the live-value cache.
+    /// Callers must hold the cache write lock from this call until the matching live batch is written (see `get_live_value`).
+    pub fn apply_cache_updates(
+        cache: &CacheForSchema<V>,
+        batch: &VersionedSchemaBatch<V>,
+        is_commit: bool,
+    ) {
+        for (key, value) in batch.versioned_table_writes.iter() {
+            match value {
+                Some(value) => cache.insert(key.clone(), Some(value.clone())),
+                None if is_commit => cache.insert(key.clone(), None),
+                None => {}
+            }
+        }
     }
 
     /// Updates `VersionedDbMetrics`
@@ -1521,11 +1534,11 @@ where
             &mut archival_db_batch,
             batch,
             version,
-            &cache,
             live_db,
             archival_db,
             true,
         )?;
+        Self::apply_cache_updates(&cache, batch, true);
 
         let serialized_size = live_db_batch.size_in_bytes() + archival_db_batch.size_in_bytes();
         let archival_serialized_size = archival_db_batch.size_in_bytes();
