@@ -3,6 +3,7 @@ mod commit_protocol;
 mod delta_reader;
 mod iterator;
 mod pruning;
+mod rollback;
 
 use std::sync::Arc;
 
