@@ -15,10 +15,10 @@ use tempfile::TempDir;
 
 use super::{put_keys, LiveKeys, TestDB, TestField, TestKey, VersionedDbCache};
 
-type V = VersionedDB<LiveKeys, VersionedDbCache<LiveKeys>>;
-type Reader = VersionedDeltaReader<LiveKeys, VersionedDbCache<LiveKeys>>;
+pub(super) type V = VersionedDB<LiveKeys, VersionedDbCache<LiveKeys>>;
+pub(super) type Reader = VersionedDeltaReader<LiveKeys, VersionedDbCache<LiveKeys>>;
 
-fn open_versioned() -> (TempDir, Arc<V>, VersionedDbCache<LiveKeys>) {
+pub(super) fn open_versioned() -> (TempDir, Arc<V>, VersionedDbCache<LiveKeys>) {
     let TestDB { tmpdir, db } = TestDB::new();
     let db = Arc::new(db);
     let cache = VersionedDbCache::new(1_000_000);
@@ -26,21 +26,21 @@ fn open_versioned() -> (TempDir, Arc<V>, VersionedDbCache<LiveKeys>) {
     (tmpdir, versioned_db, cache)
 }
 
-fn key(name: &[u8]) -> TestKey {
+pub(super) fn key(name: &[u8]) -> TestKey {
     TestKey::from(name.to_vec())
 }
 
-fn value(value: u32) -> Option<TestField> {
+pub(super) fn value(value: u32) -> Option<TestField> {
     Some(TestField::new(value))
 }
 
-fn pinned_reader(db: &Arc<V>, version: u64) -> Reader {
+pub(super) fn pinned_reader(db: &Arc<V>, version: u64) -> Reader {
     Reader::new(db.clone(), Some(version), vec![])
 }
 
 /// Commits version 0 with `updated` and `deleted` present and `created` absent, reads all
 /// three so that the cache holds their version 0 state, and returns the batch for version 1.
-fn commit_v0_and_build_v1(db: &Arc<V>) -> VersionedSchemaBatch<LiveKeys> {
+pub(super) fn commit_v0_and_build_v1(db: &Arc<V>) -> VersionedSchemaBatch<LiveKeys> {
     put_keys(db, &[(b"updated", 1), (b"deleted", 1)], 0);
     assert_eq!(db.get_live_value(&key(b"created")).unwrap(), None);
 
@@ -51,7 +51,7 @@ fn commit_v0_and_build_v1(db: &Arc<V>) -> VersionedSchemaBatch<LiveKeys> {
     batch
 }
 
-fn assert_live_view_is_v0(db: &Arc<V>, cache: &VersionedDbCache<LiveKeys>) {
+pub(super) fn assert_live_view_is_v0(db: &Arc<V>, cache: &VersionedDbCache<LiveKeys>) {
     assert_eq!(db.get_committed_version_live_db().unwrap(), Some(0));
     for (name, expected) in [
         (&b"updated"[..], value(1)),
@@ -63,7 +63,7 @@ fn assert_live_view_is_v0(db: &Arc<V>, cache: &VersionedDbCache<LiveKeys>) {
     }
 }
 
-fn assert_live_view_is_v1(db: &Arc<V>, cache: &VersionedDbCache<LiveKeys>) {
+pub(super) fn assert_live_view_is_v1(db: &Arc<V>, cache: &VersionedDbCache<LiveKeys>) {
     assert_eq!(db.get_committed_version_live_db().unwrap(), Some(1));
     for (name, expected) in [
         (&b"updated"[..], value(2)),
@@ -77,7 +77,7 @@ fn assert_live_view_is_v1(db: &Arc<V>, cache: &VersionedDbCache<LiveKeys>) {
     }
 }
 
-fn assert_reader_at_v0_is_stable(reader: &Reader) {
+pub(super) fn assert_reader_at_v0_is_stable(reader: &Reader) {
     assert_eq!(
         reader.get_latest_borrowed(&key(b"updated")).unwrap(),
         value(1)

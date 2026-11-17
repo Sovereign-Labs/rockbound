@@ -188,8 +188,8 @@ pub trait CacheForVersionedDB<V: SchemaWithVersion> {
 ///
 /// Commits must not run concurrently: only steps 3 through 6 are serialized by the lock.
 ///
-/// A rollback (`is_commit == false`) only builds an archival batch. The live batch must not
-/// be written and the cache must not be updated.
+/// A commit that wrote its archival batch but not its live batch is undone with
+/// [`Self::update_archival_db_batch_for_rollback`], which only touches the archival DB.
 #[derive(Debug)]
 pub struct VersionedDB<S: SchemaWithVersion, C: CacheForVersionedDB<S>> {
     /// Holds the live state and the committed versions metadata.
@@ -838,9 +838,11 @@ where
     /// Populates the `live_db_batch & archival_db_batch` using data from `batch` and returns the associated metrics.
     ///
     /// This only builds the batches. It does not need the cache lock and does not touch the
-    /// cache: callers that write the live batch must also call [`Self::apply_cache_updates`].
-    /// See the "Commit protocol" section of [`VersionedDB`].
-    #[allow(clippy::too_many_arguments)]
+    /// cache: callers must also call [`Self::apply_cache_updates`] once the live batch is
+    /// written. See the "Commit protocol" section of [`VersionedDB`].
+    ///
+    /// To undo the archival half of a commit whose live batch was never written, use
+    /// [`Self::update_archival_db_batch_for_rollback`].
     pub fn update_versioned_db_batch(
         live_db_batch: &mut rocksdb::WriteBatch,
         archival_db_batch: &mut rocksdb::WriteBatch,
@@ -848,7 +850,6 @@ where
         version: u64,
         live_db: &DB,
         archival_db: &DB,
-        is_commit: bool,
     ) -> anyhow::Result<VersionedDbMetrics> {
         // Optimization:
         // At various times we need the key *prefixed* with the version (for pruning), on its own (for live reads), and suffixed with the version (for archival reads).
@@ -892,29 +893,16 @@ where
                     // println!("Deleting live key: {:?}", key_with_version.live_key());
                     deletes += 1;
                     archival_puts_bytes += key_with_version.archival_key().len();
-
-                    if is_commit {
-                        live_db_batch.delete_cf(live_cf_handle, key);
-                        archival_db_batch.put_cf(
-                            archival_cf_handle,
-                            key_with_version.archival_key(),
-                            [],
-                        );
-                    } else {
-                        // We don’t roll back live_db, and we remove data from HISTORICAL_COLUMN_FAMILY_NAME.
-                        archival_db_batch
-                            .delete_cf(archival_cf_handle, key_with_version.archival_key());
-                    }
+                    live_db_batch.delete_cf(live_cf_handle, key);
+                    archival_db_batch.put_cf(
+                        archival_cf_handle,
+                        key_with_version.archival_key(),
+                        [],
+                    );
                 }
             }
 
-            if is_commit {
-                archival_db_batch.put_cf(pruning_cf_handle, key_with_version.pruning_key(), []);
-            } else {
-                // On rollback we remove data from PRUNING_COLUMN_FAMILY_NAME)
-                archival_db_batch.delete_cf(pruning_cf_handle, key_with_version.pruning_key());
-            }
-
+            archival_db_batch.put_cf(pruning_cf_handle, key_with_version.pruning_key(), []);
             pruning_puts_bytes += key_with_version.pruning_key().len();
         }
 
@@ -932,12 +920,44 @@ where
         })
     }
 
+    /// Adds to `archival_db_batch` the deletes that remove everything the commit of `version`
+    /// wrote to the archival DB: its historical rows and its pruning entries.
+    ///
+    /// This is for a commit that wrote its archival batch but never wrote its live batch,
+    /// for example because the process crashed in between. Such a version is not visible to
+    /// readers, so a rollback needs neither the cache lock nor the live DB, and it must not
+    /// be followed by [`Self::store_committed_archival_version`] or
+    /// [`Self::apply_cache_updates`].
+    ///
+    /// The keys are taken from the pruning entries of `version`, so `version` must not have
+    /// been pruned.
+    pub fn update_archival_db_batch_for_rollback(
+        &self,
+        archival_db_batch: &mut rocksdb::WriteBatch,
+        version: u64,
+    ) -> anyhow::Result<()> {
+        let historical_cf_handle = self
+            .archival_db
+            .get_cf_handle(V::HISTORICAL_COLUMN_FAMILY_NAME)?;
+        let pruning_cf_handle = self
+            .archival_db
+            .get_cf_handle(V::PRUNING_COLUMN_FAMILY_NAME)?;
+
+        let mut key_with_version = KeyWithVersionPrefixAndSuffix::new(version);
+        for prunable_key in self.iter_pruning_keys_at_version(version)? {
+            let (_, key) = prunable_key.version_and_key();
+            key_with_version.set_key(key.as_ref());
+            archival_db_batch.delete_cf(historical_cf_handle, key_with_version.archival_key());
+            archival_db_batch.delete_cf(pruning_cf_handle, key_with_version.pruning_key());
+        }
+        Ok(())
+    }
+
     /// Mirrors the live writes of `batch` into the live-value cache.
     ///
     /// Call this once the live batch built from `batch` is written, while still holding the
     /// cache write lock that was taken before that write. The `&mut` is what ties this call
     /// to the write lock: it can only be obtained from [`CacheForVersionedDB::write`].
-    /// Do not call it for a rollback, which does not write the live DB.
     /// See the "Commit protocol" section of [`VersionedDB`].
     pub fn apply_cache_updates(cache: &mut CacheForSchema<V>, batch: &VersionedSchemaBatch<V>) {
         for (key, value) in batch.versioned_table_writes.iter() {
@@ -1606,7 +1626,6 @@ where
             version,
             live_db,
             archival_db,
-            true,
         )?;
 
         let serialized_size = live_db_batch.size_in_bytes() + archival_db_batch.size_in_bytes();
