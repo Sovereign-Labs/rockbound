@@ -114,14 +114,19 @@ impl ValueCodec<VersionMetadata> for u64 {
 }
 
 /// Cache for [`VersionedDB`].
+///
+/// The lock around the cache does double duty: besides protecting the cached values, it is
+/// what keeps the live DB from changing underneath cached readers and iterators. Committers
+/// must therefore hold the write lock across the live write, see the "Commit protocol"
+/// section of [`VersionedDB`].
 pub trait CacheForVersionedDB<V: SchemaWithVersion> {
-    /// Write lock.
+    /// Write lock. Held by the committer while it writes the live DB and updates the cache.
     fn write(&self) -> MappedRwLockWriteGuard<'_, CacheForSchema<V>>;
 
-    /// Read lock.
+    /// Read lock. While it is held, the live DB and the cache do not change.
     fn read(&self) -> MappedRwLockReadGuard<'_, CacheForSchema<V>>;
 
-    /// Attempt read lock.
+    /// Attempt read lock. Must fail, rather than block, while a writer holds the lock.
     fn try_read(&self) -> Option<MappedRwLockReadGuard<'_, CacheForSchema<V>>>;
 }
 
@@ -150,6 +155,41 @@ pub trait CacheForVersionedDB<V: SchemaWithVersion> {
 ///
 /// On each read, the implementation will:
 /// - Read from the live column family
+///
+/// # Commit protocol
+///
+/// Several `VersionedDB` instances may share one live DB, one archival DB and one cache lock,
+/// so there is no single `commit` method. Callers assemble a commit from
+/// [`Self::update_versioned_db_batch`], [`Self::store_committed_archival_version`] and
+/// [`Self::apply_cache_updates`]. Readers are only correct if the commit of version `N`
+/// follows this order:
+///
+/// 1. Build the batches with [`Self::update_versioned_db_batch`]. No lock is needed.
+/// 2. Write the archival batch. No lock is needed either: readers at versions below `N`
+///    never look at rows written at `N`.
+/// 3. Take the cache write lock ([`CacheForVersionedDB::write`]) and hold it through step 6.
+/// 4. Call [`Self::store_committed_archival_version`] with `N`. This may happen any time
+///    after step 2, but must happen before step 5.
+/// 5. Write the live batch.
+/// 6. Call [`Self::apply_cache_updates`], then release the lock.
+///
+/// The reasons:
+/// - Archival before live (2 before 5) keeps a crash recoverable, see the `live_db` field,
+///   and guarantees that a reader that finds the live DB ahead of its own version can fall
+///   back to the archival DB.
+/// - Version before live (4 before 5) is what lets [`VersionedDeltaReader`] detect that
+///   fall-back case: a reader that observes a live value written at `N` is guaranteed to
+///   also observe the committed version at `N` or later.
+/// - Live write and cache update under one write lock (3 through 6) means that readers
+///   holding the read lock see a live DB and a cache that agree and do not change, and that
+///   readers never see the cache ahead of or behind the live DB.
+/// - Cache update after the live write (5 before 6) keeps the cache equal to the live DB if
+///   the live write fails.
+///
+/// Commits must not run concurrently: only steps 3 through 6 are serialized by the lock.
+///
+/// A rollback (`is_commit == false`) only builds an archival batch. The live batch must not
+/// be written and the cache must not be updated.
 #[derive(Debug)]
 pub struct VersionedDB<S: SchemaWithVersion, C: CacheForVersionedDB<S>> {
     /// Holds the live state and the committed versions metadata.
@@ -164,8 +204,10 @@ pub struct VersionedDB<S: SchemaWithVersion, C: CacheForVersionedDB<S>> {
     /// Holds *only* the archival and pruning data, inluding pruned version metadata.
     archival_db: Arc<DB>,
     versioned_db_cache: C,
-    // The number of the *lowest* version that is guaranteed to be available in the live db. We increment this value when we *start* committing to the database,
-    // so the cache may not be valid for versions below this value.
+    // The newest version that is fully written to the archival db and whose live write may have started.
+    // It is stored after the archival write and before the live write of each commit, so a reader that
+    // observes a live value written at version N also observes this value at N or later, and then
+    // reads from the archival db instead. `u64::MAX` means that nothing has been committed yet.
     committed_archival_version: AtomicU64,
     _schema: S,
 }
@@ -414,7 +456,11 @@ where
     V::Value: Clone + AsRef<[u8]>,
     V: Ord,
 {
-    /// Stores version in `committed_archival_version`.
+    /// Records that `version` is fully written to the archival DB and that its live write is
+    /// about to start.
+    ///
+    /// Must be called after the archival batch of `version` is written and before its live
+    /// batch is written. See the "Commit protocol" section of [`VersionedDB`].
     pub fn store_committed_archival_version(&self, version: u64) {
         self.committed_archival_version
             .store(version, Ordering::Release);
@@ -790,6 +836,10 @@ where
     }
 
     /// Populates the `live_db_batch & archival_db_batch` using data from `batch` and returns the associated metrics.
+    ///
+    /// This only builds the batches. It does not need the cache lock and does not touch the
+    /// cache: callers that write the live batch must also call [`Self::apply_cache_updates`].
+    /// See the "Commit protocol" section of [`VersionedDB`].
     #[allow(clippy::too_many_arguments)]
     pub fn update_versioned_db_batch(
         live_db_batch: &mut rocksdb::WriteBatch,
@@ -882,19 +932,16 @@ where
         })
     }
 
-    /// Applies `batch` to the live-value cache.
-    /// Callers must hold the cache write lock from this call until the matching live batch is written (see `get_live_value`).
-    pub fn apply_cache_updates(
-        cache: &CacheForSchema<V>,
-        batch: &VersionedSchemaBatch<V>,
-        is_commit: bool,
-    ) {
+    /// Mirrors the live writes of `batch` into the live-value cache.
+    ///
+    /// Call this once the live batch built from `batch` is written, while still holding the
+    /// cache write lock that was taken before that write. The `&mut` is what ties this call
+    /// to the write lock: it can only be obtained from [`CacheForVersionedDB::write`].
+    /// Do not call it for a rollback, which does not write the live DB.
+    /// See the "Commit protocol" section of [`VersionedDB`].
+    pub fn apply_cache_updates(cache: &mut CacheForSchema<V>, batch: &VersionedSchemaBatch<V>) {
         for (key, value) in batch.versioned_table_writes.iter() {
-            match value {
-                Some(value) => cache.insert(key.clone(), Some(value.clone())),
-                None if is_commit => cache.insert(key.clone(), None),
-                None => {}
-            }
+            cache.insert(key.clone(), value.clone());
         }
     }
 
@@ -1502,6 +1549,22 @@ pub enum HistoricalValueError {
     Other(#[from] anyhow::Error),
 }
 
+/// The points of [`VersionedDB::commit_with_hook`] at which the hook is called.
+#[cfg(feature = "test-utils")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitStep {
+    /// The archival batch is written. The cache lock is not held yet, and the live DB and
+    /// the cache are still at the previous version. An error returned here aborts the
+    /// commit before it takes the lock.
+    ArchivalWritten,
+    /// The cache write lock is held and the committed version is stored. The live batch is
+    /// about to be written. An error returned here stands in for a failed live write.
+    BeforeLiveWrite,
+    /// The live batch is written. The cache write lock is still held and the cache is not
+    /// updated yet. An error returned here is reported once the commit is complete.
+    LiveWritten,
+}
+
 #[cfg(feature = "test-utils")]
 impl<V: SchemaWithVersion, C: CacheForVersionedDB<V>> VersionedDB<V, C>
 where
@@ -1509,19 +1572,25 @@ where
     V::Value: Clone + AsRef<[u8]>,
     V: Ord,
 {
-    /// This method is used nly for integration tests.
-    /// Commits a batch of versioned writes to the database.
-    pub fn commit(&self, batch: &VersionedSchemaBatch<V>, version: u64) -> anyhow::Result<()>
-    where
-        V::Value: AsRef<[u8]>,
-        V::Key: AsRef<[u8]>,
-    {
+    /// This method is used only for integration tests.
+    /// Commits a batch of versioned writes to the database, following the "Commit protocol"
+    /// section of [`VersionedDB`].
+    pub fn commit(&self, batch: &VersionedSchemaBatch<V>, version: u64) -> anyhow::Result<()> {
+        self.commit_with_hook(batch, version, |_| Ok(()))
+    }
+
+    /// This method is used only for integration tests.
+    /// Like [`Self::commit`], but calls `hook` at each [`CommitStep`], so that a test can
+    /// observe or fail a commit at that point.
+    pub fn commit_with_hook(
+        &self,
+        batch: &VersionedSchemaBatch<V>,
+        version: u64,
+        mut hook: impl FnMut(CommitStep) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         let _timer = crate::SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS
             .with_label_values(&[self.live_db.name()])
             .start_timer();
-        // Update the next version to commit if relevant.
-        // Block any readers while the DB isn't fully consistent
-        let cache = self.versioned_db_cache.write();
 
         let mut live_db_batch = rocksdb::WriteBatch::default();
         let mut archival_db_batch = rocksdb::WriteBatch::default();
@@ -1529,6 +1598,7 @@ where
         let live_db = &self.live_db;
         let archival_db = &self.archival_db;
 
+        // 1. Build the batches. This needs no lock.
         let metrics = Self::update_versioned_db_batch(
             &mut live_db_batch,
             &mut archival_db_batch,
@@ -1538,24 +1608,35 @@ where
             archival_db,
             true,
         )?;
-        Self::apply_cache_updates(&cache, batch, true);
 
         let serialized_size = live_db_batch.size_in_bytes() + archival_db_batch.size_in_bytes();
         let archival_serialized_size = archival_db_batch.size_in_bytes();
+
+        // 2. Write the archival batch. This needs no lock either.
         crate::with_error_logging(
             || archival_db.write_opt(archival_db_batch, &crate::default_write_options()),
             "write_versioned_schemas::write_archival_opt",
         )?;
+        hook(CommitStep::ArchivalWritten)?;
 
-        // Danger: This function is coupled with `get_historical_value`.
+        // 3. Block readers of the cache and iterators while the live DB changes.
+        let mut cache = self.versioned_db_cache.write();
+
+        // 4. Danger: this has to precede the live write, `get_latest_borrowed` relies on it.
         self.store_committed_archival_version(version);
+        hook(CommitStep::BeforeLiveWrite)?;
 
+        // 5. Write the live batch.
         crate::with_error_logging(
             || live_db.write_opt(live_db_batch, &crate::default_write_options()),
             "write_versioned_schemas::write_live_opt",
         )?;
+        let hook_result = hook(CommitStep::LiveWritten);
 
+        // 6. Update the cache only now, so that a failed live write leaves it equal to the live DB.
+        Self::apply_cache_updates(&mut cache, batch);
         drop(cache);
+        hook_result?;
 
         // Track metrics after the writes succeed.
         self.update_metrics(metrics, serialized_size, archival_serialized_size);

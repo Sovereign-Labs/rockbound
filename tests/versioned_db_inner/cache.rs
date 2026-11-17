@@ -199,19 +199,29 @@ fn test_cache_behavior_under_concurrency() {
     );
 }
 
+/// A commit must replace whatever the cache already holds for the keys it writes, including
+/// cached "this key is absent" entries. Anything left behind would be served as a stale read.
 #[test]
-fn test_apply_cache_updates_respects_is_commit() {
-    let cache = rockbound::new_cache_for_schema::<LiveKeys>(10_000);
-    let put_key = TestKey::from(b"put".to_vec());
-    let deleted_key = TestKey::from(b"deleted".to_vec());
+fn test_apply_cache_updates_overwrites_cached_entries() {
+    let mut cache = rockbound::new_cache_for_schema::<LiveKeys>(1_000_000);
+    let updated = TestKey::from(b"updated".to_vec());
+    let deleted = TestKey::from(b"deleted".to_vec());
+    let created = TestKey::from(b"created".to_vec());
+    let untouched = TestKey::from(b"untouched".to_vec());
+    cache.insert(updated.clone(), Some(TestField::new(1)));
+    cache.insert(deleted.clone(), Some(TestField::new(1)));
+    cache.insert(created.clone(), None);
+    cache.insert(untouched.clone(), Some(TestField::new(1)));
+
     let mut batch = VersionedSchemaBatch::<LiveKeys>::default();
-    batch.put_versioned(put_key.clone(), TestField::new(1));
-    batch.delete_versioned(deleted_key.clone());
+    batch.put_versioned(updated.clone(), TestField::new(2));
+    batch.delete_versioned(deleted.clone());
+    batch.put_versioned(created.clone(), TestField::new(2));
 
-    VersionedDB::<LiveKeys, VersionedDbCache<LiveKeys>>::apply_cache_updates(&cache, &batch, false);
-    assert_eq!(cache.get(&put_key), Some(Some(TestField::new(1))));
-    assert_eq!(cache.get(&deleted_key), None);
+    VersionedDB::<LiveKeys, VersionedDbCache<LiveKeys>>::apply_cache_updates(&mut cache, &batch);
 
-    VersionedDB::<LiveKeys, VersionedDbCache<LiveKeys>>::apply_cache_updates(&cache, &batch, true);
-    assert_eq!(cache.get(&deleted_key), Some(None));
+    assert_eq!(cache.get(&updated), Some(Some(TestField::new(2))));
+    assert_eq!(cache.get(&deleted), Some(None));
+    assert_eq!(cache.get(&created), Some(Some(TestField::new(2))));
+    assert_eq!(cache.get(&untouched), Some(Some(TestField::new(1))));
 }

@@ -386,8 +386,11 @@ fn test_iteration_with_cursor() {
         .is_err());
 }
 
+/// An open iterator holds the cache read lock, so a commit must not be able to change the
+/// live DB underneath it. The commit may write the archival DB, which the iterator never
+/// reads, but it has to wait for the iterator before it writes the live DB.
 #[test]
-fn test_open_iterator_blocks_writes() {
+fn test_open_iterator_blocks_live_write() {
     let test_db = TestDB::new();
     let db = Arc::new(test_db.db);
     let versioned_db_cache = VersionedDbCache::new(0);
@@ -395,7 +398,7 @@ fn test_open_iterator_blocks_writes() {
         VersionedDB::<LiveKeys, VersionedDbCache<LiveKeys>>::from_dbs(
             db.clone(),
             db.clone(),
-            versioned_db_cache,
+            versioned_db_cache.clone(),
         )
         .unwrap(),
     );
@@ -410,23 +413,48 @@ fn test_open_iterator_blocks_writes() {
         .iter_with_prefix(TestKey::from(b"key".to_vec()))
         .unwrap();
 
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        tx.send("starting").unwrap();
-        commit_batch(
-            &versioned_db,
-            &VersionedSchemaBatch::<LiveKeys>::default(),
-            0,
+    let key = TestKey::from(b"key1".to_vec());
+    let mut batch = VersionedSchemaBatch::<LiveKeys>::default();
+    batch.put_versioned(key.clone(), TestField::new(7));
+
+    std::thread::scope(|s| {
+        let writer = s.spawn(|| commit_batch(&versioned_db, &batch, 0));
+
+        // Wait until the writer is queued for the write lock, instead of sleeping and hoping.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !versioned_db_cache.writer_holds_or_waits() {
+            assert!(
+                !writer.is_finished(),
+                "The commit completed while an iterator was open"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "The writer never reached the write lock"
+            );
+            std::thread::yield_now();
+        }
+
+        // The writer is now stuck behind the iterator: the archival DB has the new version,
+        // the live DB does not.
+        assert_eq!(
+            versioned_db.get_historical_value(&key, 0).unwrap(),
+            Some(TestField::new(7))
         );
-        tx.send("finished").unwrap();
+        assert_eq!(versioned_db.get_committed_version_live_db().unwrap(), None);
+        assert!(iter.next().is_none());
+        assert!(!writer.is_finished());
+
+        // Dropping the iterator releases the read lock and lets the commit complete.
+        drop(iter);
+        writer.join().unwrap();
     });
 
-    // Block until the background thread has sent its message, then sleep to ensure it has time to run if it's not blocked
-    assert!(rx.recv().unwrap() == "starting");
-    std::thread::sleep(std::time::Duration::from_secs(5));
-    // Assert that it didn't finish. Then drop the iterator to release the read lock and ensure that it completes.
-    assert!(rx.try_recv().is_err());
-    assert!(iter.next().is_none());
-    drop(iter);
-    assert!(rx.recv().unwrap() == "finished");
+    assert_eq!(
+        versioned_db.get_committed_version_live_db().unwrap(),
+        Some(0)
+    );
+    assert_eq!(
+        versioned_db.get_live_value(&key).unwrap(),
+        Some(TestField::new(7))
+    );
 }
