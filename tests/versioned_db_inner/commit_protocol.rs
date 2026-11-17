@@ -281,7 +281,7 @@ fn read_without_the_read_lock_does_not_populate_the_cache() {
 
 const NUM_KEYS: usize = 400;
 // Every commit does two synchronous writes, which is what bounds the runtime of this test.
-const LAST_VERSION: u64 = 150;
+const LAST_VERSION: u64 = 400;
 const KEY_PREFIX: &[u8] = b"k";
 
 fn model_key(i: usize) -> TestKey {
