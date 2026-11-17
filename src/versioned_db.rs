@@ -11,7 +11,6 @@ use std::{
 
 use anyhow::bail;
 use parking_lot::{MappedRwLockReadGuard, MappedRwLockWriteGuard};
-use quick_cache::sync::Cache;
 use rocksdb::ColumnFamilyDescriptor;
 
 use crate::{
@@ -20,7 +19,7 @@ use crate::{
     metrics::{SCHEMADB_BATCH_COMMIT_BYTES, SCHEMADB_DELETES, SCHEMADB_PUT_BYTES},
     schema::{ColumnFamilyName, KeyDecoder, KeyEncoder, ValueCodec},
     schema_batch::RangeDeleteKey,
-    BasicWeighter, CacheForSchema, CfDescriptorBuilder, CodecError, Schema, SchemaBatch, DB,
+    CacheForSchema, CfDescriptorBuilder, CodecError, Schema, SchemaBatch, DB,
 };
 
 #[derive(Debug, Default)]
@@ -116,7 +115,7 @@ impl ValueCodec<VersionMetadata> for u64 {
 /// Cache for [`VersionedDB`].
 ///
 /// The lock around the cache does double duty: besides protecting the cached values, it is
-/// what keeps the live DB from changing underneath cached readers and iterators. Committers
+/// what keeps the live DB from changing underneath readers that use the cache. Committers
 /// must therefore hold the write lock across the live write, see the "Commit protocol"
 /// section of [`VersionedDB`].
 pub trait CacheForVersionedDB<V: SchemaWithVersion> {
@@ -124,6 +123,10 @@ pub trait CacheForVersionedDB<V: SchemaWithVersion> {
     fn write(&self) -> MappedRwLockWriteGuard<'_, CacheForSchema<V>>;
 
     /// Read lock. While it is held, the live DB and the cache do not change.
+    ///
+    /// This blocks while a committer holds or waits for the write lock, also for a thread
+    /// that already holds a read lock. Do not keep the guard while calling back into
+    /// [`VersionedDB`] or [`VersionedDeltaReader`].
     fn read(&self) -> MappedRwLockReadGuard<'_, CacheForSchema<V>>;
 
     /// Attempt read lock. Must fail, rather than block, while a writer holds the lock.
@@ -1174,15 +1177,19 @@ type MaybePeekableBtreeMapRange<'a, K, V> = Option<Peekable<btree_map::Range<'a,
 /// An iterator over the live key/value pairs in a VersionedDB, including the current snapshots.
 ///
 /// Internally, this struct has to peek at each snapshot and the db to find the next smallest key and returns that result.
+///
+/// The iterator yields the state as of its creation. It does not hold the cache lock, so it
+/// does not block commits, and commits that complete while it is alive do not change what
+/// it yields.
 pub struct VersionedDbIterator<'a, V: SchemaWithVersion> {
-    // We hold a read lock over the db cache to prevent any writes to the table during iteration. If a key was written while we were iterating, we could get inconsistent results:
+    // Borrow the snapshots to keep the lifetimes tied together. We could clone, but this makes it easier to reason about.
+    snapshots: Vec<MaybePeekableBtreeMapRange<'a, V::Key, Option<V::Value>>>,
+    // A RocksDB iterator reads from an implicit snapshot of the DB that is taken when the iterator is created,
+    // so writes that happen during the iteration are not visible to it. Without that, we could see inconsistent results:
     //  - Iterator reads:  Key1 -> A,
     //  - Concurrent thread writes:: Key1 -> B, Key2 -> B
     //  - Iterator reads: Key2 -> B,
-    // Now the caller sees a state of the world which never existed where Key1 -> A and Key2 -> B.
-    _read_lock: MappedRwLockReadGuard<'a, Cache<V::Key, Option<V::Value>, BasicWeighter>>,
-    // Borrow the snapshots to keep the lifetimes tied together. We could clone, but this makes it easier to reason about.
-    snapshots: Vec<MaybePeekableBtreeMapRange<'a, V::Key, Option<V::Value>>>,
+    // Now the caller would see a state of the world which never existed where Key1 -> A and Key2 -> B.
     db_iterator: Option<Peekable<RawDbIter<'a>>>,
     prefix: V::Key,
     encoded_prefix: Vec<u8>,
@@ -1333,7 +1340,7 @@ where
 {
     /// Construct an iterator over the versioned DB with a given prefix.
     ///
-    /// Note that the returned iterator holds a read lock over the DB, so no writes can complete while it is active.
+    /// The returned iterator yields the state as of this call, and does not block commits.
     pub fn iter_with_prefix(&self, prefix: V::Key) -> anyhow::Result<VersionedDbIterator<'_, V>> {
         self.iter_with_prefix_and_cursor(prefix, None)
     }
@@ -1341,12 +1348,16 @@ where
     /// Construct an iterator over the versioned DB with a given prefix, skipping until the given key is reached. Note that
     /// any values exactly equal to the cursor *will* be included in the iterator.
     ///
-    /// Note that the returned iterator holds a read lock over the DB, so no writes can complete while it is active.
+    /// The returned iterator yields the state as of this call, and does not block commits.
     pub fn iter_with_prefix_and_cursor(
         &self,
         prefix: V::Key,
         skip_until: Option<V::Key>,
     ) -> anyhow::Result<VersionedDbIterator<'_, V>> {
+        // The live DB only changes under the write lock. Holding the read lock until the DB iterator exists
+        // guarantees that the iterator reads the same version of the live DB as `version_on_disk`.
+        // The lock must not be held any longer than that: a thread that keeps a read lock and then waits
+        // for another one deadlocks with a committer that is queued in between.
         let read_lock = self.db.versioned_db_cache.read();
         let version_on_disk = self.db.get_committed_version_live_db()?;
         let encoded_prefix = prefix.encode_key()?;
@@ -1402,8 +1413,8 @@ where
                 .iter_range_allow_cached::<V>(&read_lock, encoded_range, ScanDirection::Forward)?
                 .peekable(),
         );
+        drop(read_lock);
         Ok(VersionedDbIterator {
-            _read_lock: read_lock,
             snapshots,
             db_iterator,
             prefix,
@@ -1638,7 +1649,7 @@ where
         )?;
         hook(CommitStep::ArchivalWritten)?;
 
-        // 3. Block readers of the cache and iterators while the live DB changes.
+        // 3. Block readers of the cache and the creation of iterators while the live DB changes.
         let mut cache = self.versioned_db_cache.write();
 
         // 4. Danger: this has to precede the live write, `get_latest_borrowed` relies on it.
@@ -1665,8 +1676,11 @@ where
 
     /// Sets the cache size for the DB.
     pub fn set_cache_size(&self, estimated_size: usize, weight_capacity: u64) {
-        *self.versioned_db_cache.write() =
-            Cache::with_weighter(estimated_size, weight_capacity, BasicWeighter);
+        *self.versioned_db_cache.write() = CacheForSchema::<V>::with_weighter(
+            estimated_size,
+            weight_capacity,
+            crate::BasicWeighter,
+        );
     }
 
     /// Returns the number of cache hits.
