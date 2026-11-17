@@ -11,7 +11,6 @@ use std::{
 
 use anyhow::bail;
 use parking_lot::{MappedRwLockReadGuard, MappedRwLockWriteGuard};
-use quick_cache::sync::Cache;
 use rocksdb::ColumnFamilyDescriptor;
 
 use crate::{
@@ -20,7 +19,7 @@ use crate::{
     metrics::{SCHEMADB_BATCH_COMMIT_BYTES, SCHEMADB_DELETES, SCHEMADB_PUT_BYTES},
     schema::{ColumnFamilyName, KeyDecoder, KeyEncoder, ValueCodec},
     schema_batch::RangeDeleteKey,
-    BasicWeighter, CacheForSchema, CfDescriptorBuilder, CodecError, Schema, SchemaBatch, DB,
+    CacheForSchema, CfDescriptorBuilder, CodecError, Schema, SchemaBatch, DB,
 };
 
 #[derive(Debug, Default)]
@@ -114,14 +113,23 @@ impl ValueCodec<VersionMetadata> for u64 {
 }
 
 /// Cache for [`VersionedDB`].
+///
+/// The lock around the cache does double duty: besides protecting the cached values, it is
+/// what keeps the live DB from changing underneath readers that use the cache. Committers
+/// must therefore hold the write lock across the live write, see the "Commit protocol"
+/// section of [`VersionedDB`].
 pub trait CacheForVersionedDB<V: SchemaWithVersion> {
-    /// Write lock.
+    /// Write lock. Held by the committer while it writes the live DB and updates the cache.
     fn write(&self) -> MappedRwLockWriteGuard<'_, CacheForSchema<V>>;
 
-    /// Read lock.
+    /// Read lock. While it is held, the live DB and the cache do not change.
+    ///
+    /// This blocks while a committer holds or waits for the write lock, also for a thread
+    /// that already holds a read lock. Do not keep the guard while calling back into
+    /// [`VersionedDB`] or [`VersionedDeltaReader`].
     fn read(&self) -> MappedRwLockReadGuard<'_, CacheForSchema<V>>;
 
-    /// Attempt read lock.
+    /// Attempt read lock. Must fail, rather than block, while a writer holds the lock.
     fn try_read(&self) -> Option<MappedRwLockReadGuard<'_, CacheForSchema<V>>>;
 }
 
@@ -150,6 +158,41 @@ pub trait CacheForVersionedDB<V: SchemaWithVersion> {
 ///
 /// On each read, the implementation will:
 /// - Read from the live column family
+///
+/// # Commit protocol
+///
+/// Several `VersionedDB` instances may share one live DB, one archival DB and one cache lock,
+/// so there is no single `commit` method. Callers assemble a commit from
+/// [`Self::update_versioned_db_batch`], [`Self::store_committed_archival_version`] and
+/// [`Self::apply_cache_updates`]. Readers are only correct if the commit of version `N`
+/// follows this order:
+///
+/// 1. Build the batches with [`Self::update_versioned_db_batch`]. No lock is needed.
+/// 2. Write the archival batch. No lock is needed either: readers at versions below `N`
+///    never look at rows written at `N`.
+/// 3. Take the cache write lock ([`CacheForVersionedDB::write`]) and hold it through step 6.
+/// 4. Call [`Self::store_committed_archival_version`] with `N`. This may happen any time
+///    after step 2, but must happen before step 5.
+/// 5. Write the live batch.
+/// 6. Call [`Self::apply_cache_updates`], then release the lock.
+///
+/// The reasons:
+/// - Archival before live (2 before 5) keeps a crash recoverable, see the `live_db` field,
+///   and guarantees that a reader that finds the live DB ahead of its own version can fall
+///   back to the archival DB.
+/// - Version before live (4 before 5) is what lets [`VersionedDeltaReader`] detect that
+///   fall-back case: a reader that observes a live value written at `N` is guaranteed to
+///   also observe the committed version at `N` or later.
+/// - Live write and cache update under one write lock (3 through 6) means that readers
+///   holding the read lock see a live DB and a cache that agree and do not change, and that
+///   readers never see the cache ahead of or behind the live DB.
+/// - Cache update after the live write (5 before 6) keeps the cache equal to the live DB if
+///   the live write fails.
+///
+/// Commits must not run concurrently: only steps 3 through 6 are serialized by the lock.
+///
+/// A commit that wrote its archival batch but not its live batch is undone with
+/// [`Self::update_archival_db_batch_for_rollback`], which only touches the archival DB.
 #[derive(Debug)]
 pub struct VersionedDB<S: SchemaWithVersion, C: CacheForVersionedDB<S>> {
     /// Holds the live state and the committed versions metadata.
@@ -164,8 +207,10 @@ pub struct VersionedDB<S: SchemaWithVersion, C: CacheForVersionedDB<S>> {
     /// Holds *only* the archival and pruning data, inluding pruned version metadata.
     archival_db: Arc<DB>,
     versioned_db_cache: C,
-    // The number of the *lowest* version that is guaranteed to be available in the live db. We increment this value when we *start* committing to the database,
-    // so the cache may not be valid for versions below this value.
+    // The newest version that is fully written to the archival db and whose live write may have started.
+    // It is stored after the archival write and before the live write of each commit, so a reader that
+    // observes a live value written at version N also observes this value at N or later, and then
+    // reads from the archival db instead. `u64::MAX` means that nothing has been committed yet.
     committed_archival_version: AtomicU64,
     _schema: S,
 }
@@ -414,7 +459,11 @@ where
     V::Value: Clone + AsRef<[u8]>,
     V: Ord,
 {
-    /// Stores version in `committed_archival_version`.
+    /// Records that `version` is fully written to the archival DB and that its live write is
+    /// about to start.
+    ///
+    /// Must be called after the archival batch of `version` is written and before its live
+    /// batch is written. See the "Commit protocol" section of [`VersionedDB`].
     pub fn store_committed_archival_version(&self, version: u64) {
         self.committed_archival_version
             .store(version, Ordering::Release);
@@ -790,16 +839,20 @@ where
     }
 
     /// Populates the `live_db_batch & archival_db_batch` using data from `batch` and returns the associated metrics.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// This only builds the batches. It does not need the cache lock and does not touch the
+    /// cache: callers must also call [`Self::apply_cache_updates`] once the live batch is
+    /// written. See the "Commit protocol" section of [`VersionedDB`].
+    ///
+    /// To undo the archival half of a commit whose live batch was never written, use
+    /// [`Self::update_archival_db_batch_for_rollback`].
     pub fn update_versioned_db_batch(
         live_db_batch: &mut rocksdb::WriteBatch,
         archival_db_batch: &mut rocksdb::WriteBatch,
         batch: &VersionedSchemaBatch<V>,
         version: u64,
-        cache: &CacheForSchema<V>,
         live_db: &DB,
         archival_db: &DB,
-        is_commit: bool,
     ) -> anyhow::Result<VersionedDbMetrics> {
         // Optimization:
         // At various times we need the key *prefixed* with the version (for pruning), on its own (for live reads), and suffixed with the version (for archival reads).
@@ -838,36 +891,21 @@ where
                         key_with_version.archival_key(),
                         value,
                     );
-                    cache.insert(key.clone(), Some(value.clone()));
                 }
                 None => {
                     // println!("Deleting live key: {:?}", key_with_version.live_key());
                     deletes += 1;
                     archival_puts_bytes += key_with_version.archival_key().len();
-
-                    if is_commit {
-                        live_db_batch.delete_cf(live_cf_handle, key);
-                        cache.insert(key.clone(), None);
-                        archival_db_batch.put_cf(
-                            archival_cf_handle,
-                            key_with_version.archival_key(),
-                            [],
-                        );
-                    } else {
-                        // We don’t roll back live_db, and we remove data from HISTORICAL_COLUMN_FAMILY_NAME.
-                        archival_db_batch
-                            .delete_cf(archival_cf_handle, key_with_version.archival_key());
-                    }
+                    live_db_batch.delete_cf(live_cf_handle, key);
+                    archival_db_batch.put_cf(
+                        archival_cf_handle,
+                        key_with_version.archival_key(),
+                        [],
+                    );
                 }
             }
 
-            if is_commit {
-                archival_db_batch.put_cf(pruning_cf_handle, key_with_version.pruning_key(), []);
-            } else {
-                // On rollback we remove data from PRUNING_COLUMN_FAMILY_NAME)
-                archival_db_batch.delete_cf(pruning_cf_handle, key_with_version.pruning_key());
-            }
-
+            archival_db_batch.put_cf(pruning_cf_handle, key_with_version.pruning_key(), []);
             pruning_puts_bytes += key_with_version.pruning_key().len();
         }
 
@@ -883,6 +921,51 @@ where
             archival_puts_bytes,
             pruning_puts_bytes,
         })
+    }
+
+    /// Adds to `archival_db_batch` the deletes that remove everything the commit of `version`
+    /// wrote to the archival DB: its historical rows and its pruning entries.
+    ///
+    /// This is for a commit that wrote its archival batch but never wrote its live batch,
+    /// for example because the process crashed in between. Such a version is not visible to
+    /// readers, so a rollback needs neither the cache lock nor the live DB, and it must not
+    /// be followed by [`Self::store_committed_archival_version`] or
+    /// [`Self::apply_cache_updates`].
+    ///
+    /// The keys are taken from the pruning entries of `version`, so `version` must not have
+    /// been pruned.
+    pub fn update_archival_db_batch_for_rollback(
+        &self,
+        archival_db_batch: &mut rocksdb::WriteBatch,
+        version: u64,
+    ) -> anyhow::Result<()> {
+        let historical_cf_handle = self
+            .archival_db
+            .get_cf_handle(V::HISTORICAL_COLUMN_FAMILY_NAME)?;
+        let pruning_cf_handle = self
+            .archival_db
+            .get_cf_handle(V::PRUNING_COLUMN_FAMILY_NAME)?;
+
+        let mut key_with_version = KeyWithVersionPrefixAndSuffix::new(version);
+        for prunable_key in self.iter_pruning_keys_at_version(version)? {
+            let (_, key) = prunable_key.version_and_key();
+            key_with_version.set_key(key.as_ref());
+            archival_db_batch.delete_cf(historical_cf_handle, key_with_version.archival_key());
+            archival_db_batch.delete_cf(pruning_cf_handle, key_with_version.pruning_key());
+        }
+        Ok(())
+    }
+
+    /// Mirrors the live writes of `batch` into the live-value cache.
+    ///
+    /// Call this once the live batch built from `batch` is written, while still holding the
+    /// cache write lock that was taken before that write. The `&mut` is what ties this call
+    /// to the write lock: it can only be obtained from [`CacheForVersionedDB::write`].
+    /// See the "Commit protocol" section of [`VersionedDB`].
+    pub fn apply_cache_updates(cache: &mut CacheForSchema<V>, batch: &VersionedSchemaBatch<V>) {
+        for (key, value) in batch.versioned_table_writes.iter() {
+            cache.insert(key.clone(), value.clone());
+        }
     }
 
     /// Updates `VersionedDbMetrics`
@@ -1094,15 +1177,19 @@ type MaybePeekableBtreeMapRange<'a, K, V> = Option<Peekable<btree_map::Range<'a,
 /// An iterator over the live key/value pairs in a VersionedDB, including the current snapshots.
 ///
 /// Internally, this struct has to peek at each snapshot and the db to find the next smallest key and returns that result.
+///
+/// The iterator yields the state as of its creation. It does not hold the cache lock, so it
+/// does not block commits, and commits that complete while it is alive do not change what
+/// it yields.
 pub struct VersionedDbIterator<'a, V: SchemaWithVersion> {
-    // We hold a read lock over the db cache to prevent any writes to the table during iteration. If a key was written while we were iterating, we could get inconsistent results:
+    // Borrow the snapshots to keep the lifetimes tied together. We could clone, but this makes it easier to reason about.
+    snapshots: Vec<MaybePeekableBtreeMapRange<'a, V::Key, Option<V::Value>>>,
+    // A RocksDB iterator reads from an implicit snapshot of the DB that is taken when the iterator is created,
+    // so writes that happen during the iteration are not visible to it. Without that, we could see inconsistent results:
     //  - Iterator reads:  Key1 -> A,
     //  - Concurrent thread writes:: Key1 -> B, Key2 -> B
     //  - Iterator reads: Key2 -> B,
-    // Now the caller sees a state of the world which never existed where Key1 -> A and Key2 -> B.
-    _read_lock: MappedRwLockReadGuard<'a, Cache<V::Key, Option<V::Value>, BasicWeighter>>,
-    // Borrow the snapshots to keep the lifetimes tied together. We could clone, but this makes it easier to reason about.
-    snapshots: Vec<MaybePeekableBtreeMapRange<'a, V::Key, Option<V::Value>>>,
+    // Now the caller would see a state of the world which never existed where Key1 -> A and Key2 -> B.
     db_iterator: Option<Peekable<RawDbIter<'a>>>,
     prefix: V::Key,
     encoded_prefix: Vec<u8>,
@@ -1253,7 +1340,7 @@ where
 {
     /// Construct an iterator over the versioned DB with a given prefix.
     ///
-    /// Note that the returned iterator holds a read lock over the DB, so no writes can complete while it is active.
+    /// The returned iterator yields the state as of this call, and does not block commits.
     pub fn iter_with_prefix(&self, prefix: V::Key) -> anyhow::Result<VersionedDbIterator<'_, V>> {
         self.iter_with_prefix_and_cursor(prefix, None)
     }
@@ -1261,12 +1348,16 @@ where
     /// Construct an iterator over the versioned DB with a given prefix, skipping until the given key is reached. Note that
     /// any values exactly equal to the cursor *will* be included in the iterator.
     ///
-    /// Note that the returned iterator holds a read lock over the DB, so no writes can complete while it is active.
+    /// The returned iterator yields the state as of this call, and does not block commits.
     pub fn iter_with_prefix_and_cursor(
         &self,
         prefix: V::Key,
         skip_until: Option<V::Key>,
     ) -> anyhow::Result<VersionedDbIterator<'_, V>> {
+        // The live DB only changes under the write lock. Holding the read lock until the DB iterator exists
+        // guarantees that the iterator reads the same version of the live DB as `version_on_disk`.
+        // The lock must not be held any longer than that: a thread that keeps a read lock and then waits
+        // for another one deadlocks with a committer that is queued in between.
         let read_lock = self.db.versioned_db_cache.read();
         let version_on_disk = self.db.get_committed_version_live_db()?;
         let encoded_prefix = prefix.encode_key()?;
@@ -1322,8 +1413,8 @@ where
                 .iter_range_allow_cached::<V>(&read_lock, encoded_range, ScanDirection::Forward)?
                 .peekable(),
         );
+        drop(read_lock);
         Ok(VersionedDbIterator {
-            _read_lock: read_lock,
             snapshots,
             db_iterator,
             prefix,
@@ -1489,6 +1580,22 @@ pub enum HistoricalValueError {
     Other(#[from] anyhow::Error),
 }
 
+/// The points of [`VersionedDB::commit_with_hook`] at which the hook is called.
+#[cfg(feature = "test-utils")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitStep {
+    /// The archival batch is written. The cache lock is not held yet, and the live DB and
+    /// the cache are still at the previous version. An error returned here aborts the
+    /// commit before it takes the lock.
+    ArchivalWritten,
+    /// The cache write lock is held and the committed version is stored. The live batch is
+    /// about to be written. An error returned here stands in for a failed live write.
+    BeforeLiveWrite,
+    /// The live batch is written. The cache write lock is still held and the cache is not
+    /// updated yet. An error returned here is reported once the commit is complete.
+    LiveWritten,
+}
+
 #[cfg(feature = "test-utils")]
 impl<V: SchemaWithVersion, C: CacheForVersionedDB<V>> VersionedDB<V, C>
 where
@@ -1496,19 +1603,25 @@ where
     V::Value: Clone + AsRef<[u8]>,
     V: Ord,
 {
-    /// This method is used nly for integration tests.
-    /// Commits a batch of versioned writes to the database.
-    pub fn commit(&self, batch: &VersionedSchemaBatch<V>, version: u64) -> anyhow::Result<()>
-    where
-        V::Value: AsRef<[u8]>,
-        V::Key: AsRef<[u8]>,
-    {
+    /// This method is used only for integration tests.
+    /// Commits a batch of versioned writes to the database, following the "Commit protocol"
+    /// section of [`VersionedDB`].
+    pub fn commit(&self, batch: &VersionedSchemaBatch<V>, version: u64) -> anyhow::Result<()> {
+        self.commit_with_hook(batch, version, |_| Ok(()))
+    }
+
+    /// This method is used only for integration tests.
+    /// Like [`Self::commit`], but calls `hook` at each [`CommitStep`], so that a test can
+    /// observe or fail a commit at that point.
+    pub fn commit_with_hook(
+        &self,
+        batch: &VersionedSchemaBatch<V>,
+        version: u64,
+        mut hook: impl FnMut(CommitStep) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         let _timer = crate::SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS
             .with_label_values(&[self.live_db.name()])
             .start_timer();
-        // Update the next version to commit if relevant.
-        // Block any readers while the DB isn't fully consistent
-        let cache = self.versioned_db_cache.write();
 
         let mut live_db_batch = rocksdb::WriteBatch::default();
         let mut archival_db_batch = rocksdb::WriteBatch::default();
@@ -1516,33 +1629,44 @@ where
         let live_db = &self.live_db;
         let archival_db = &self.archival_db;
 
+        // 1. Build the batches. This needs no lock.
         let metrics = Self::update_versioned_db_batch(
             &mut live_db_batch,
             &mut archival_db_batch,
             batch,
             version,
-            &cache,
             live_db,
             archival_db,
-            true,
         )?;
 
         let serialized_size = live_db_batch.size_in_bytes() + archival_db_batch.size_in_bytes();
         let archival_serialized_size = archival_db_batch.size_in_bytes();
+
+        // 2. Write the archival batch. This needs no lock either.
         crate::with_error_logging(
             || archival_db.write_opt(archival_db_batch, &crate::default_write_options()),
             "write_versioned_schemas::write_archival_opt",
         )?;
+        hook(CommitStep::ArchivalWritten)?;
 
-        // Danger: This function is coupled with `get_historical_value`.
+        // 3. Block readers of the cache and the creation of iterators while the live DB changes.
+        let mut cache = self.versioned_db_cache.write();
+
+        // 4. Danger: this has to precede the live write, `get_latest_borrowed` relies on it.
         self.store_committed_archival_version(version);
+        hook(CommitStep::BeforeLiveWrite)?;
 
+        // 5. Write the live batch.
         crate::with_error_logging(
             || live_db.write_opt(live_db_batch, &crate::default_write_options()),
             "write_versioned_schemas::write_live_opt",
         )?;
+        let hook_result = hook(CommitStep::LiveWritten);
 
+        // 6. Update the cache only now, so that a failed live write leaves it equal to the live DB.
+        Self::apply_cache_updates(&mut cache, batch);
         drop(cache);
+        hook_result?;
 
         // Track metrics after the writes succeed.
         self.update_metrics(metrics, serialized_size, archival_serialized_size);
@@ -1552,8 +1676,11 @@ where
 
     /// Sets the cache size for the DB.
     pub fn set_cache_size(&self, estimated_size: usize, weight_capacity: u64) {
-        *self.versioned_db_cache.write() =
-            Cache::with_weighter(estimated_size, weight_capacity, BasicWeighter);
+        *self.versioned_db_cache.write() = CacheForSchema::<V>::with_weighter(
+            estimated_size,
+            weight_capacity,
+            crate::BasicWeighter,
+        );
     }
 
     /// Returns the number of cache hits.

@@ -386,47 +386,89 @@ fn test_iteration_with_cursor() {
         .is_err());
 }
 
+/// Runs `body` on its own thread and fails the test if it does not finish, so that a
+/// deadlock shows up as a test failure instead of a hanging test run.
+fn fail_on_deadlock(body: impl FnOnce() + Send + 'static) {
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        body();
+        let _ = done_tx.send(());
+    });
+    match done_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+        Ok(()) => handle.join().unwrap(),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("The test body did not finish: it is most likely deadlocked")
+        }
+        // The body panicked: report its panic.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            std::panic::resume_unwind(handle.join().unwrap_err())
+        }
+    }
+}
+
+/// An iterator reads from a snapshot of the live DB that is taken when it is created. It
+/// does not hold the cache lock afterwards, so the thread that holds it can commit and can
+/// open further iterators, and it keeps yielding the state it was created at.
 #[test]
-fn test_open_iterator_blocks_writes() {
-    let test_db = TestDB::new();
-    let db = Arc::new(test_db.db);
-    let versioned_db_cache = VersionedDbCache::new(0);
-    let versioned_db = Arc::new(
-        VersionedDB::<LiveKeys, VersionedDbCache<LiveKeys>>::from_dbs(
-            db.clone(),
-            db.clone(),
-            versioned_db_cache,
-        )
-        .unwrap(),
-    );
+fn test_open_iterator_keeps_its_snapshot_and_does_not_block_commits() {
+    fail_on_deadlock(|| {
+        let test_db = TestDB::new();
+        let db = Arc::new(test_db.db);
+        let versioned_db = Arc::new(
+            VersionedDB::<LiveKeys, VersionedDbCache<LiveKeys>>::from_dbs(
+                db.clone(),
+                db.clone(),
+                VersionedDbCache::new(10_000),
+            )
+            .unwrap(),
+        );
+        let key = |name: &[u8]| TestKey::from(name.to_vec());
+        let prefix = key(b"key");
 
-    let delta_reader = VersionedDeltaReader::<LiveKeys, VersionedDbCache<LiveKeys>>::new(
-        versioned_db.clone(),
-        None,
-        vec![],
-    );
-
-    let mut iter = delta_reader
-        .iter_with_prefix(TestKey::from(b"key".to_vec()))
-        .unwrap();
-
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        tx.send("starting").unwrap();
-        commit_batch(
+        put_keys(
             &versioned_db,
-            &VersionedSchemaBatch::<LiveKeys>::default(),
+            &[(b"key1", 0), (b"key2", 0), (b"key3", 0)],
             0,
         );
-        tx.send("finished").unwrap();
-    });
+        let reader_at_v0 = VersionedDeltaReader::<LiveKeys, VersionedDbCache<LiveKeys>>::new(
+            versioned_db.clone(),
+            Some(0),
+            vec![],
+        );
+        let mut iter_at_v0 = reader_at_v0.iter_with_prefix(prefix.clone()).unwrap();
+        assert_eq!(
+            iter_at_v0.next(),
+            Some((key(b"key1"), Some(TestField::new(0))))
+        );
 
-    // Block until the background thread has sent its message, then sleep to ensure it has time to run if it's not blocked
-    assert!(rx.recv().unwrap() == "starting");
-    std::thread::sleep(std::time::Duration::from_secs(5));
-    // Assert that it didn't finish. Then drop the iterator to release the read lock and ensure that it completes.
-    assert!(rx.try_recv().is_err());
-    assert!(iter.next().is_none());
-    drop(iter);
-    assert!(rx.recv().unwrap() == "finished");
+        // Commit version 1 while the iterator is open. It changes, deletes and adds keys
+        // that the iterator has not reached yet.
+        let mut batch = VersionedSchemaBatch::<LiveKeys>::default();
+        batch.put_versioned(key(b"key2"), TestField::new(1));
+        batch.delete_versioned(key(b"key3"));
+        batch.put_versioned(key(b"key4"), TestField::new(1));
+        commit_batch(&versioned_db, &batch, 1);
+
+        // A second iterator can be opened while the first one is still alive, also from a
+        // second thread while this one keeps its iterator.
+        let reader_at_v1 = VersionedDeltaReader::<LiveKeys, VersionedDbCache<LiveKeys>>::new(
+            versioned_db.clone(),
+            Some(1),
+            vec![],
+        );
+        let expected_at_v1: &[(&[u8], u32)] = &[(b"key1", 0), (b"key2", 1), (b"key4", 1)];
+        check_iterator(&reader_at_v1, b"key", expected_at_v1);
+        std::thread::scope(|s| {
+            s.spawn(|| check_iterator(&reader_at_v1, b"key", expected_at_v1));
+        });
+
+        // The first iterator still yields version 0.
+        assert_eq!(
+            iter_at_v0.collect::<Vec<_>>(),
+            [
+                (key(b"key2"), Some(TestField::new(0))),
+                (key(b"key3"), Some(TestField::new(0)))
+            ]
+        );
+    });
 }

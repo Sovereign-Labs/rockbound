@@ -1,7 +1,9 @@
 mod cache;
+mod commit_protocol;
 mod delta_reader;
 mod iterator;
 mod pruning;
+mod rollback;
 
 use std::sync::Arc;
 
@@ -252,6 +254,19 @@ where
         Self {
             cache: cache.into(),
         }
+    }
+}
+
+impl VersionedDbCache<LiveKeys> {
+    /// Returns what the cache itself holds for `key`, without falling back to the DB.
+    /// Blocks while a commit holds or waits for the write lock.
+    pub fn peek(&self, key: &TestKey) -> Option<Option<TestField>> {
+        self.cache.read().get(key)
+    }
+
+    /// Returns true while a committer holds the write lock or is queued for it.
+    pub fn writer_holds_or_waits(&self) -> bool {
+        self.cache.try_read().is_none()
     }
 }
 

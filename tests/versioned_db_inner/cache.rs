@@ -198,3 +198,30 @@ fn test_cache_behavior_under_concurrency() {
         "Cache misses should be greater than cache hits. Cache size is too large"
     );
 }
+
+/// A commit must replace whatever the cache already holds for the keys it writes, including
+/// cached "this key is absent" entries. Anything left behind would be served as a stale read.
+#[test]
+fn test_apply_cache_updates_overwrites_cached_entries() {
+    let mut cache = rockbound::new_cache_for_schema::<LiveKeys>(1_000_000);
+    let updated = TestKey::from(b"updated".to_vec());
+    let deleted = TestKey::from(b"deleted".to_vec());
+    let created = TestKey::from(b"created".to_vec());
+    let untouched = TestKey::from(b"untouched".to_vec());
+    cache.insert(updated.clone(), Some(TestField::new(1)));
+    cache.insert(deleted.clone(), Some(TestField::new(1)));
+    cache.insert(created.clone(), None);
+    cache.insert(untouched.clone(), Some(TestField::new(1)));
+
+    let mut batch = VersionedSchemaBatch::<LiveKeys>::default();
+    batch.put_versioned(updated.clone(), TestField::new(2));
+    batch.delete_versioned(deleted.clone());
+    batch.put_versioned(created.clone(), TestField::new(2));
+
+    VersionedDB::<LiveKeys, VersionedDbCache<LiveKeys>>::apply_cache_updates(&mut cache, &batch);
+
+    assert_eq!(cache.get(&updated), Some(Some(TestField::new(2))));
+    assert_eq!(cache.get(&deleted), Some(None));
+    assert_eq!(cache.get(&created), Some(Some(TestField::new(2))));
+    assert_eq!(cache.get(&untouched), Some(Some(TestField::new(1))));
+}

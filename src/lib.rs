@@ -484,10 +484,13 @@ impl DB {
         ))
     }
 
-    /// Iterator over a range of keys in a schema, allowing iteration over cached column families. This is only correct if a lock is held to ensure consistency.
+    /// Iterator over a range of keys in a schema, allowing iteration over cached column families.
+    ///
+    /// The guard only has to be held while the iterator is created: the iterator reads from an implicit
+    /// snapshot of the DB that RocksDB takes at that point, so it is not affected by later writes.
     pub(crate) fn iter_range_allow_cached<'a, S: Schema>(
         &'a self,
-        _guard: &parking_lot::MappedRwLockReadGuard<'a, CacheForSchema<S>>,
+        _guard: &parking_lot::MappedRwLockReadGuard<'_, CacheForSchema<S>>,
         range: impl std::ops::RangeBounds<SchemaKey>,
         direction: ScanDirection,
     ) -> anyhow::Result<RawDbIter<'a>> {
